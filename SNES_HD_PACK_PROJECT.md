@@ -6,8 +6,9 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Build:** Kompiliert und startet erfolgreich. HD Pack Option ist im UI aktivierbar.  
-**Next Step:** Test-Tile erstellen und End-to-End verifizieren.
+**Build:** Kompiliert und startet erfolgreich.  
+**Status: M4 abgeschlossen — End-to-End verifiziert.** Bunte Test-Tiles in DKC2 sichtbar, Tile-Key-Matching (VramAddress + Palette) funktioniert, 4x-Skalierung korrekt, EnableHdPacks-Toggle reagiert sofort.  
+**Next Step (M5):** DKC2 HD Viewer Tool-Exports als echte Tile-Ersetzungen integrieren.
 
 ## Milestone History
 
@@ -49,11 +50,22 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 7. **Improved comment on `SnesHdBitmapInfo::Init()`** (`SnesHdData.h`): Clarified that `Init()` is for deferred async PNG decoding via `LoadAsync()`.
 
-### M4 — Test Tile (NEXT)
-- Ein einfaches Test-Tile-PNG erstellen
-- `manifest.json` mit einem gemappten Tile anlegen
-- Verifizieren, dass das Tile korrekt im Spiel ersetzt wird
-- End-to-End-Funktionalität bestätigen
+### M4 — End-to-End Test ✓ (2026-05-29/30)
+- Solide Test-PNGs (32×32, 9 Adressen × 8 Paletten) für DKC2 BG1 generiert
+- Tiles in-game sichtbar: grün, blau, gelb, cyan, orange, lila — Matching bestätigt
+- `EnableHdPacks`-Checkbox im SNES General-Tab ergänzt
+- `ForceFilterUpdate()` bei Toggle → sofortige Reaktion ohne ROM-Reload
+- VS 2025 Insiders (v145-Toolset, MSVC 14.51) Build-Fixes:
+  - `_Openprot` entfernt aus `UTF8Util.h`
+  - Pfade mit Leerzeichen in `UI.csproj` gequotet
+  - HD-Pack-Dateien in `Core.vcxproj` eingetragen
+  - `GetCartName()` auf public gestellt, `EnableHdPacks` zu `SnesConfig` hinzugefügt
+
+### M5 — Echte HD-Tiles (NEXT)
+- DKC2 HD Viewer Tool-Exports in `HdPacks/Donkey Kong Country 2/bg/bg1/` einspielen
+- Export-Pfad im Viewer von `textures/DONKEY_KONG_2/` auf `HdPacks/{romName}/` anpassen
+- Manifest-Parsing implementieren (aktuell Scale hardcoded auf 4)
+- Vollständiges Level mit HD-Tiles verifizieren
 
 ## Architecture
 
