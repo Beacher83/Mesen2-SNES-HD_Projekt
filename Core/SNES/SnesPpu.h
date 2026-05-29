@@ -1,6 +1,7 @@
 #pragma once
 #include "pch.h"
 #include "SNES/SnesPpuTypes.h"
+#include "SNES/HdPacks/SnesHdData.h"
 #include "Utilities/ISerializable.h"
 #include "Utilities/Timer.h"
 
@@ -122,6 +123,11 @@ private:
 	int32_t _debugMode7EndY = 0;
 
 	bool _needFullFrame = false;
+
+	// HD Pack support
+	SnesHdScreenInfo* _hdScreenInfo[2] = {};  // Double-buffered
+	SnesHdScreenInfo* _hdActiveScreen = nullptr;
+	SnesHdPackData* _hdData = nullptr;
 
 	void RenderSprites(const uint8_t priorities[4]);
 
@@ -254,6 +260,8 @@ public:
 	uint8_t* GetSpriteRam();
 
 	void DebugSendFrame();
+
+	void SetHdData(SnesHdPackData* hdData);
 
 	void SetLocationLatchRequest(uint16_t x, uint16_t y);
 	void ProcessLocationLatchRequest();

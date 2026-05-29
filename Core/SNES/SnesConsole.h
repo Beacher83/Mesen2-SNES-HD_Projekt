@@ -35,6 +35,7 @@ class DebugStats;
 class Msu1;
 
 class Emulator;
+struct SnesHdPackData;
 
 enum class MemoryOperationType;
 enum class MemoryType;
@@ -55,6 +56,7 @@ private:
 	unique_ptr<SnesDmaController> _dmaController;
 	
 	unique_ptr<Msu1> _msu1;
+	shared_ptr<SnesHdPackData> _hdData;
 	EmuSettings* _settings = nullptr;
 	Emulator* _emu = nullptr;
 
@@ -67,6 +69,7 @@ private:
 
 	void UpdateRegion();
 	bool LoadSpcFile(VirtualFile& romFile);
+	void LoadHdPack();
 
 public:
 	SnesConsole(Emulator* emu);
@@ -103,6 +106,7 @@ public:
 	BaseControlManager* GetControlManager() override;
 	SnesDmaController* GetDmaController();
 	Msu1* GetMsu1();
+	SnesHdPackData* GetHdData();
 	
 	Emulator* GetEmulator();
 	

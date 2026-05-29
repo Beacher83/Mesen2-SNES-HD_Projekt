@@ -33,6 +33,10 @@
 #include "Utilities/VirtualFile.h"
 #include "Utilities/PlatformUtilities.h"
 #include "Utilities/FolderUtilities.h"
+#include "SNES/HdPacks/SnesHdData.h"
+#include "SNES/HdPacks/SnesHdPackLoader.h"
+#include "SNES/HdPacks/SnesHdVideoFilter.h"
+#include "Shared/MessageManager.h"
 #include "Shared/EventType.h"
 #include "SNES/RegisterHandlerA.h"
 #include "SNES/RegisterHandlerB.h"
@@ -115,11 +119,15 @@ LoadRomResult SnesConsole::LoadRom(VirtualFile& romFile)
 	if(cart) {
 		_cart.swap(cart);
 		
+		LoadHdPack();
 		UpdateRegion();
 
 		_internalRegisters.reset(new InternalRegisters());
 		_memoryManager.reset(new SnesMemoryManager());
 		_ppu.reset(new SnesPpu(_emu, this));
+		if(_hdData) {
+			_ppu->SetHdData(_hdData.get());
+		}
 		_controlManager.reset(new SnesControlManager(this));
 		_dmaController.reset(new SnesDmaController(_memoryManager.get()));
 		_spc.reset(new Spc(this));
@@ -174,6 +182,26 @@ bool SnesConsole::LoadSpcFile(VirtualFile& romFile)
 	}
 	_spcTrackNumber = (uint32_t)std::distance(_spcPlaylist.begin(), result);
 	return true;
+}
+
+void SnesConsole::LoadHdPack()
+{
+	_hdData.reset();
+
+	string cartName = _cart->GetCartName();
+	if(!cartName.empty()) {
+		_hdData.reset(new SnesHdPackData());
+		if(!SnesHdPackLoader::LoadHdSnesPack(cartName, *_hdData.get())) {
+			_hdData.reset();
+		} else {
+			MessageManager::Log("[SNES HD] Loaded HD pack for: " + cartName + " (scale: " + std::to_string(_hdData->Scale) + "x)");
+		}
+	}
+}
+
+SnesHdPackData* SnesConsole::GetHdData()
+{
+	return _hdData.get();
 }
 
 uint64_t SnesConsole::GetMasterClock()
@@ -270,6 +298,11 @@ BaseVideoFilter* SnesConsole::GetVideoFilter(bool getDefaultFilter)
 {
 	if(getDefaultFilter || GetRomFormat() == RomFormat::Spc) {
 		return new SnesDefaultVideoFilter(_emu);
+	}
+
+	// HD Pack: if loaded, use the HD video filter
+	if(_hdData) {
+		return new SnesHdVideoFilter(_emu, this, _hdData.get());
 	}
 
 	VideoFilterType filterType = _emu->GetSettings()->GetVideoConfig().VideoFilter;

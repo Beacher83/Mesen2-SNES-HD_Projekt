@@ -36,6 +36,10 @@ SnesPpu::SnesPpu(Emulator* emu, SnesConsole* console)
 	_outputBuffers[1] = new uint16_t[512 * 478];
 	memset(_outputBuffers[0], 0, 512 * 478 * sizeof(uint16_t));
 	memset(_outputBuffers[1], 0, 512 * 478 * sizeof(uint16_t));
+
+	_hdScreenInfo[0] = new SnesHdScreenInfo();
+	_hdScreenInfo[1] = new SnesHdScreenInfo();
+	_hdActiveScreen = _hdScreenInfo[0];
 }
 
 SnesPpu::~SnesPpu()
@@ -43,6 +47,13 @@ SnesPpu::~SnesPpu()
 	delete[] _vram;
 	delete[] _outputBuffers[0];
 	delete[] _outputBuffers[1];
+	delete _hdScreenInfo[0];
+	delete _hdScreenInfo[1];
+}
+
+void SnesPpu::SetHdData(SnesHdPackData* hdData)
+{
+	_hdData = hdData;
 }
 
 void SnesPpu::PowerOn()
@@ -1062,6 +1073,40 @@ void SnesPpu::RenderTilemap()
 				DrawSubPixel(x, hiresSubRgbColor, priority);
 			}
 		}
+
+		// HD Pack: collect tile identification data per pixel
+		if(_hdData && _scanline < SnesHdScreenInfo::ScreenHeight && x < SnesHdScreenInfo::ScreenWidth) {
+			SnesHdPpuPixelInfo& pixelInfo = _hdActiveScreen->ScreenTiles[_scanline * SnesHdScreenInfo::ScreenWidth + x];
+			if(pixelInfo.BgTileCount < 4) {
+				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[pixelInfo.BgTileCount];
+				uint16_t tileIndex = tilemapData & 0x3FF;
+				tileInfo.Key.VramAddress = (_state.Layers[layerIndex].ChrAddress + tileIndex * 4 * bpp) & 0x7FFF;
+				tileInfo.Key.PaletteIndex = paletteIndex;
+				tileInfo.Key.LayerIndex = layerIndex;
+				tileInfo.Key.IsSprite = false;
+				bool hMirrorHd = (tilemapData & 0x4000) != 0;
+				bool vMirrorHd = (tilemapData & 0x8000) != 0;
+				tileInfo.HorizontalMirror = hMirrorHd;
+				tileInfo.VerticalMirror = vMirrorHd;
+				tileInfo.Priority = priority;
+				tileInfo.TilemapData = tilemapData;
+
+				// Compute pixel offset within the 8x8 tile
+				if constexpr(hiResMode) {
+					tileInfo.OffsetX = ((x << 1) + 1 + hScroll) & 0x07;
+				} else {
+					tileInfo.OffsetX = (x + hScroll) & 0x07;
+				}
+				if(hMirrorHd) {
+					tileInfo.OffsetX = 7 - tileInfo.OffsetX;
+				}
+				uint16_t realY = IsDoubleHeight() ? (_oddFrame ? ((_scanline << 1) + 1) : (_scanline << 1)) : _scanline;
+				uint8_t yOffset = (realY + _layerData[layerIndex].Tiles[lookupIndex].VScroll) & 0x07;
+				tileInfo.OffsetY = vMirrorHd ? (7 - yOffset) : yOffset;
+
+				pixelInfo.BgTileCount++;
+			}
+		}
 	}
 }
 
@@ -1519,6 +1564,17 @@ void SnesPpu::SendFrame()
 	_needFullFrame = false;
 
 	RenderedFrame frame(_currentBuffer, width, height, _useHighResOutput ? 0.5 : 1.0, _frameCount, _console->GetControlManager()->GetPortStates());
+	
+	// HD Pack: attach screen info and swap buffers
+	if(_hdData) {
+		_hdActiveScreen->FrameNumber = _frameCount;
+		frame.Data = _hdActiveScreen;
+		// Swap to other buffer for next frame
+		_hdActiveScreen = (_hdActiveScreen == _hdScreenInfo[0]) ? _hdScreenInfo[1] : _hdScreenInfo[0];
+		// Clear next frame's screen info
+		memset(_hdActiveScreen->ScreenTiles, 0, sizeof(SnesHdPpuPixelInfo) * SnesHdScreenInfo::ScreenPixelCount);
+	}
+
 	_emu->GetVideoDecoder()->UpdateFrame(frame, isRewinding, isRewinding);
 
 	if(!_skipRender) {
