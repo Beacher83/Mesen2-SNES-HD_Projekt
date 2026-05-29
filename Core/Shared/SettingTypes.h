@@ -574,6 +574,8 @@ struct SnesConfig
 	uint32_t GsuClockSpeed = 100;
 
 	int64_t BsxCustomDate = -1;
+
+	bool EnableHdPacks = true;
 };
 
 enum class StereoFilterType

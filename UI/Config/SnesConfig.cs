@@ -66,6 +66,9 @@ namespace Mesen.Config
 		[Reactive] [MinMax(0, 1000)] public UInt32 PpuExtraScanlinesAfterNmi { get; set; } = 0;
 		[Reactive] [MinMax(100, 1000)] public UInt32 GsuClockSpeed { get; set; } = 100;
 
+		//HD Packs
+		[Reactive] public bool EnableHdPacks { get; set; } = true;
+
 		//BSX
 		[Reactive] public bool BsxUseCustomTime { get; set; } = false;
 		[Reactive] public DateTimeOffset BsxCustomDate { get; set; } = new DateTimeOffset(1995, 1, 1, 0, 0, 0, TimeSpan.Zero);
@@ -122,7 +125,8 @@ namespace Mesen.Config
 				GsuClockSpeed = this.GsuClockSpeed,
 				RamPowerOnState = this.RamPowerOnState,
 				SpcClockSpeedAdjustment = this.SpcClockSpeedAdjustment,
-				BsxCustomDate = BsxUseCustomTime ? (this.BsxCustomDate.ToUnixTimeSeconds() + (long)this.BsxCustomTime.TotalSeconds) : -1
+				BsxCustomDate = BsxUseCustomTime ? (this.BsxCustomDate.ToUnixTimeSeconds() + (long)this.BsxCustomTime.TotalSeconds) : -1,
+				EnableHdPacks = this.EnableHdPacks
 			});
 		}
 
@@ -182,6 +186,7 @@ namespace Mesen.Config
 		public UInt32 GsuClockSpeed;
 
 		public long BsxCustomDate;
+		[MarshalAs(UnmanagedType.I1)] public bool EnableHdPacks;
 	}
 
 	public enum DspInterpolationType

@@ -460,6 +460,9 @@
     <ClInclude Include="NES\Debugger\NesEventManager.h" />
     <ClInclude Include="NES\Debugger\NesTraceLogger.h" />
     <ClInclude Include="NES\DefaultNesPpu.h" />
+    <ClInclude Include="SNES\HdPacks\SnesHdData.h" />
+    <ClInclude Include="SNES\HdPacks\SnesHdPackLoader.h" />
+    <ClInclude Include="SNES\HdPacks\SnesHdVideoFilter.h" />
     <ClInclude Include="NES\HdPacks\HdAudioDevice.h" />
     <ClInclude Include="NES\HdPacks\HdData.h" />
     <ClInclude Include="NES\HdPacks\HdNesPack.h" />
@@ -998,6 +1001,8 @@
     <ClCompile Include="SNES\Debugger\TraceLogger\GsuTraceLogger.cpp" />
     <ClCompile Include="SNES\Debugger\TraceLogger\SpcTraceLogger.cpp" />
     <ClCompile Include="SNES\Debugger\TraceLogger\SnesCpuTraceLogger.cpp" />
+    <ClCompile Include="SNES\HdPacks\SnesHdPackLoader.cpp" />
+    <ClCompile Include="SNES\HdPacks\SnesHdVideoFilter.cpp" />
     <ClCompile Include="SNES\SnesDefaultVideoFilter.cpp" />
     <ClCompile Include="Debugger\Disassembler.cpp" />
     <ClCompile Include="Debugger\DisassemblyInfo.cpp" />
@@ -1125,27 +1130,27 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='PGO Profile|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='PGO Optimize|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>

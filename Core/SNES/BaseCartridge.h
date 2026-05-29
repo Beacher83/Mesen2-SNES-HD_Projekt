@@ -96,11 +96,12 @@ private:
 	void InitCoprocessor();
 	void LoadEmbeddedFirmware();
 
-	string GetCartName();
 	string GetGameCode();
 
 public:
 	virtual ~BaseCartridge();
+
+	string GetCartName();
 
 	static unique_ptr<BaseCartridge> CreateCartridge(SnesConsole* console, VirtualFile &romFile);
 
