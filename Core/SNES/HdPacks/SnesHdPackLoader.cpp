@@ -126,7 +126,7 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		}
 
 		// Create bitmap info and load the PNG
-		auto bitmap = make_unique<SnesHdBitmapInfo>();
+		auto bitmap = std::make_unique<SnesHdBitmapInfo>();
 		bitmap->PngName = filePath;
 
 		if(!LoadPngFile(filePath, *bitmap)) {
@@ -143,7 +143,7 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		}
 
 		// Create tile info
-		auto tile = make_unique<SnesHdPackTileInfo>();
+		auto tile = std::make_unique<SnesHdPackTileInfo>();
 		tile->Key.VramAddress = vramAddr;
 		tile->Key.PaletteIndex = paletteIndex;
 		tile->Key.LayerIndex = layerIndex;
