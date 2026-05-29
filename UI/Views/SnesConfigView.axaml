@@ -41,6 +41,7 @@
 							AvailableValues="{Binding AvailableRegions}"
 						/>
 					</StackPanel>
+					<CheckBox IsChecked="{Binding Config.EnableHdPacks}" Content="{l:Translate chkEnableHdPacks}" />
 				</StackPanel>
 			</ScrollViewer>
 		</TabItem>

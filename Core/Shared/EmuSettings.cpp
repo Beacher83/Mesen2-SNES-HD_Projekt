@@ -6,6 +6,7 @@
 #include "Shared/Emulator.h"
 #include "Shared/DebuggerRequest.h"
 #include "Shared/NotificationManager.h"
+#include "Shared/Video/VideoDecoder.h"
 #include "Utilities/FolderUtilities.h"
 #include "Utilities/Serializer.h"
 
@@ -201,7 +202,11 @@ EmulationConfig& EmuSettings::GetEmulationConfig()
 
 void EmuSettings::SetSnesConfig(SnesConfig& config)
 {
+	bool hdPackToggled = (config.EnableHdPacks != _snes.EnableHdPacks);
 	_snes = config;
+	if(hdPackToggled) {
+		_emu->GetVideoDecoder()->ForceFilterUpdate();
+	}
 }
 
 SnesConfig& EmuSettings::GetSnesConfig()
