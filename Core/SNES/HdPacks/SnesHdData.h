@@ -33,7 +33,6 @@ struct SnesHdTileKey
 	uint16_t VramAddress = 0;   // VRAM word address of the tile's CHR data
 	uint8_t PaletteIndex = 0;   // Palette group (0-7)
 	uint8_t LayerIndex = 0;     // 0-3 = BG1-BG4, 4 = Sprites
-	bool IsSprite = false;
 
 	uint32_t GetHashCode() const
 	{
@@ -190,7 +189,7 @@ public:
 	uint32_t Width = 0;
 	uint32_t Height = 0;
 
-	void Init();  // Implemented in SnesHdPackLoader.cpp
+	void Init();  // Deferred PNG decode for async loading (used by LoadAsync)
 
 	void PremultiplyAlpha()
 	{

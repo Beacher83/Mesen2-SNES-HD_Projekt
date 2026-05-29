@@ -15,6 +15,10 @@ private:
 
 	// Palette lookup (BGR555 → ARGB8888), same as SnesDefaultVideoFilter
 	uint32_t _calculatedPalette[0x8000] = {};
+	int16_t _lastHue = INT16_MIN;
+	int16_t _lastSaturation = INT16_MIN;
+	int16_t _lastBrightness = INT16_MIN;
+	int16_t _lastContrast = INT16_MIN;
 	void InitLookupTable();
 
 public:

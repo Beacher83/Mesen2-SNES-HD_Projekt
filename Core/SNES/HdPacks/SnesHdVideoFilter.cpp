@@ -33,8 +33,15 @@ void SnesHdVideoFilter::InitLookupTable()
 
 void SnesHdVideoFilter::OnBeforeApplyFilter()
 {
-	// Re-init palette if settings changed (simplified — always re-init for now)
-	InitLookupTable();
+	VideoConfig config = _emu->GetSettings()->GetVideoConfig();
+	if(config.Hue != _lastHue || config.Saturation != _lastSaturation ||
+	   config.Brightness != _lastBrightness || config.Contrast != _lastContrast) {
+		_lastHue = config.Hue;
+		_lastSaturation = config.Saturation;
+		_lastBrightness = config.Brightness;
+		_lastContrast = config.Contrast;
+		InitLookupTable();
+	}
 }
 
 FrameInfo SnesHdVideoFilter::GetFrameInfo()
@@ -125,10 +132,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									uint8_t hdR = (hdColor >> 16) & 0xFF;
 									uint8_t hdG = (hdColor >> 8) & 0xFF;
 									uint8_t hdB = hdColor & 0xFF;
-								// HD tile data is premultiplied alpha, so blend accordingly
-								uint8_t outR = hdR + ((srcR * (255 - alpha)) / 255);
-								uint8_t outG = hdG + ((srcG * (255 - alpha)) / 255);
-								uint8_t outB = hdB + ((srcB * (255 - alpha)) / 255);
+									// HD tile data is premultiplied alpha, so blend accordingly
+									uint8_t outR = hdR + ((srcR * (255 - alpha)) / 255);
+									uint8_t outG = hdG + ((srcG * (255 - alpha)) / 255);
+									uint8_t outB = hdB + ((srcB * (255 - alpha)) / 255);
 									outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
 								} else {
 									outputBuffer[outIndex] = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];

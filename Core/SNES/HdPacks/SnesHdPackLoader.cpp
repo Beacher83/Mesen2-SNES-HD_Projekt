@@ -38,11 +38,23 @@ bool SnesHdPackLoader::InitializeLoader(const string& romName, SnesHdPackData* d
 	string hdPackRoot = FolderUtilities::GetHdPackFolder();
 	_hdPackFolder = FolderUtilities::CombinePath(hdPackRoot, romName);
 
-	// Check if the pack directory exists by looking for any PNG files
-	string manifestPath = FolderUtilities::CombinePath(_hdPackFolder, "manifest.json");
+	// Verify the pack directory exists
+	vector<string> entries;
+	try {
+		entries = FolderUtilities::GetFolders(_hdPackFolder);
+	} catch(...) {}
 
-	// Simple existence check: try to find bg/ or sprites/ subdirectories
-	// We'll check for PNGs in LoadPack
+	// Also check for any files directly
+	std::unordered_set<string> anyExt = { ".png", ".json" };
+	vector<string> files;
+	try {
+		files = FolderUtilities::GetFilesInFolder(_hdPackFolder, anyExt, false);
+	} catch(...) {}
+
+	if(entries.empty() && files.empty()) {
+		return false;
+	}
+
 	return true;
 }
 
@@ -114,6 +126,8 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		return false;
 	}
 
+	int loadedCount = 0;
+
 	for(const string& filePath : files) {
 		string filename = FolderUtilities::GetFilename(filePath, false);
 
@@ -147,7 +161,6 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		tile->Key.VramAddress = vramAddr;
 		tile->Key.PaletteIndex = paletteIndex;
 		tile->Key.LayerIndex = layerIndex;
-		tile->Key.IsSprite = isSprite;
 		tile->X = 0;
 		tile->Y = 0;
 		tile->Width = bitmap->Width;
@@ -164,9 +177,10 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 
 		_data->Tiles.push_back(std::move(tile));
 		_data->ImageFileData.push_back(std::move(bitmap));
+		loadedCount++;
 	}
 
-	return !files.empty();
+	return loadedCount > 0;
 }
 
 bool SnesHdPackLoader::LoadPngFile(const string& filePath, SnesHdBitmapInfo& bitmap)

@@ -300,8 +300,8 @@ BaseVideoFilter* SnesConsole::GetVideoFilter(bool getDefaultFilter)
 		return new SnesDefaultVideoFilter(_emu);
 	}
 
-	// HD Pack: if loaded, use the HD video filter
-	if(_hdData) {
+	// HD Pack: if loaded and enabled in settings, use the HD video filter
+	if(_hdData && _settings->GetSnesConfig().EnableHdPacks) {
 		return new SnesHdVideoFilter(_emu, this, _hdData.get());
 	}
 
