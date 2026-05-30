@@ -6,9 +6,9 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Build:** Noch nicht neu gebaut (M4.2-Änderungen ausstehend).  
-**Status: M4.2 implementiert — Rebuild erforderlich.** Fundamentaler Fix für HD-Tile-Priorität: nur der Pixel-Gewinner-BG-Layer wird in `BgTiles[0]` gespeichert.  
-**Next Step (nach Rebuild-Verifikation):** M5 — DKC2 HD Viewer Tool-Exports als echte Tile-Ersetzungen integrieren.
+**Build:** M4.2 gebaut und verifiziert (committed `c27054c9`).  
+**Status: M5 in Arbeit** — echte DKC2 HD-Tiles vom Viewer Tool einspielen.  
+**Next Step:** Viewer-Export-Verzeichnis auf Mesen2-Loader-Pfad mappen, ROM-Name klären, erstes Level mit echten Tiles verifizieren.
 
 ## Milestone History
 
@@ -108,12 +108,23 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 - Wenn BG2 high (Wert 8) nach BG1 low (Wert 6) gewinnt, überschreibt BG2 `BgTiles[0]`
 - Ergebnis: `BgTiles[0]` enthält immer den echten Gewinner-BG-Layer
 
-### M5 — Echte HD-Tiles (NEXT, nach M4.2-Verifikation)
-- **Rebuild + Test M4.1:** Core + UI neu bauen, DKC2 starten, verifizieren dass Diddy VOR den farbigen Test-Tiles läuft
-- DKC2 HD Viewer Tool-Exports in `HdPacks/Donkey Kong Country 2/bg/bg1/` einspielen
-- Export-Pfad im Viewer von `textures/DONKEY_KONG_2/` auf `HdPacks/{romName}/` anpassen
-- Manifest-Parsing implementieren (aktuell Scale hardcoded auf 4)
-- Vollständiges Level mit HD-Tiles verifizieren
+### M5 — Echte HD-Tiles (IN ARBEIT)
+
+**HdPacks-Pfad (bestätigt):**
+```
+C:\Users\beach\OneDrive\Dokumente\Mesen2\HdPacks\Donkey Kong Country 2\bg\bg1\
+```
+ROM-Name: `Donkey Kong Country 2` (aus SNES ROM-Header, so wie Mesen es loggt)
+
+**Workflow (kein Code-Fix nötig):**
+1. Pack im DKC2 HD Viewer Tool generieren (BG1-Tiles, 32×32px = 4x Scale)
+2. Alte Test-Tiles löschen (`2010_P00.png` bis `2090_P07.png`)
+3. Neue Viewer-Tiles in den HdPacks-Ordner kopieren
+4. DKC2 in Mesen neu laden (Pack wird nur beim ROM-Load eingelesen)
+
+**Noch offen:**
+- Manifest-Parsing (`manifest.json` für Scale, Version) — aktuell Scale hardcoded auf 4
+- Vollständiges Level mit echten HD-Tiles verifizieren
 
 ### M6 — Tile Viewer Integration (niedrigere Priorität)
 - HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)
@@ -186,6 +197,25 @@ The viewer exports to `textures/DONKEY_KONG_2/bg/bg1/` but Mesen2 looks in `HdPa
 To test: either rename the export directory, or update the viewer's export path.
 
 The `romName` in Mesen2 comes from `_cart->GetCartName()` — for DKC2 this is likely `DONKEY KONG 2` or similar (from the SNES ROM header at offset $FFC0). Verify with a test ROM.
+
+## Upstream-Situation: MesenCE
+
+**Stand: 2026-05-30**
+
+Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unter `nesdev-org/MesenCE` einen aktiven Fork gestartet — mit Beteiligung des Originalautors Sour (aktive Commits bis heute). Lizenz: GPL v3, identisch zu Mesen2.
+
+**Relevanz für unser Projekt:**
+
+- Unser SNES HD Pack-Code ist einzigartig — MesenCE hat keine SNES HD Packs
+- Neue Bug-Fixes und Genauigkeitsverbesserungen kommen nur noch von MesenCE, nicht von Mesen2
+- MesenCE hat am 26.05.2026 auf VS2022 v143-Toolset zurückgewechselt; unser v145-Build-Fix existiert dort nicht
+- Je länger wir auf Mesen2-Basis bleiben, desto aufwändiger wird ein späterer Merge von MesenCE-Fixes
+
+**Empfehlung (nach M5):** Fork-Basis von Mesen2 auf MesenCE wechseln (Rebase). Unser SNES HD-Code ist sauber isoliert und sollte konfliktarm übertragbar sein. MesenCE wäre auch das richtige Ziel für eine spätere Upstream-Contribution.
+
+**Referenz:** https://github.com/nesdev-org/MesenCE
+
+---
 
 ## Known Limitations & Design Notes
 
