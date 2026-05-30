@@ -192,5 +192,6 @@ struct SnesPpuState : public BaseState
 
 enum PixelFlags
 {
+	IsSpritePixel = 0x40,   // Set when a sprite wins the main screen pixel
 	AllowColorMath = 0x80,
 };

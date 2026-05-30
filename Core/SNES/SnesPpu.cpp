@@ -916,6 +916,13 @@ void SnesPpu::RenderScanline()
 		ApplyBrightness<true>();
 		ApplyHiResMode();
 
+		// Copy final main screen flags to HD pixel info (for sprite priority detection)
+		if(_hdData && _hdActiveScreen && _scanline < SnesHdScreenInfo::ScreenHeight) {
+			for(int x = _drawStartX; x <= _drawEndX && x < SnesHdScreenInfo::ScreenWidth; x++) {
+				_hdActiveScreen->ScreenTiles[_scanline * SnesHdScreenInfo::ScreenWidth + x].MainScreenFlags = _mainScreenFlags[x];
+			}
+		}
+
 		_drawStartX = _drawEndX + 1;
 	}
 	
@@ -970,7 +977,7 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 			if(drawMain && ((_mainScreenFlags[x] & 0x0F) < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
 				uint16_t paletteRamOffset = 128 + (_spritePalette[x] << 4) + _spriteColors[x];
 				_mainScreenBuffer[x] = _cgram[paletteRamOffset];
-				_mainScreenFlags[x] = spritePrio | (((_state.ColorMathEnabled & 0x10) && _spritePalette[x] > 3) ? PixelFlags::AllowColorMath : 0);
+				_mainScreenFlags[x] = spritePrio | PixelFlags::IsSpritePixel | (((_state.ColorMathEnabled & 0x10) && _spritePalette[x] > 3) ? PixelFlags::AllowColorMath : 0);
 			}
 
 			if(drawSub && (_subScreenPriority[x] < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(subWindowCount, x)) {
@@ -1057,7 +1064,8 @@ void SnesPpu::RenderTilemap()
 
 		if(color > 0) {
 			uint16_t rgbColor = GetRgbColor<bpp, directColorMode, basePaletteOffset>(paletteIndex, color);
-			if(drawMain && (_mainScreenFlags[x] & 0x0F) < priority && !ProcessMaskWindow<layerIndex>(mainWindowCount, x)) {
+			bool winsMain = drawMain && (_mainScreenFlags[x] & 0x0F) < priority && !ProcessMaskWindow<layerIndex>(mainWindowCount, x);
+			if(winsMain) {
 				DrawMainPixel(x, rgbColor, priority | pixelFlags);
 			}
 			if constexpr(!hiResMode) {
@@ -1065,20 +1073,13 @@ void SnesPpu::RenderTilemap()
 					DrawSubPixel(x, rgbColor, priority);
 				}
 			}
-		}
 
-		if constexpr(hiResMode) {
-			if(hiresSubColor > 0 && drawSub && _subScreenPriority[x] < priority && !ProcessMaskWindow<layerIndex>(subWindowCount, x)) {
-				uint16_t hiresSubRgbColor = GetRgbColor<bpp, directColorMode, basePaletteOffset>(paletteIndex, hiresSubColor);
-				DrawSubPixel(x, hiresSubRgbColor, priority);
-			}
-		}
-
-		// HD Pack: collect tile identification data per pixel
-		if(_hdData && _scanline < SnesHdScreenInfo::ScreenHeight && x < SnesHdScreenInfo::ScreenWidth) {
-			SnesHdPpuPixelInfo& pixelInfo = _hdActiveScreen->ScreenTiles[_scanline * SnesHdScreenInfo::ScreenWidth + x];
-			if(pixelInfo.BgTileCount < 4) {
-				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[pixelInfo.BgTileCount];
+			// HD Pack: only record tile info when this BG layer wins the pixel.
+			// Always writes to BgTiles[0] so a higher-priority layer rendered later overwrites it.
+			// BgTileCount=0 means sprite or backdrop won — filter uses native SNES pixel.
+			if(winsMain && _hdData && _scanline < SnesHdScreenInfo::ScreenHeight && x < SnesHdScreenInfo::ScreenWidth) {
+				SnesHdPpuPixelInfo& pixelInfo = _hdActiveScreen->ScreenTiles[_scanline * SnesHdScreenInfo::ScreenWidth + x];
+				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[0];
 				uint16_t tileIndex = tilemapData & 0x3FF;
 				tileInfo.Key.VramAddress = (_state.Layers[layerIndex].ChrAddress + tileIndex * 4 * bpp) & 0x7FFF;
 				tileInfo.Key.PaletteIndex = paletteIndex;
@@ -1090,7 +1091,6 @@ void SnesPpu::RenderTilemap()
 				tileInfo.Priority = priority;
 				tileInfo.TilemapData = tilemapData;
 
-				// Compute pixel offset within the 8x8 tile
 				if constexpr(hiResMode) {
 					tileInfo.OffsetX = ((x << 1) + 1 + hScroll) & 0x07;
 				} else {
@@ -1102,8 +1102,14 @@ void SnesPpu::RenderTilemap()
 				uint16_t realY = IsDoubleHeight() ? (_oddFrame ? ((_scanline << 1) + 1) : (_scanline << 1)) : _scanline;
 				uint8_t yOffset = (realY + _layerData[layerIndex].Tiles[lookupIndex].VScroll) & 0x07;
 				tileInfo.OffsetY = vMirrorHd ? (7 - yOffset) : yOffset;
+				pixelInfo.BgTileCount = 1;
+			}
+		}
 
-				pixelInfo.BgTileCount++;
+		if constexpr(hiResMode) {
+			if(hiresSubColor > 0 && drawSub && _subScreenPriority[x] < priority && !ProcessMaskWindow<layerIndex>(subWindowCount, x)) {
+				uint16_t hiresSubRgbColor = GetRgbColor<bpp, directColorMode, basePaletteOffset>(paletteIndex, hiresSubColor);
+				DrawSubPixel(x, hiresSubRgbColor, priority);
 			}
 		}
 	}

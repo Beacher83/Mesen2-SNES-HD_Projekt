@@ -90,15 +90,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			// Index into ppuOutputBuffer (accounts for hi-res doubling)
 			uint32_t ppuIndex = isHiRes ? (y * 2 * ppuWidth + x * 2) : (y * ppuWidth + x);
 
-			// Try to find an HD replacement for the topmost BG tile
+			// BgTileCount is 0 (sprite/backdrop won) or 1 (the winning BG layer's tile).
+			// Only apply HD tile when a BG layer won the pixel.
 			SnesHdPackTileInfo* hdTile = nullptr;
 			SnesHdPpuTileInfo* tileInfo = nullptr;
 
-			for(int i = pixelInfo.BgTileCount - 1; i >= 0; i--) {
-				hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[i].Key);
+			if(pixelInfo.BgTileCount > 0) {
+				hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key);
 				if(hdTile) {
-					tileInfo = &pixelInfo.BgTiles[i];
-					break;
+					tileInfo = &pixelInfo.BgTiles[0];
 				}
 			}
 

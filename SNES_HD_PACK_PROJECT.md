@@ -6,9 +6,9 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Build:** Kompiliert und startet erfolgreich.  
-**Status: M4 abgeschlossen — End-to-End verifiziert.** Bunte Test-Tiles in DKC2 sichtbar, Tile-Key-Matching (VramAddress + Palette) funktioniert, 4x-Skalierung korrekt, EnableHdPacks-Toggle reagiert sofort.  
-**Next Step (M5):** DKC2 HD Viewer Tool-Exports als echte Tile-Ersetzungen integrieren.
+**Build:** Noch nicht neu gebaut (M4.2-Änderungen ausstehend).  
+**Status: M4.2 implementiert — Rebuild erforderlich.** Fundamentaler Fix für HD-Tile-Priorität: nur der Pixel-Gewinner-BG-Layer wird in `BgTiles[0]` gespeichert.  
+**Next Step (nach Rebuild-Verifikation):** M5 — DKC2 HD Viewer Tool-Exports als echte Tile-Ersetzungen integrieren.
 
 ## Milestone History
 
@@ -50,6 +50,25 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 7. **Improved comment on `SnesHdBitmapInfo::Init()`** (`SnesHdData.h`): Clarified that `Init()` is for deferred async PNG decoding via `LoadAsync()`.
 
+### M4.1 — Sprite Priority Fix (2026-05-30, noch nicht gebaut)
+
+**Problem:** Diddy (Sprite) lief hinter den HD BG1-Tiles, weil der HD-Filter jedes Pixel mit einem BG1-Tile-Key ersetzte — auch wenn ein Sprite den Pixel gewonnen hatte.
+
+**Root Cause:** `RenderTilemap()` sammelt Tile-Infos für alle BG-Pixel unabhängig davon, ob das Tile den Main Screen gewonnen hat. `ApplyFilter()` ersetzte blind alle Pixel, bei denen ein HD-Tile gefunden wurde.
+
+**Fix (3 Dateien):**
+
+1. **`Core/SNES/SnesPpuTypes.h`**: `IsSpritePixel = 0x40` zu `PixelFlags` hinzugefügt (Bit 6, bisher unbenutzt).
+
+2. **`Core/SNES/SnesPpu.cpp`**:
+   - `RenderSprites()`: Wenn Sprite Main Screen gewinnt → `_mainScreenFlags[x] |= PixelFlags::IsSpritePixel`
+   - `RenderScanline()`: Nach `ApplyHiResMode()` → `_mainScreenFlags[x]` in `pixelInfo.MainScreenFlags` kopieren (für den aktuellen Chunk `[_drawStartX, _drawEndX]`)
+   - Wenn danach ein BG-Tile den Sprite überschreibt, löscht `DrawMainPixel()` das Bit automatisch
+
+3. **`Core/SNES/HdPacks/SnesHdVideoFilter.cpp`**:
+   - `#include "SNES/SnesPpuTypes.h"` hinzugefügt
+   - `ApplyFilter()`: `spriteOnTop = pixelInfo.MainScreenFlags & PixelFlags::IsSpritePixel` — wenn gesetzt, nativen SNES-Pixel verwenden statt HD-Tile
+
 ### M4 — End-to-End Test ✓ (2026-05-29/30)
 - Solide Test-PNGs (32×32, 9 Adressen × 8 Paletten) für DKC2 BG1 generiert
 - Tiles in-game sichtbar: grün, blau, gelb, cyan, orange, lila — Matching bestätigt
@@ -61,11 +80,44 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
   - HD-Pack-Dateien in `Core.vcxproj` eingetragen
   - `GetCartName()` auf public gestellt, `EnableHdPacks` zu `SnesConfig` hinzugefügt
 
-### M5 — Echte HD-Tiles (NEXT)
+### M4.2 — HD-Tile Priority Fix (2026-05-30, noch nicht gebaut)
+
+**Problem:** Zwei Bugs nach M4.1:
+1. Tiles clippten teilweise durch Diddy (besonders bei Bewegung)
+2. Foreground-BG-Layer (BG2/BG3 Seile, Pflanzen) verschwanden hinter den HD-BG1-Tiles
+
+**Root Cause beider Bugs:** `RenderTilemap` sammelte HD-Tile-Info UNCONDITIONALLY für alle BG-Layer, egal ob sie den Pixel gewonnen haben oder nicht. Der Filter iterierte dann durch alle BgTiles[] und fand BG1-Tiles auch an Pixeln, wo BG2/Sprite eigentlich gewonnen hatte.
+
+**Fix (2 Dateien):**
+
+1. **`Core/SNES/SnesPpu.cpp` — `RenderTilemap()`:**
+   - `bool winsMain = drawMain && (_mainScreenFlags[x] & 0x0F) < priority && ...` extrahiert
+   - HD-Tile-Info-Sammlung nun INNERHALB von `if(color > 0)` und `if(winsMain)`
+   - Schreibt immer auf `BgTiles[0]` (höheres Layer überschreibt ggf.); `BgTileCount = 1`
+   - `BgTileCount = 0` signalisiert: Sprite oder Backdrop hat gewonnen — kein HD-Tile
+
+2. **`Core/SNES/HdPacks/SnesHdVideoFilter.cpp` — `ApplyFilter()`:**
+   - Loop entfernt, direkt `BgTiles[0]` prüfen wenn `BgTileCount > 0`
+   - `spriteOnTop`/`IsSpritePixel`-Check entfernt (durch `BgTileCount=0` implizit gehandhabt)
+   - `#include "SNES/SnesPpuTypes.h"` entfernt (nicht mehr benötigt)
+
+**Warum das BgTileCount=1 Modell korrekt ist:**
+- Sprites rendern VOR BG-Layern (Mode 1: `RenderSprites` → `RenderTilemap BG1/2/3`)
+- Wenn Sprite Priority 3 (Wert 10) gewinnt, setzt er `_mainScreenFlags[x] = 10|IsSpritePixel`
+- BG1 high (Wert 9) prüft `10 < 9` = false → BG1 gewinnt nicht → kein Info gesammelt
+- Wenn BG2 high (Wert 8) nach BG1 low (Wert 6) gewinnt, überschreibt BG2 `BgTiles[0]`
+- Ergebnis: `BgTiles[0]` enthält immer den echten Gewinner-BG-Layer
+
+### M5 — Echte HD-Tiles (NEXT, nach M4.2-Verifikation)
+- **Rebuild + Test M4.1:** Core + UI neu bauen, DKC2 starten, verifizieren dass Diddy VOR den farbigen Test-Tiles läuft
 - DKC2 HD Viewer Tool-Exports in `HdPacks/Donkey Kong Country 2/bg/bg1/` einspielen
 - Export-Pfad im Viewer von `textures/DONKEY_KONG_2/` auf `HdPacks/{romName}/` anpassen
 - Manifest-Parsing implementieren (aktuell Scale hardcoded auf 4)
 - Vollständiges Level mit HD-Tiles verifizieren
+
+### M6 — Tile Viewer Integration (niedrigere Priorität)
+- HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)
+- `SnesPpuTools.cpp` + `TileViewerViewModel.cs` anpassen
 
 ## Architecture
 
@@ -135,7 +187,24 @@ To test: either rename the export directory, or update the viewer's export path.
 
 The `romName` in Mesen2 comes from `_cart->GetCartName()` — for DKC2 this is likely `DONKEY KONG 2` or similar (from the SNES ROM header at offset $FFC0). Verify with a test ROM.
 
-## Notes
+## Known Limitations & Design Notes
+
+### Transparente Sprite-Pixel — "Clipping"-Effekt mit Test-Tiles
+
+**Symptom:** HD BG-Tiles scheinen durch den Spieler-Sprite zu "clippen", besonders bei Bewegung.
+
+**Ursache:** SNES Sprite-Tiles haben transparente Pixel (Color Index 0 = kein Sprite). In `FetchSpriteTile()` (`SnesPpu.cpp`) wird `_spritePriorityCopy[x]` nur gesetzt wenn `color != 0`. Transparente Sprite-Pixel lassen `_spritePriorityCopy[x] = 0xFF` (kein Sprite). An diesen Positionen gewinnt der BG-Layer korrekt — der HD-Filter wendet das HD-Tile an.
+
+**Mit Original-SNES-Grafik:** Die nativen 8×8-BG-Tiles zeigen durch die transparenten Sprite-Lücken → sieht aus wie der Hintergrund → kaum sichtbar.  
+**Mit Test-Tiles (Farbblöcke):** Die großen 32×32 Farbblöcke in den Sprite-Lücken → sieht aus wie ein Bug, ist aber korrektes SNES-Verhalten.
+
+**"Bei Bewegung stärker":** Verschiedene Animations-Frames haben unterschiedliche Positionen transparenter Pixel, die mehr oder weniger mit HD-Tiles überlappen.
+
+**Fix:** Kein Code-Fix nötig. Das verschwindet automatisch mit echten HD-Tiles (M5), weil dann durch die Sprite-Lücken der korrekte Hintergrund sichtbar ist statt eines Farbblocks. Langfristig: HD-Sprites für den Spielercharakter (future milestone).
+
+---
+
+### Allgemeine Hinweise
 
 - Scale factor is defined in `manifest.json` (currently hardcoded to 4 in loader)
 - Alpha blending is premultiplied for performance
@@ -143,3 +212,4 @@ The `romName` in Mesen2 comes from `_cart->GetCartName()` — for DKC2 this is l
 - Hi-res modes (512px) are handled in the video filter
 - `EnableHdPacks` setting in `SnesConfig` (default: `true`) controls whether HD filter is used
 - `SnesHdTileKey` uses `LayerIndex=4` for sprites (no separate `IsSprite` flag)
+- BG-Tile-Info wird nur für den Pixel-Gewinner-Layer gespeichert (`BgTiles[0]`, `BgTileCount` = 0 oder 1). `BgTileCount=0` = Sprite oder Backdrop hat gewonnen → Filter verwendet nativen SNES-Pixel.
