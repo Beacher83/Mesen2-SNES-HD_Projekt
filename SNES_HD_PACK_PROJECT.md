@@ -108,23 +108,50 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 - Wenn BG2 high (Wert 8) nach BG1 low (Wert 6) gewinnt, überschreibt BG2 `BgTiles[0]`
 - Ergebnis: `BgTiles[0]` enthält immer den echten Gewinner-BG-Layer
 
-### M5 — Echte HD-Tiles (IN ARBEIT)
+### M5 — Echte HD-Tiles ✓ (2026-06-01, verifiziert)
 
 **HdPacks-Pfad (bestätigt):**
 ```
 C:\Users\beach\OneDrive\Dokumente\Mesen2\HdPacks\Donkey Kong Country 2\bg\bg1\
 ```
-ROM-Name: `Donkey Kong Country 2` (aus SNES ROM-Header, so wie Mesen es loggt)
+ROM-Name: `Donkey Kong Country 2` (verifiziert aus SNES ROM-Header offset 0xFFC0, HiROM + 512-Byte SMC-Header → 0x101C0; ROM: `Donkey Kong Country 2 - Diddy's Kong Quest.smc`)
 
-**Workflow (kein Code-Fix nötig):**
-1. Pack im DKC2 HD Viewer Tool generieren (BG1-Tiles, 32×32px = 4x Scale)
-2. Alte Test-Tiles löschen (`2010_P00.png` bis `2090_P07.png`)
-3. Neue Viewer-Tiles in den HdPacks-Ordner kopieren
-4. DKC2 in Mesen neu laden (Pack wird nur beim ROM-Load eingelesen)
+**Workflow (via DKC2-HD-Tools Viewer):**
+1. Container im Viewer laden (`Alt v1.3`)
+2. "Texture Pack"-Button → `Alt v1.3_mesen2_hdpack.zip` (918 unique BG1 Sub-Tiles)
+3. ZIP nach `C:\Users\beach\OneDrive\Dokumente\Mesen2\` entpacken
+4. DKC2 in Mesen neu laden (Pack wird beim ROM-Load eingelesen)
 
-**Noch offen:**
+**Ergebnis:** BG1-Tiles (Piratenschiff, gfxset_07) korrekt in HD dargestellt, Spiel spielbar.
+
+**Viewer-Änderungen (DKC2-HD-Tools):**
+- `exportContainerAsZip`: speichert `ppu_config.json` + `tile_arrangement.bin` pro Level-Set
+- `importContainerFromZip`: stellt diese Felder beim Import wieder her
+- `exportAsTexturePack`: Ausgabepfad auf `HdPacks/Donkey Kong Country 2/bg/bg1/` korrigiert; `OffscreenCanvas.convertToBlob()` durch `HTMLCanvasElement.toDataURL()` ersetzt (Browser-Kompatibilität); Tile-ID-Lookup-Bug gefixt (`"7_0"` Format statt Integer)
+
+**Noch offen → M5.1:**
 - Manifest-Parsing (`manifest.json` für Scale, Version) — aktuell Scale hardcoded auf 4
-- Vollständiges Level mit echten HD-Tiles verifizieren
+- Flip-Handling in `ApplyFilter()` (BG1-Tiles werden gespiegelt falsch dargestellt → Ghosting-Glitches)
+- BG2-Export im Viewer (Hintergründe noch nativ)
+- VRAM-Kollision auf Worldmap (siehe Known Limitations)
+
+### M5.1 — Bugfixes nach erstem Praxistest (GEPLANT)
+
+**Bug 1: Grafische Glitches (doppelte/dreifache Konturen versetzt)**
+- Ursache: Flip-Bits werden im HD-Filter nicht angewendet. Gespiegelte Tiles (H/V-Flip in Tilemap) haben dieselbe VRAM-Adresse, zeigen aber die un-gespiegelte HD-Version.
+- Fix: `SnesHdVideoFilter::ApplyFilter()` — Flip-Flags aus `SnesHdPpuPixelInfo` auslesen, HD-Pixel entsprechend spiegeln beim Schreiben.
+
+**Bug 2: Transparenter Schatten + Charaktere laufen durch Boden**
+- Ursache: Sub-pixel Position Mismatch zwischen nativer Sprite-Renderposition und HD-Tile-Grid. Transparente Sprite-Pixel lassen HD-BG-Tiles durchscheinen (bekannte Limitation, sollte mit echten HD-Tiles besser werden, aber sub-pixel Offset bleibt).
+- Fix: Position-Alignment in `SnesHdVideoFilter` prüfen; langfristig HD-Sprites.
+
+**Bug 3: BG2 (Hintergründe) nicht in HD**
+- Ursache: `exportAsTexturePack` exportiert nur BG1; `bg2.png` im Container ist Spritesheet, nicht Einzeltiles.
+- Fix: BG2-Tile-Export in Viewer analog zu BG1 implementieren (mit `ppuCfg.bg2ChrBase`).
+
+**Bug 4: Level-Tiles auf Worldmap (VRAM-Kollision)**
+- Ursache: HD-Pack wird global für die ROM geladen. VRAM-Adressen des Piratenschiff-Sets überlappen mit Worldmap-Tiles. Der Filter matcht auf dieselben Adressen → ca. 20% Worldmap zeigt Piratenschiff-HD-Tiles.
+- Fix (kurzfristig): Content-Verifikation im Loader (Tile-Pixel-Checksum prüfen bevor HD-Tile angewendet wird). Langfristig: Level-kontextsensitives Laden.
 
 ### M6 — Tile Viewer Integration (niedrigere Priorität)
 - HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)
@@ -196,7 +223,7 @@ The viewer's `exportAsTexturePack()` function exports tiles in a compatible form
 The viewer exports to `textures/DONKEY_KONG_2/bg/bg1/` but Mesen2 looks in `HdPacks/{romName}/bg/bg1/`.
 To test: either rename the export directory, or update the viewer's export path.
 
-The `romName` in Mesen2 comes from `_cart->GetCartName()` — for DKC2 this is likely `DONKEY KONG 2` or similar (from the SNES ROM header at offset $FFC0). Verify with a test ROM.
+The `romName` in Mesen2 comes from `_cart->GetCartName()` — für DKC2 ist das **`Donkey Kong Country 2`** (verifiziert aus SNES ROM-Header, offset 0xFFC0 / HiROM+SMC = 0x101C0).
 
 ## Upstream-Situation: MesenCE
 
