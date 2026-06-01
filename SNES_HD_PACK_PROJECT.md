@@ -6,9 +6,9 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Build:** M4.2 gebaut und verifiziert (committed `c27054c9`).  
-**Status: M5 in Arbeit** — echte DKC2 HD-Tiles vom Viewer Tool einspielen.  
-**Next Step:** Viewer-Export-Verzeichnis auf Mesen2-Loader-Pfad mappen, ROM-Name klären, erstes Level mit echten Tiles verifizieren.
+**Build:** M5 abgeschlossen (2026-06-01). Letzter Commit Mesen2: `88c9deb3`, Viewer: `2eed885`.  
+**Status: M5.1 geplant** — Bugfixes nach erstem Praxistest.  
+**Next Step:** Flip-Handling in `SnesHdVideoFilter::ApplyFilter()` implementieren (größter visueller Bug: Ghosting-Glitches durch fehlende H/V-Flip-Anwendung auf HD-Tiles).
 
 ## Milestone History
 
