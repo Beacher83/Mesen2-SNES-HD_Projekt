@@ -106,14 +106,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			uint32_t outY = (y - overscan.Top) * hdScale;
 
 			if(hdTile && tileInfo && !hdTile->HdTileData.empty()) {
-				// Draw HD tile pixels for this source pixel's sub-pixels
 				uint8_t srcTileX = tileInfo->OffsetX;
 				uint8_t srcTileY = tileInfo->OffsetY;
+				bool hFlip = tileInfo->HorizontalMirror;
+				bool vFlip = tileInfo->VerticalMirror;
 
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
 					for(uint32_t dx = 0; dx < hdScale; dx++) {
-						uint32_t hdPixelX = srcTileX * hdScale + dx;
-						uint32_t hdPixelY = srcTileY * hdScale + dy;
+						uint32_t hdPixelX = srcTileX * hdScale + (hFlip ? (hdScale - 1 - dx) : dx);
+						uint32_t hdPixelY = srcTileY * hdScale + (vFlip ? (hdScale - 1 - dy) : dy);
 
 						if(hdPixelX < hdTile->Width && hdPixelY < hdTile->Height) {
 							uint32_t hdColor = hdTile->HdTileData[hdPixelY * hdTile->Width + hdPixelX];
