@@ -111,7 +111,7 @@ struct SnesHdPpuPixelInfo
 struct SnesHdScreenInfo
 {
 	static constexpr int ScreenWidth = 256;
-	static constexpr int ScreenHeight = 240;   // Max visible (including overscan)
+	static constexpr int ScreenHeight = 239;   // Full PPU frame height (matches SnesPpu::SendFrame height)
 	static constexpr int ScreenPixelCount = ScreenWidth * ScreenHeight;
 
 	SnesHdPpuPixelInfo* ScreenTiles;

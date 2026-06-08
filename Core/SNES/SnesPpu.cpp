@@ -916,10 +916,13 @@ void SnesPpu::RenderScanline()
 		ApplyBrightness<true>();
 		ApplyHiResMode();
 
-		// Copy final main screen flags to HD pixel info (for sprite priority detection)
-		if(_hdData && _hdActiveScreen && _scanline < SnesHdScreenInfo::ScreenHeight) {
+		// Copy final screen info to HD pixel info (using same row offset as ApplyHiResMode)
+		uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
+		if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight) {
 			for(int x = _drawStartX; x <= _drawEndX && x < SnesHdScreenInfo::ScreenWidth; x++) {
-				_hdActiveScreen->ScreenTiles[_scanline * SnesHdScreenInfo::ScreenWidth + x].MainScreenFlags = _mainScreenFlags[x];
+				SnesHdPpuPixelInfo& px = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
+				px.MainScreenFlags = _mainScreenFlags[x];
+				px.SubScreenColor = _subScreenBuffer[x];
 			}
 		}
 
@@ -1005,6 +1008,11 @@ void SnesPpu::RenderTilemap()
 
 	uint8_t mosaicCounter = applyMosaic ? (_drawStartX % _state.MosaicSize) : 0;
 
+	// PPU writes _scanline's data into buffer row (_scanline+6) for non-overscan, (_scanline-1) for overscan.
+	// ScreenTiles must use the same row index so the filter reads matching data from both buffers.
+	const uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
+	const bool hdValid = _hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight;
+
 	uint8_t lookupIndex;
 	uint8_t chrDataOffset;
 	uint8_t hiresSubColor;
@@ -1077,8 +1085,8 @@ void SnesPpu::RenderTilemap()
 			// HD Pack: only record tile info when this BG layer wins the pixel.
 			// Always writes to BgTiles[0] so a higher-priority layer rendered later overwrites it.
 			// BgTileCount=0 means sprite or backdrop won — filter uses native SNES pixel.
-			if(winsMain && _hdData && _scanline < SnesHdScreenInfo::ScreenHeight && x < SnesHdScreenInfo::ScreenWidth) {
-				SnesHdPpuPixelInfo& pixelInfo = _hdActiveScreen->ScreenTiles[_scanline * SnesHdScreenInfo::ScreenWidth + x];
+			if(winsMain && hdValid && x < SnesHdScreenInfo::ScreenWidth) {
+				SnesHdPpuPixelInfo& pixelInfo = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
 				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[0];
 				uint16_t tileIndex = tilemapData & 0x3FF;
 				tileInfo.Key.VramAddress = (_state.Layers[layerIndex].ChrAddress + tileIndex * 4 * bpp) & 0x7FFF;
@@ -1091,17 +1099,14 @@ void SnesPpu::RenderTilemap()
 				tileInfo.Priority = priority;
 				tileInfo.TilemapData = tilemapData;
 
+				// Store raw tile offsets (0-7) — flip is applied by the HD filter using HorizontalMirror/VerticalMirror
 				if constexpr(hiResMode) {
 					tileInfo.OffsetX = ((x << 1) + 1 + hScroll) & 0x07;
 				} else {
 					tileInfo.OffsetX = (x + hScroll) & 0x07;
 				}
-				if(hMirrorHd) {
-					tileInfo.OffsetX = 7 - tileInfo.OffsetX;
-				}
 				uint16_t realY = IsDoubleHeight() ? (_oddFrame ? ((_scanline << 1) + 1) : (_scanline << 1)) : _scanline;
-				uint8_t yOffset = (realY + _layerData[layerIndex].Tiles[lookupIndex].VScroll) & 0x07;
-				tileInfo.OffsetY = vMirrorHd ? (7 - yOffset) : yOffset;
+				tileInfo.OffsetY = (realY + _layerData[layerIndex].Tiles[lookupIndex].VScroll) & 0x07;
 				pixelInfo.BgTileCount = 1;
 			}
 		}
@@ -1572,6 +1577,16 @@ void SnesPpu::SendFrame()
 	
 	// HD Pack: attach screen info and swap buffers
 	if(_hdData) {
+		// Zero the rows that the PPU's pixel buffer also blanks (non-overscan: top 7, bottom 8).
+		// ScreenTiles uses the same hdScanline offset as ApplyHiResMode, so rows 0-6 and 231-238
+		// are never written by rendering and remain zero — this memset is belt-and-suspenders.
+		if(!_overscanFrame) {
+			constexpr int top = 7, bottom = 8;
+			memset(_hdActiveScreen->ScreenTiles, 0,
+				sizeof(SnesHdPpuPixelInfo) * SnesHdScreenInfo::ScreenWidth * top);
+			memset(_hdActiveScreen->ScreenTiles + SnesHdScreenInfo::ScreenWidth * (SnesHdScreenInfo::ScreenHeight - bottom), 0,
+				sizeof(SnesHdPpuPixelInfo) * SnesHdScreenInfo::ScreenWidth * bottom);
+		}
 		_hdActiveScreen->FrameNumber = _frameCount;
 		frame.Data = _hdActiveScreen;
 		// Swap to other buffer for next frame

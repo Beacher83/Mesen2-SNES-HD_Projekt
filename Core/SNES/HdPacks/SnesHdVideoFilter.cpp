@@ -106,10 +106,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			uint32_t outY = (y - overscan.Top) * hdScale;
 
 			if(hdTile && tileInfo && !hdTile->HdTileData.empty()) {
-				uint8_t srcTileX = tileInfo->OffsetX;
-				uint8_t srcTileY = tileInfo->OffsetY;
+				uint8_t rawX = tileInfo->OffsetX;
+				uint8_t rawY = tileInfo->OffsetY;
 				bool hFlip = tileInfo->HorizontalMirror;
 				bool vFlip = tileInfo->VerticalMirror;
+				uint8_t srcTileX = hFlip ? (7 - rawX) : rawX;
+				uint8_t srcTileY = vFlip ? (7 - rawY) : rawY;
 
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
 					for(uint32_t dx = 0; dx < hdScale; dx++) {
@@ -125,15 +127,16 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 								if(alpha == 0xFF) {
 									outputBuffer[outIndex] = hdColor;
 								} else if(alpha > 0) {
-									// Alpha blend with fallback SNES color
-									uint32_t bgColor = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
+									// Alpha blend with sub-screen (BG2/backdrop) as background.
+									// Using main-screen would blend HD tile with native BG1 itself,
+									// creating a doubled appearance for semi-transparent tiles.
+									uint32_t bgColor = _calculatedPalette[pixelInfo.SubScreenColor & 0x7FFF];
 									uint8_t srcR = (bgColor >> 16) & 0xFF;
 									uint8_t srcG = (bgColor >> 8) & 0xFF;
 									uint8_t srcB = bgColor & 0xFF;
 									uint8_t hdR = (hdColor >> 16) & 0xFF;
 									uint8_t hdG = (hdColor >> 8) & 0xFF;
 									uint8_t hdB = hdColor & 0xFF;
-									// HD tile data is premultiplied alpha, so blend accordingly
 									uint8_t outR = hdR + ((srcR * (255 - alpha)) / 255);
 									uint8_t outG = hdG + ((srcG * (255 - alpha)) / 255);
 									uint8_t outB = hdB + ((srcB * (255 - alpha)) / 255);
