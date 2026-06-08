@@ -63,16 +63,6 @@ OverscanDimensions SnesHdVideoFilter::GetOverscan()
 	return BaseVideoFilter::GetOverscan();
 }
 
-static uint32_t ComputeVramTileChecksum(const uint16_t* vram, uint16_t wordAddr)
-{
-	// Sum 16 words (32 bytes = one 4bpp 8x8 tile) — matches JS computeVramChecksum() in viewer
-	uint32_t sum = 0;
-	for(int i = 0; i < 16; i++) {
-		sum += vram[wordAddr + i];
-	}
-	return sum;
-}
-
 void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 {
 	if(_frameData == nullptr) {
@@ -106,19 +96,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPpuTileInfo* tileInfo = nullptr;
 
 			if(pixelInfo.BgTileCount > 0) {
-				hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key);
+				hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
 				if(hdTile) {
-					// VRAM content verification: reject tile if VRAM has changed since export
-					// (fixes collision when multiple gfxsets share the same VRAM addresses)
-					if(hdTile->HasChecksum && hdScreen->Vram != nullptr) {
-						uint32_t live = ComputeVramTileChecksum(hdScreen->Vram, hdTile->Key.VramAddress);
-						if(live != hdTile->VramChecksum) {
-							hdTile = nullptr;
-						}
-					}
-					if(hdTile) {
-						tileInfo = &pixelInfo.BgTiles[0];
-					}
+					tileInfo = &pixelInfo.BgTiles[0];
 				}
 			}
 

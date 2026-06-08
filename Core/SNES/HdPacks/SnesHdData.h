@@ -248,17 +248,20 @@ public:
 		}
 	}
 
-	// Look up an HD tile replacement. Returns nullptr if no replacement exists.
-	SnesHdPackTileInfo* GetMatchingTile(const SnesHdTileKey& key)
+	// Look up an HD tile replacement.
+	// When vram is provided, selects among multiple candidates by checksum (multi-gfxset packs).
+	// Falls back to first non-transparent tile for legacy packs without checksums.
+	SnesHdPackTileInfo* GetMatchingTile(const SnesHdTileKey& key, const uint16_t* vram = nullptr)
 	{
 		auto it = TileByKey.find(key);
-		if(it != TileByKey.end() && !it->second.empty()) {
-			// For now, return the first match (no conditions yet)
-			SnesHdPackTileInfo* tile = it->second[0];
-			if(tile->IsFullyTransparent) {
-				return nullptr;
-			}
-			return tile;
+		if(it == TileByKey.end()) return nullptr;
+
+		for(SnesHdPackTileInfo* tile : it->second) {
+			if(tile->IsFullyTransparent) continue;
+			if(!tile->HasChecksum || vram == nullptr) return tile;
+			uint32_t sum = 0;
+			for(int i = 0; i < 16; i++) sum += vram[key.VramAddress + i];
+			if(sum == tile->VramChecksum) return tile;
 		}
 		return nullptr;
 	}

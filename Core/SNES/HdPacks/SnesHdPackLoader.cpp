@@ -69,14 +69,39 @@ bool SnesHdPackLoader::LoadPack()
 
 	bool anyLoaded = false;
 
-	// Load BG tiles for each layer (bg1 through bg4)
+	// Load BG tiles for each layer (bg1 through bg4).
+	// New format: bg/bg1/gfxset_07/*.png  (one subdir per gfxset)
+	// Legacy format: bg/bg1/*.png          (flat, no gfxset)
 	for(uint8_t layer = 0; layer < 4; layer++) {
 		string layerDir = FolderUtilities::CombinePath(
 			FolderUtilities::CombinePath(_hdPackFolder, "bg"),
 			"bg" + std::to_string(layer + 1)
 		);
-		if(LoadTilesFromDirectory(layerDir, layer, false)) {
-			anyLoaded = true;
+
+		// Scan for gfxset_XX subdirectories
+		bool foundGfxsetDirs = false;
+		vector<string> subdirs;
+		try { subdirs = FolderUtilities::GetFolders(layerDir); } catch(...) {}
+
+		for(const string& subdir : subdirs) {
+			// Extract last path component to get dir name
+			size_t sep = subdir.find_last_of("/\\");
+			string dirName = (sep != string::npos) ? subdir.substr(sep + 1) : subdir;
+
+			uint8_t gfxsetIdx = 0;
+			if(ParseGfxsetDirName(dirName, gfxsetIdx)) {
+				if(LoadTilesFromDirectory(subdir, layer, false, gfxsetIdx)) {
+					anyLoaded = true;
+				}
+				foundGfxsetDirs = true;
+			}
+		}
+
+		// Fall back to flat layout if no gfxset subdirs found
+		if(!foundGfxsetDirs) {
+			if(LoadTilesFromDirectory(layerDir, layer, false)) {
+				anyLoaded = true;
+			}
 		}
 	}
 
@@ -133,17 +158,18 @@ bool SnesHdPackLoader::LoadChecksums()
 	for(uint32_t i = 0; i < count; i++) {
 		uint16_t vramAddr = 0;
 		uint8_t layerIdx = 0;
-		uint8_t reserved = 0;
+		uint8_t gfxsetIdx = 0;
 		uint32_t checksum = 0;
 
 		file.read((char*)&vramAddr, 2);
 		file.read((char*)&layerIdx, 1);
-		file.read((char*)&reserved, 1);
+		file.read((char*)&gfxsetIdx, 1);
 		file.read((char*)&checksum, 4);
 
 		if(file.fail()) break;
 
-		uint32_t key = ((uint32_t)layerIdx << 16) | vramAddr;
+		// Key = (gfxset << 24) | (layer << 16) | vramAddr
+		uint32_t key = ((uint32_t)gfxsetIdx << 24) | ((uint32_t)layerIdx << 16) | vramAddr;
 		_checksumMap[key] = checksum;
 	}
 
@@ -153,7 +179,21 @@ bool SnesHdPackLoader::LoadChecksums()
 	return !_checksumMap.empty();
 }
 
-bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t layerIndex, bool isSprite)
+bool SnesHdPackLoader::ParseGfxsetDirName(const string& dirName, uint8_t& gfxsetIndex)
+{
+	// Expects "gfxset_07", "gfxset_8", etc.
+	if(dirName.size() < 8 || dirName.substr(0, 7) != "gfxset_") return false;
+	try {
+		unsigned long idx = std::stoul(dirName.substr(7), nullptr, 10);
+		if(idx > 254) return false;  // 0xFF reserved for legacy (no gfxset)
+		gfxsetIndex = (uint8_t)idx;
+		return true;
+	} catch(...) {
+		return false;
+	}
+}
+
+bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t layerIndex, bool isSprite, uint8_t gfxsetIndex)
 {
 	std::unordered_set<string> extensions = { ".png" };
 	vector<string> files;
@@ -215,12 +255,14 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		tile->HdTileData = bitmap->PixelData;
 		tile->UpdateFlags();
 
-		// Assign VRAM checksum if available
-		uint32_t csKey = ((uint32_t)layerIndex << 16) | vramAddr;
-		auto csIt = _checksumMap.find(csKey);
-		if(csIt != _checksumMap.end()) {
-			tile->VramChecksum = csIt->second;
-			tile->HasChecksum = true;
+		// Assign VRAM checksum if available (only for gfxset-namespaced tiles, not legacy flat packs)
+		if(gfxsetIndex != 0xFF) {
+			uint32_t csKey = ((uint32_t)gfxsetIndex << 24) | ((uint32_t)layerIndex << 16) | vramAddr;
+			auto csIt = _checksumMap.find(csKey);
+			if(csIt != _checksumMap.end()) {
+				tile->VramChecksum = csIt->second;
+				tile->HasChecksum = true;
+			}
 		}
 
 		// Register in lookup map
