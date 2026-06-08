@@ -6,9 +6,16 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Build:** Bug #4 verifiziert (2026-06-08). Mesen2: `75589f83`, Viewer: `1628677`.  
-**Status:** Bug #1 ✓, Bug #2 ✓, Bug #3 ✓, Bug #4 ✓ — alle gefixt. Bug #5 Known Limitation.  
-**Next Step:** Multi-Level-Workflow (VRAM-Snapshot im Container, alle Level exportierbar).
+**Stand: 2026-06-08**  
+**Bug #4 verifiziert** (Mesen2: `75589f83`, Viewer: `1628677`).  
+**Multi-Gfxset-Architektur implementiert, aber noch nicht gebaut/getestet** (Mesen2: `16dadecf`, Viewer: `4331822`).
+
+**Nächste Schritte (Priorität):**
+1. Mesen2 neu bauen + Multi-Gfxset-Pack testen (Level 1 + Worldmap)
+2. Level 2 korrekt exportieren (richtigen Gfxset-Index laden, neu speichern)
+3. Weitere Gfxsets für vollständige Spielabdeckung
+4. Bug #5 (BG2 Animation Flicker) — Known Limitation, Diagnose offen
+5. M6: HD-Tiles im Tile-Viewer-Debugger
 
 ## Milestone History
 
@@ -174,23 +181,38 @@ ROM-Name: `Donkey Kong Country 2` (verifiziert aus SNES ROM-Header offset 0xFFC0
 - Klären ob Mechanismus 2 (Tilemap-Switching) oder 3 (VRAM-Overwrite / CHR-Animation)
 - Mesen2: Sub-Screen Color-Math für BG2 HD-Tiles prüfen
 
-### Multi-Level-Workflow — Next (Viewer: VRAM-Snapshot)
+### Multi-Gfxset-Architektur — IMPLEMENTIERT, Test ausstehend
 
-**Ziel:** Alle Level des Spiels (nacheinander) in einen Container laden und als vollständiges HD Pack exportieren.
+**Commits:** Mesen2 `16dadecf`, Viewer `4331822`
 
-**Problem:** Checksummen werden beim Container-Speichern aus `currentBgData.vram` berechnet — das ist korrekt, wenn das Level gerade geladen ist, aber falsch wenn vorher ein anderes Level aktiv war.
+**Neues Exportformat (Viewer):**
+```
+bg/bg1/gfxset_07/2000_P03.png    (Pirate Panic)
+bg/bg1/gfxset_08/2000_P03.png    (anderer Level, gleiche Adresse, anderer Inhalt)
+```
+- Deduplizierung jetzt **per Gfxset** (nicht mehr global)
+- `checksums.bin` Byte 3 = gfxsetIndex (war `reserved=0`)
+- tileChecksums-Einträge enthalten `gfxset`-Feld (aus `currentStyle.graphics`)
 
-**Fix (Viewer, `index.html`):**
-- Beim Laden eines Gfxsets: kompakten VRAM-Snapshot der genutzten Tile-Bytes in `catalogData.vramSnapshot` speichern
-- Beim Container-Speichern: Snapshot in Set-Daten ablegen (`set.vramSnapshot`)
-- Beim Texture-Pack-Export: Checksummen aus `set.vramSnapshot` statt aus live `currentBgData.vram` berechnen
-- Effekt: VRAM-Zustand des Levels bleibt korrekt erhalten, auch wenn der User später (nach einem Level-Wechsel) erst speichert
+**Mesen2 Loader:**
+- `LoadPack()` sucht `gfxset_XX/`-Unterordner je Layer; Fallback auf Flat-Layout (rückwärtskompatibel)
+- `ParseGfxsetDirName()`: parst `"gfxset_07"` → Index 7
+- `_checksumMap`-Key: `(gfxset << 24) | (layer << 16) | vramAddr`
 
-**Workflow dann:**
-1. Level N laden → Tiles upscalen → Save to Container (Snapshot gesichert)
-2. Level N+1 laden → Tiles upscalen → Save to Container
-3. … für alle Level wiederholen
-4. Texture Pack Export → ein ZIP, alle Level, korrekte Checksummen
+**Mesen2 Filter:**
+- `GetMatchingTile(key, vram)` iteriert Kandidaten-Vector → gibt Tile mit passendem VRAM-Checksum zurück
+- Multi-Gfxset-Auflösung direkt in `GetMatchingTile`, nicht mehr in `ApplyFilter`
+
+**Workflow:**
+1. Gfxset N laden → upscalen → Save to Container
+2. Nächsten Gfxset laden → upscalen → Save
+3. Export → ein ZIP deckt alle Gfxsets ab
+4. DKC2-Levels die denselben Gfxset nutzen, profitieren automatisch
+
+**Noch offen / nächste Session:**
+- Build + Test: Level 1 + Worldmap mit neuem Pack prüfen
+- Level 2 korrekt exportieren (richtiger Gfxset-Index)
+- Optional: VRAM-Snapshot beim Laden sichern (Robustheit wenn User Gfxset wechselt bevor er speichert)
 
 ### M6 — Tile Viewer Integration (niedrigere Priorität)
 - HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)
