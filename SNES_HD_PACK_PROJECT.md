@@ -6,9 +6,9 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Build:** M5.1 abgeschlossen (2026-06-08). Letzter Commit Mesen2: `abd2da7c`.  
-**Status: M5.1 verifiziert** — Bug #1 (Flip) und Bug #2 (Scanline-Offset) behoben und im Spiel bestätigt.  
-**Next Step:** M5.1 Bug #3 (BG2-Export) oder Bug #4 (VRAM-Kollision), oder Wechsel zu M6 (Tile-Viewer).
+**Build:** M5.1 abgeschlossen (2026-06-08). Bug #4 Fix: VRAM-Checksum-Verifikation.  
+**Status:** Bug #1 ✓, Bug #2 ✓, Bug #3 ✓, Bug #4 ✓ — alle gefixt. Bug #5 Known Limitation.  
+**Next Step:** M6 (Tile-Viewer) oder Bug #5 Diagnose.
 
 ## Milestone History
 
@@ -146,13 +146,33 @@ ROM-Name: `Donkey Kong Country 2` (verifiziert aus SNES ROM-Header offset 0xFFC0
 - Fix: `hdScanline = _overscanFrame ? (_scanline-1) : (_scanline+6)` in `RenderTilemap()` und `RenderScanline()` — gleiche Formel wie `ApplyHiResMode()`.
 - Gleichzeitig: `ScreenHeight` 240→239 (Constant-Fix), Flip-Refactor PPU→Filter, Alpha-Blend auf SubScreenColor umgestellt.
 
-**Bug 3: BG2 (Hintergründe) nicht in HD — OFFEN**
-- Ursache: `exportAsTexturePack` exportiert nur BG1; `bg2.png` im Container ist Spritesheet, nicht Einzeltiles.
-- Fix: BG2-Tile-Export in Viewer analog zu BG1 implementieren (mit `ppuCfg.bg2ChrBase`).
+**Bug 3: BG2 (Hintergründe) nicht in HD ✓ (Viewer Commits 62a1135, 9eb3be3, 142d6df)**
+- Dynamische Tile-Größe, Live-Catalog-Fallback, BG2-Tilemap-Extraktion implementiert.
+- BG2-Tiles werden korrekt exportiert und in Mesen dargestellt.
 
-**Bug 4: Level-Tiles auf Worldmap (VRAM-Kollision) — OFFEN**
-- Ursache: HD-Pack wird global für die ROM geladen. VRAM-Adressen des Piratenschiff-Sets überlappen mit Worldmap-Tiles. Der Filter matcht auf dieselben Adressen → ca. 20% Worldmap zeigt Piratenschiff-HD-Tiles.
-- Fix (kurzfristig): Content-Verifikation im Loader (Tile-Pixel-Checksum prüfen bevor HD-Tile angewendet wird). Langfristig: Level-kontextsensitives Laden.
+**Bug 4: Level-Tiles auf Worldmap (VRAM-Kollision) ✓ GEFIXT**
+- Ursache: DKC2 lädt verschiedene Gfxsets an dieselben VRAM-Adressen. `{vramAddr}_P{pal}` reicht nicht zur eindeutigen Identifikation.
+- Fix: VRAM-Checksum-Verifikation. Der Viewer berechnet beim Speichern für jede exportierte Tile eine Prüfsumme (Summe der 16 VRAM-Wörter = 32 Bytes) und speichert sie in `checksums.bin`. Der Loader (`LoadChecksums()`) liest die Datei und hängt die Checksummen an `SnesHdPackTileInfo`. Der Filter (`ApplyFilter()`) prüft via `ComputeVramTileChecksum()` ob das aktuelle VRAM noch stimmt — bei Abweichung kein HD-Tile.
+- Workflow: Level im Viewer laden → Container speichern (berechnet Checksummen) → Texture Pack exportieren (schreibt `checksums.bin` in ZIP).
+- Rückwärtskompatibel: Packs ohne `checksums.bin` verhalten sich wie bisher (kein `HasChecksum` gesetzt → immer matchen).
+
+**Bug 5: BG2 Tile-Animation Flicker — Known Limitation (geparkt 2026-06-08)**
+
+*Symptom:* Ozean-Animation in "Pirate Panic" (BG2) wechselt zwischen HD (4×) und nativem Bild wenn Kamera nach oben scrollt (unterer Ozeanbereich sichtbar).
+
+*Diagnose:* HD/nativ-Wechsel (nicht bloße Farbverschiebung) → Tile-Keys fehlen im HD-Pack für bestimmte Animationszustände. Genaue Ursache unklar — wahrscheinlich eine Kombination aus:
+- **Tilemap-Animation (Mechanismus 2):** Spiel wechselt tileNum-Einträge per Frame; unser Export erfasst nur einen Animationsframe
+- **Palette-Mismatch:** Einige Tiles (speziell unterer Tilemap-Bereich) verwenden andere Palette-Rows als erwartet
+- **Sonderproblem unterster Tilemap-Rows:** Beim Tilemap-Render erschienen die untersten ~4 Tilemap-Zeilen als grau/bräunlich (möglicher Sub-Screen-Blend-Effekt im Spiel, der ohne Farb-Math-Unterstützung falsch aussieht)
+
+*Was versucht wurde (beides hat nicht funktioniert):*
+1. **Tilemap-Render (Original):** bg2.png = Tilemap gerendert → gute Upscaling-Qualität, aber nur ein Animations-Frame → Flicker; graue Tiles im unteren Bereich → Farbverschiebung bei Kamera-Scroll
+2. **Raw-VRAM-Grid:** bg2.png = alle 512 VRAM-Tiles ab chrBase sequenziell → alle Frames vorhanden, aber: (a) schlechtere Upscaling-Qualität (kein Szenen-Kontext), (b) Palette-Mismatch für Tiles die nicht im aktuellen Tilemap-Frame waren → Flicker schlimmer als zuvor. Revert auf Commit `142d6df`.
+
+*Nächster Diagnose-Schritt (wenn wieder aufgegriffen):*
+- Hit/Miss-Logging im `SnesHdVideoFilter` aktivieren → sehen welche konkreten Keys fehlen
+- Klären ob Mechanismus 2 (Tilemap-Switching) oder 3 (VRAM-Overwrite / CHR-Animation)
+- Mesen2: Sub-Screen Color-Math für BG2 HD-Tiles prüfen
 
 ### M6 — Tile Viewer Integration (niedrigere Priorität)
 - HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)

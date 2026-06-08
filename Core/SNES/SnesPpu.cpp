@@ -39,6 +39,8 @@ SnesPpu::SnesPpu(Emulator* emu, SnesConsole* console)
 
 	_hdScreenInfo[0] = new SnesHdScreenInfo();
 	_hdScreenInfo[1] = new SnesHdScreenInfo();
+	_hdScreenInfo[0]->Vram = _vram;
+	_hdScreenInfo[1]->Vram = _vram;
 	_hdActiveScreen = _hdScreenInfo[0];
 }
 

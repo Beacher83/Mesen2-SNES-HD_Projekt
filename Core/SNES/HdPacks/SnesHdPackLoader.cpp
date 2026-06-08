@@ -64,6 +64,8 @@ bool SnesHdPackLoader::LoadPack()
 
 	// Try to load manifest for scale info
 	LoadManifest();
+	// Load optional checksums.bin for VRAM content verification (Bug #4: collision fix)
+	LoadChecksums();
 
 	bool anyLoaded = false;
 
@@ -108,6 +110,47 @@ bool SnesHdPackLoader::LoadManifest()
 	// For the initial implementation, we hardcode scale=4
 
 	return true;
+}
+
+bool SnesHdPackLoader::LoadChecksums()
+{
+	// checksums.bin format (all little-endian):
+	//   uint32_t count
+	//   count × { uint16_t vramAddr, uint8_t layerIndex, uint8_t reserved, uint32_t checksum }
+	string checksumPath = FolderUtilities::CombinePath(_hdPackFolder, "checksums.bin");
+
+	ifstream file(checksumPath, std::ios::binary);
+	if(!file) {
+		return false;  // No checksum file — pack was exported without checksums, all tiles match
+	}
+
+	uint32_t count = 0;
+	file.read((char*)&count, 4);
+	if(file.fail() || count == 0 || count > 65536) {
+		return false;
+	}
+
+	for(uint32_t i = 0; i < count; i++) {
+		uint16_t vramAddr = 0;
+		uint8_t layerIdx = 0;
+		uint8_t reserved = 0;
+		uint32_t checksum = 0;
+
+		file.read((char*)&vramAddr, 2);
+		file.read((char*)&layerIdx, 1);
+		file.read((char*)&reserved, 1);
+		file.read((char*)&checksum, 4);
+
+		if(file.fail()) break;
+
+		uint32_t key = ((uint32_t)layerIdx << 16) | vramAddr;
+		_checksumMap[key] = checksum;
+	}
+
+	if(!_checksumMap.empty()) {
+		MessageManager::Log("[SNES HD Pack] Loaded " + std::to_string(_checksumMap.size()) + " VRAM checksums for content verification");
+	}
+	return !_checksumMap.empty();
 }
 
 bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t layerIndex, bool isSprite)
@@ -171,6 +214,14 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		// Copy pixel data directly into tile (since each PNG = one tile)
 		tile->HdTileData = bitmap->PixelData;
 		tile->UpdateFlags();
+
+		// Assign VRAM checksum if available
+		uint32_t csKey = ((uint32_t)layerIndex << 16) | vramAddr;
+		auto csIt = _checksumMap.find(csKey);
+		if(csIt != _checksumMap.end()) {
+			tile->VramChecksum = csIt->second;
+			tile->HasChecksum = true;
+		}
 
 		// Register in lookup map
 		_data->TileByKey[tile->Key].push_back(tile.get());

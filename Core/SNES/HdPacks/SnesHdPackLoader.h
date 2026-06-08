@@ -16,9 +16,14 @@ private:
 	SnesHdPackData* _data = nullptr;
 	string _hdPackFolder;
 
+	// Checksum map: key = (layerIndex << 16) | vramAddr → checksum value
+	// Populated from checksums.bin; used to reject HD tiles when VRAM content doesn't match.
+	std::unordered_map<uint32_t, uint32_t> _checksumMap;
+
 	bool InitializeLoader(const string& romName, SnesHdPackData* data);
 	bool LoadPack();
 	bool LoadManifest();
+	bool LoadChecksums();
 	bool LoadTilesFromDirectory(const string& dirPath, uint8_t layerIndex, bool isSprite);
 	bool LoadPngFile(const string& filePath, SnesHdBitmapInfo& bitmap);
 	bool ParseTileFilename(const string& filename, uint16_t& vramAddr, uint8_t& paletteIndex);

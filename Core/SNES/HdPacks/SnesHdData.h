@@ -115,6 +115,7 @@ struct SnesHdScreenInfo
 	static constexpr int ScreenPixelCount = ScreenWidth * ScreenHeight;
 
 	SnesHdPpuPixelInfo* ScreenTiles;
+	uint16_t* Vram = nullptr;   // Pointer to PPU VRAM (word-addressed, 0x8000 entries); set by PPU at init
 	uint32_t FrameNumber = 0;
 	uint16_t Scanline = 0;
 
@@ -145,6 +146,9 @@ struct SnesHdPackTileInfo
 	uint32_t Y = 0;             // Y offset in the source PNG atlas
 	uint32_t Width = 0;         // HD tile width (e.g. 32 for 4x scale)
 	uint32_t Height = 0;        // HD tile height
+
+	uint32_t VramChecksum = 0;   // Sum of VRAM words for this tile's CHR region (0 = not verified)
+	bool HasChecksum = false;    // If false, tile was exported without checksum data (always match)
 
 	int Brightness = 255;       // Brightness adjustment (0-255)
 	bool Blank = false;         // All pixels are the same color
