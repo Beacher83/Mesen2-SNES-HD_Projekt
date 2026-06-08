@@ -6,9 +6,9 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Build:** M5 abgeschlossen (2026-06-01). Letzter Commit Mesen2: `88c9deb3`, Viewer: `2eed885`.  
-**Status: M5.1 geplant** — Bugfixes nach erstem Praxistest.  
-**Next Step:** Flip-Handling in `SnesHdVideoFilter::ApplyFilter()` implementieren (größter visueller Bug: Ghosting-Glitches durch fehlende H/V-Flip-Anwendung auf HD-Tiles).
+**Build:** M5.1 abgeschlossen (2026-06-08). Letzter Commit Mesen2: `abd2da7c`.  
+**Status: M5.1 verifiziert** — Bug #1 (Flip) und Bug #2 (Scanline-Offset) behoben und im Spiel bestätigt.  
+**Next Step:** M5.1 Bug #3 (BG2-Export) oder Bug #4 (VRAM-Kollision), oder Wechsel zu M6 (Tile-Viewer).
 
 ## Milestone History
 
@@ -135,21 +135,22 @@ ROM-Name: `Donkey Kong Country 2` (verifiziert aus SNES ROM-Header offset 0xFFC0
 - BG2-Export im Viewer (Hintergründe noch nativ)
 - VRAM-Kollision auf Worldmap (siehe Known Limitations)
 
-### M5.1 — Bugfixes nach erstem Praxistest (GEPLANT)
+### M5.1 — Bugfixes nach erstem Praxistest ✓ (2026-06-08)
 
-**Bug 1: Grafische Glitches (doppelte/dreifache Konturen versetzt)**
-- Ursache: Flip-Bits werden im HD-Filter nicht angewendet. Gespiegelte Tiles (H/V-Flip in Tilemap) haben dieselbe VRAM-Adresse, zeigen aber die un-gespiegelte HD-Version.
-- Fix: `SnesHdVideoFilter::ApplyFilter()` — Flip-Flags aus `SnesHdPpuPixelInfo` auslesen, HD-Pixel entsprechend spiegeln beim Schreiben.
+**Bug 1: Grafische Glitches bei gespiegelten Tiles ✓ (Commit 2209d5f3)**
+- Ursache: H/V-Flip-Bits wurden im HD-Filter nicht angewendet → gespiegelte Tiles zeigten un-gespiegelte HD-Version → Ghosting.
+- Fix: Flip-Flags aus `SnesHdPpuPixelInfo` auslesen, HD-Pixel in `ApplyFilter()` entsprechend spiegeln.
 
-**Bug 2: Transparenter Schatten + Charaktere laufen durch Boden**
-- Ursache: Sub-pixel Position Mismatch zwischen nativer Sprite-Renderposition und HD-Tile-Grid. Transparente Sprite-Pixel lassen HD-BG-Tiles durchscheinen (bekannte Limitation, sollte mit echten HD-Tiles besser werden, aber sub-pixel Offset bleibt).
-- Fix: Position-Alignment in `SnesHdVideoFilter` prüfen; langfristig HD-Sprites.
+**Bug 2: HD-Tiles 6 Pixel nach oben verschoben → Diddy im Boden, Seile falsch ✓ (Commit abd2da7c)**
+- Ursache: `ApplyHiResMode()` schreibt `_scanline N` in PPU-Buffer-Zeile `N+6` (non-overscan). ScreenTiles wurde aber bei Index `_scanline` beschrieben → Filter las Tile-Info von Scanline N+6 mit Pixeldaten von Scanline N.
+- Fix: `hdScanline = _overscanFrame ? (_scanline-1) : (_scanline+6)` in `RenderTilemap()` und `RenderScanline()` — gleiche Formel wie `ApplyHiResMode()`.
+- Gleichzeitig: `ScreenHeight` 240→239 (Constant-Fix), Flip-Refactor PPU→Filter, Alpha-Blend auf SubScreenColor umgestellt.
 
-**Bug 3: BG2 (Hintergründe) nicht in HD**
+**Bug 3: BG2 (Hintergründe) nicht in HD — OFFEN**
 - Ursache: `exportAsTexturePack` exportiert nur BG1; `bg2.png` im Container ist Spritesheet, nicht Einzeltiles.
 - Fix: BG2-Tile-Export in Viewer analog zu BG1 implementieren (mit `ppuCfg.bg2ChrBase`).
 
-**Bug 4: Level-Tiles auf Worldmap (VRAM-Kollision)**
+**Bug 4: Level-Tiles auf Worldmap (VRAM-Kollision) — OFFEN**
 - Ursache: HD-Pack wird global für die ROM geladen. VRAM-Adressen des Piratenschiff-Sets überlappen mit Worldmap-Tiles. Der Filter matcht auf dieselben Adressen → ca. 20% Worldmap zeigt Piratenschiff-HD-Tiles.
 - Fix (kurzfristig): Content-Verifikation im Loader (Tile-Pixel-Checksum prüfen bevor HD-Tile angewendet wird). Langfristig: Level-kontextsensitives Laden.
 
