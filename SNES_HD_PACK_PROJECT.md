@@ -6,9 +6,9 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Build:** M5.1 abgeschlossen (2026-06-08). Bug #4 Fix: VRAM-Checksum-Verifikation.  
+**Build:** Bug #4 verifiziert (2026-06-08). Mesen2: `75589f83`, Viewer: `1628677`.  
 **Status:** Bug #1 ✓, Bug #2 ✓, Bug #3 ✓, Bug #4 ✓ — alle gefixt. Bug #5 Known Limitation.  
-**Next Step:** M6 (Tile-Viewer) oder Bug #5 Diagnose.
+**Next Step:** Multi-Level-Workflow (VRAM-Snapshot im Container, alle Level exportierbar).
 
 ## Milestone History
 
@@ -173,6 +173,24 @@ ROM-Name: `Donkey Kong Country 2` (verifiziert aus SNES ROM-Header offset 0xFFC0
 - Hit/Miss-Logging im `SnesHdVideoFilter` aktivieren → sehen welche konkreten Keys fehlen
 - Klären ob Mechanismus 2 (Tilemap-Switching) oder 3 (VRAM-Overwrite / CHR-Animation)
 - Mesen2: Sub-Screen Color-Math für BG2 HD-Tiles prüfen
+
+### Multi-Level-Workflow — Next (Viewer: VRAM-Snapshot)
+
+**Ziel:** Alle Level des Spiels (nacheinander) in einen Container laden und als vollständiges HD Pack exportieren.
+
+**Problem:** Checksummen werden beim Container-Speichern aus `currentBgData.vram` berechnet — das ist korrekt, wenn das Level gerade geladen ist, aber falsch wenn vorher ein anderes Level aktiv war.
+
+**Fix (Viewer, `index.html`):**
+- Beim Laden eines Gfxsets: kompakten VRAM-Snapshot der genutzten Tile-Bytes in `catalogData.vramSnapshot` speichern
+- Beim Container-Speichern: Snapshot in Set-Daten ablegen (`set.vramSnapshot`)
+- Beim Texture-Pack-Export: Checksummen aus `set.vramSnapshot` statt aus live `currentBgData.vram` berechnen
+- Effekt: VRAM-Zustand des Levels bleibt korrekt erhalten, auch wenn der User später (nach einem Level-Wechsel) erst speichert
+
+**Workflow dann:**
+1. Level N laden → Tiles upscalen → Save to Container (Snapshot gesichert)
+2. Level N+1 laden → Tiles upscalen → Save to Container
+3. … für alle Level wiederholen
+4. Texture Pack Export → ein ZIP, alle Level, korrekte Checksummen
 
 ### M6 — Tile Viewer Integration (niedrigere Priorität)
 - HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)
