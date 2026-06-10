@@ -6,16 +6,19 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Stand: 2026-06-08**  
-**Bug #4 verifiziert** (Mesen2: `75589f83`, Viewer: `1628677`).  
-**Multi-Gfxset-Architektur implementiert, aber noch nicht gebaut/getestet** (Mesen2: `16dadecf`, Viewer: `4331822`).
+**Stand: 2026-06-10**  
+**M5.2 — Content-Hash-System implementiert** (Mesen2 + Viewer, noch nicht committed/gebaut/getestet).  
+Ersetzt VramAddress-basierte Tile-Identifikation durch FNV-1a 64-bit Content-Hash.
+Multi-Gfxset-Support (verschiedene Levels laden verschiedene Tiles an dieselbe VRAM-Adresse) wird
+durch den Hash des tatsächlichen VRAM-Inhalts aufgelöst.
 
 **Nächste Schritte (Priorität):**
-1. Mesen2 neu bauen + Multi-Gfxset-Pack testen (Level 1 + Worldmap)
-2. Level 2 korrekt exportieren (richtigen Gfxset-Index laden, neu speichern)
-3. Weitere Gfxsets für vollständige Spielabdeckung
-4. Bug #5 (BG2 Animation Flicker) — Known Limitation, Diagnose offen
-5. M6: HD-Tiles im Tile-Viewer-Debugger
+1. **Commit + Build** — Änderungen in beiden Repos committen, Mesen2 neu bauen
+2. **Re-Export** — Texture Pack aus dem aktualisierten Viewer exportieren (generiert `hashes.bin`)
+3. **Test** — Level 1 (gfxset_07) + Level 2 (anderer gfxset) + Worldmap prüfen
+4. **Legacy-Test** — Pack ohne `hashes.bin` testen (Rückwärtskompatibilität, kein Crash)
+5. Bug #5 (BG2 Animation Flicker) — Known Limitation, Diagnose offen
+6. M6: HD-Tiles im Tile-Viewer-Debugger
 
 ## Milestone History
 
@@ -181,9 +184,15 @@ ROM-Name: `Donkey Kong Country 2` (verifiziert aus SNES ROM-Header offset 0xFFC0
 - Klären ob Mechanismus 2 (Tilemap-Switching) oder 3 (VRAM-Overwrite / CHR-Animation)
 - Mesen2: Sub-Screen Color-Math für BG2 HD-Tiles prüfen
 
-### Multi-Gfxset-Architektur — IMPLEMENTIERT, Test ausstehend
+### Multi-Gfxset-Architektur — IMPLEMENTIERT, ABGELÖST durch M5.2
 
 **Commits:** Mesen2 `16dadecf`, Viewer `4331822`
+
+> **Hinweis:** Diese Architektur (per-gfxset Unterordner + checksums.bin) war ein Zwischenschritt.
+> M5.2 (Content-Hash-System) löst das Multi-Gfxset-Problem sauberer: statt VRAM-Checksummen zur
+> Laufzeit-Disambiguation wird der Tile-Inhalt direkt als Hash-Key verwendet. Die Ordnerstruktur
+> (`gfxset_XX/`) bleibt bestehen, aber `hashes.bin` ersetzt `checksums.bin` als primäres
+> Identifikationsmittel.
 
 **Neues Exportformat (Viewer):**
 ```
@@ -214,6 +223,69 @@ bg/bg1/gfxset_08/2000_P03.png    (anderer Level, gleiche Adresse, anderer Inhalt
 - Level 2 korrekt exportieren (richtiger Gfxset-Index)
 - Optional: VRAM-Snapshot beim Laden sichern (Robustheit wenn User Gfxset wechselt bevor er speichert)
 
+### M5.2 — Content-Hash-System (2026-06-10, implementiert, Build/Test ausstehend)
+
+**Problem:** VramAddress-basierte Tile-Keys versagen bei Multi-Gfxset-Spielen wie DKC2.
+Verschiedene Levels laden verschiedene Grafiken an dieselbe VRAM-Adresse via DMA.
+Die M5.1-Lösung (checksums.bin) erforderte Laufzeit-Prüfung gegen VRAM-Inhalt bei
+jedem Tile-Lookup — funktionierte, aber war konzeptionell fragil.
+
+**Lösung:** Tile-Identifikation durch **FNV-1a 64-bit Content-Hash** der VRAM-Bytes.
+Inspiriert vom NES HD Pack CHR RAM-Modus (`HdData.h`), wo der Tile-Inhalt selbst der
+Schlüssel ist (nicht die Adresse).
+
+**Algorithmus (identisch in C++ und JavaScript):**
+```
+hash = 0xcbf29ce484222325 (FNV offset basis)
+prime = 0x100000001b3
+for each byte in tile VRAM data:
+    hash = (hash XOR byte) * prime, masked to 64 bits
+```
+
+**hashes.bin Format (ersetzt checksums.bin):**
+```
+uint32_t count                    (4 Bytes, little-endian)
+count × {
+    uint16_t vramAddr             (2 Bytes) — für Zuordnung zum PNG-Dateinamen
+    uint8_t  layerIndex           (1 Byte)
+    uint8_t  gfxsetIndex          (1 Byte)
+    uint64_t contentHash          (8 Bytes) — FNV-1a 64-bit
+}
+```
+Entry size: 12 Bytes pro Eintrag.
+
+**Geänderte Dateien (Mesen2):**
+
+1. **`SnesHdData.h`:**
+   - `ComputeTileContentHash()` (L26-44): Inline-Funktion, FNV-1a 64-bit über VRAM-Bytes
+   - `SnesHdTileKey`: Neues Feld `ContentHash` (uint64_t), dual-mode `GetHashCode()` und `operator==`
+   - `SnesHdPackData::UseContentHash`: Flag für Content-Hash-Modus
+   - `GetMatchingTile()`: Fast-Path für Content-Hash (kein VRAM-Zugriff nötig)
+
+2. **`SnesHdPackLoader.h`:**
+   - `_hashMap` (uint32_t → uint64_t): Content-Hashes aus hashes.bin
+   - `_useContentHash` Flag, `LoadHashes()` Deklaration
+
+3. **`SnesHdPackLoader.cpp`:**
+   - `LoadPack()`: Versucht `LoadHashes()`, Fallback auf `LoadChecksums()`
+   - `LoadHashes()`: Parst hashes.bin (12 Bytes/Eintrag)
+   - `LoadTilesFromDirectory()`: Content-Hash-Modus setzt `tile->Key.ContentHash` statt `VramAddress`
+
+4. **`SnesPpu.cpp`:**
+   - `RenderTilemap()`: Berechnet Content-Hash live via `ComputeTileContentHash(_vram, addr, 4*bpp)`
+
+**Geänderte Dateien (Viewer — dkc2-viewer/index.html):**
+- `fnv1a_64()`: FNV-1a 64-bit Hash-Funktion (BigInt)
+- `saveCurrentHDToContainer()`: Speichert `chrRawData` + `vramSnapshot`
+- `exportAsTexturePack()`: Generiert `hashes.bin` statt `checksums.bin`
+- `refreshContainerSetMetadata()`: Aktualisiert Container-Metadaten ohne Tile-Re-Upload
+
+**Rückwärtskompatibilität:**
+- `hashes.bin` vorhanden → Content-Hash-Modus
+- Nur `checksums.bin` → Legacy-Checksum-Modus (wie M5.1)
+- Keines vorhanden → Legacy VramAddress-Modus (first-match)
+- Kein Crash bei fehlenden Dateien
+
 ### M6 — Tile Viewer Integration (niedrigere Priorität)
 - HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)
 - `SnesPpuTools.cpp` + `TileViewerViewModel.cs` anpassen
@@ -230,11 +302,38 @@ SnesPpu
   ├── _hdData*              → pointer to loaded pack data
   ├── _hdScreenInfo[2]      → double-buffered per-pixel tile info
   └── RenderTilemap()       → fills SnesHdPpuPixelInfo per pixel
+                               Content-Hash mode: ComputeTileContentHash() → Key.ContentHash
+                               Legacy mode: Key.VramAddress
 
 SnesHdVideoFilter
   ├── _paletteLut[]         → BGR555 → ARGB conversion (cached, rebuilds on settings change)
   └── ApplyFilter()         → tile lookup + alpha blend + fallback
+                               Calls GetMatchingTile(key) — O(1) hash map lookup
+
+SnesHdPackData
+  ├── TileByKey             → unordered_map<SnesHdTileKey, vector<TileInfo*>>
+  ├── UseContentHash        → true = hashes.bin loaded, false = legacy mode
+  └── GetMatchingTile()     → Content-Hash: direct match (no VRAM access needed)
+                               Legacy: checksum disambiguation against live VRAM
 ```
+
+### Tile Identification: Dual-Mode Key
+
+```
+SnesHdTileKey {
+    ContentHash (uint64_t)  ← FNV-1a 64-bit of tile VRAM bytes (0 = legacy)
+    VramAddress (uint16_t)  ← VRAM word address (used when ContentHash == 0)
+    PaletteIndex (uint8_t)  ← Palette group 0-7
+    LayerIndex (uint8_t)    ← 0-3 = BG1-BG4, 4 = Sprites
+}
+```
+
+**Data flow (content hash mode):**
+1. Viewer: tile CHR bytes → `fnv1a_64()` → hash stored in `hashes.bin`
+2. Loader: reads `hashes.bin` → `_hashMap[(gfxset,layer,addr)] = hash`
+3. Loader: for each PNG, looks up hash → sets `tile->Key.ContentHash`
+4. PPU runtime: `ComputeTileContentHash(_vram, addr, wordCount)` → `key.ContentHash`
+5. Filter: `TileByKey.find(key)` → O(1) lookup, no VRAM comparison needed
 
 ## File Listing
 

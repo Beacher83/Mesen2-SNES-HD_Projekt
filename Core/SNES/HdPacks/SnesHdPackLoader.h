@@ -16,13 +16,20 @@ private:
 	SnesHdPackData* _data = nullptr;
 	string _hdPackFolder;
 
-	// Checksum map: key = (gfxsetIndex << 24) | (layerIndex << 16) | vramAddr → checksum value
-	// Populated from checksums.bin; used by GetMatchingTile to pick the right gfxset tile.
+	// Content hash map: (gfxsetIndex << 24) | (layerIndex << 16) | vramAddr -> FNV-1a 64-bit hash
+	// Populated from hashes.bin; used to build ContentHash-based tile keys.
+	std::unordered_map<uint32_t, uint64_t> _hashMap;
+
+	// Legacy checksum map: same composite key -> simple additive checksum
+	// Populated from checksums.bin; used by GetMatchingTile for legacy disambiguation.
 	std::unordered_map<uint32_t, uint32_t> _checksumMap;
+
+	bool _useContentHash = false;
 
 	bool InitializeLoader(const string& romName, SnesHdPackData* data);
 	bool LoadPack();
 	bool LoadManifest();
+	bool LoadHashes();
 	bool LoadChecksums();
 	bool LoadTilesFromDirectory(const string& dirPath, uint8_t layerIndex, bool isSprite, uint8_t gfxsetIndex = 0xFF);
 	bool LoadPngFile(const string& filePath, SnesHdBitmapInfo& bitmap);

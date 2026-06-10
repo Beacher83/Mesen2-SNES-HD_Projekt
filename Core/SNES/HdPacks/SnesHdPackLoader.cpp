@@ -64,8 +64,12 @@ bool SnesHdPackLoader::LoadPack()
 
 	// Try to load manifest for scale info
 	LoadManifest();
-	// Load optional checksums.bin for VRAM content verification (Bug #4: collision fix)
-	LoadChecksums();
+	// Try content hash mode first (hashes.bin), fall back to legacy checksum mode (checksums.bin)
+	_useContentHash = LoadHashes();
+	if(!_useContentHash) {
+		LoadChecksums();
+	}
+	_data->UseContentHash = _useContentHash;
 
 	bool anyLoaded = false;
 
@@ -135,6 +139,48 @@ bool SnesHdPackLoader::LoadManifest()
 	// For the initial implementation, we hardcode scale=4
 
 	return true;
+}
+
+bool SnesHdPackLoader::LoadHashes()
+{
+	// hashes.bin format (all little-endian):
+	//   uint32_t count
+	//   count x { uint16_t vramAddr, uint8_t layerIndex, uint8_t gfxsetIndex, uint64_t contentHash }
+	//   Entry size: 12 bytes per entry
+	string hashPath = FolderUtilities::CombinePath(_hdPackFolder, "hashes.bin");
+
+	ifstream file(hashPath, std::ios::binary);
+	if(!file) {
+		return false;
+	}
+
+	uint32_t count = 0;
+	file.read((char*)&count, 4);
+	if(file.fail() || count == 0 || count > 65536) {
+		return false;
+	}
+
+	for(uint32_t i = 0; i < count; i++) {
+		uint16_t vramAddr = 0;
+		uint8_t layerIdx = 0;
+		uint8_t gfxsetIdx = 0;
+		uint64_t contentHash = 0;
+
+		file.read((char*)&vramAddr, 2);
+		file.read((char*)&layerIdx, 1);
+		file.read((char*)&gfxsetIdx, 1);
+		file.read((char*)&contentHash, 8);
+
+		if(file.fail()) break;
+
+		uint32_t key = ((uint32_t)gfxsetIdx << 24) | ((uint32_t)layerIdx << 16) | vramAddr;
+		_hashMap[key] = contentHash;
+	}
+
+	if(!_hashMap.empty()) {
+		MessageManager::Log("[SNES HD Pack] Loaded " + std::to_string(_hashMap.size()) + " content hashes from hashes.bin");
+	}
+	return !_hashMap.empty();
 }
 
 bool SnesHdPackLoader::LoadChecksums()
@@ -241,9 +287,25 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 
 		// Create tile info
 		auto tile = std::make_unique<SnesHdPackTileInfo>();
-		tile->Key.VramAddress = vramAddr;
 		tile->Key.PaletteIndex = paletteIndex;
 		tile->Key.LayerIndex = layerIndex;
+
+		// Assign tile identity based on lookup mode
+		if(_useContentHash && gfxsetIndex != 0xFF) {
+			// Content hash mode: look up hash from hashes.bin
+			uint32_t hashKey = ((uint32_t)gfxsetIndex << 24) | ((uint32_t)layerIndex << 16) | vramAddr;
+			auto hashIt = _hashMap.find(hashKey);
+			if(hashIt != _hashMap.end()) {
+				tile->Key.ContentHash = hashIt->second;
+			} else {
+				MessageManager::Log("[SNES HD Pack] No content hash for tile " + filename + " in gfxset " + std::to_string(gfxsetIndex) + " - skipping");
+				continue;
+			}
+		} else {
+			// Legacy VramAddress mode
+			tile->Key.VramAddress = vramAddr;
+		}
+
 		tile->X = 0;
 		tile->Y = 0;
 		tile->Width = bitmap->Width;
@@ -255,8 +317,8 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		tile->HdTileData = bitmap->PixelData;
 		tile->UpdateFlags();
 
-		// Assign VRAM checksum if available (only for gfxset-namespaced tiles, not legacy flat packs)
-		if(gfxsetIndex != 0xFF) {
+		// Legacy: Assign VRAM checksum if available (only for legacy mode with gfxset tiles)
+		if(!_useContentHash && gfxsetIndex != 0xFF) {
 			uint32_t csKey = ((uint32_t)gfxsetIndex << 24) | ((uint32_t)layerIndex << 16) | vramAddr;
 			auto csIt = _checksumMap.find(csKey);
 			if(csIt != _checksumMap.end()) {

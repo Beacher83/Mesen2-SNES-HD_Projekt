@@ -1091,7 +1091,12 @@ void SnesPpu::RenderTilemap()
 				SnesHdPpuPixelInfo& pixelInfo = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
 				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[0];
 				uint16_t tileIndex = tilemapData & 0x3FF;
-				tileInfo.Key.VramAddress = (_state.Layers[layerIndex].ChrAddress + tileIndex * 4 * bpp) & 0x7FFF;
+				uint16_t vramWordAddr = (_state.Layers[layerIndex].ChrAddress + tileIndex * 4 * bpp) & 0x7FFF;
+				if(_hdData->UseContentHash) {
+					tileInfo.Key.ContentHash = ComputeTileContentHash(_vram, vramWordAddr, 4 * bpp);
+				} else {
+					tileInfo.Key.VramAddress = vramWordAddr;
+				}
 				tileInfo.Key.PaletteIndex = paletteIndex;
 				tileInfo.Key.LayerIndex = layerIndex;
 				bool hMirrorHd = (tilemapData & 0x4000) != 0;

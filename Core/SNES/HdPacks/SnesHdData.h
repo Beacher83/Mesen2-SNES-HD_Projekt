@@ -16,29 +16,63 @@
 // ============================================================================
 
 // ---------------------------------------------------------------------------
+// FNV-1a 64-bit hash — content-based tile identification
+// ---------------------------------------------------------------------------
+// Must match the JavaScript fnv1a_64() in the DKC2 viewer exactly.
+// Hashes the raw VRAM bytes of a tile's CHR data.
+// On x86 little-endian: (uint8_t*)(vram + wordAddr) gives bytes in the
+// same order as the viewer's Uint8Array VRAM snapshot.
+
+inline uint64_t ComputeTileContentHash(const uint16_t* vram, uint16_t wordAddress, uint16_t wordCount = 16)
+{
+	// Bounds check: don't read past end of VRAM (0x8000 words)
+	if(wordAddress + wordCount > 0x8000) {
+		wordCount = 0x8000 - wordAddress;
+	}
+
+	const uint8_t* bytes = reinterpret_cast<const uint8_t*>(vram + wordAddress);
+	uint32_t byteCount = (uint32_t)wordCount * 2;
+
+	uint64_t hash = 0xcbf29ce484222325ULL;
+	constexpr uint64_t prime = 0x100000001b3ULL;
+
+	for(uint32_t i = 0; i < byteCount; i++) {
+		hash ^= bytes[i];
+		hash *= prime;
+	}
+	return hash;
+}
+
+// ---------------------------------------------------------------------------
 // SnesHdTileKey — Uniquely identifies a SNES tile for HD replacement lookup
 // ---------------------------------------------------------------------------
-// Key = VRAM word address of tile + palette group index
-// This matches the bsnes-hd texture pack format: "{vramAddr}_P{palette}.png"
+// Content hash mode (new, for multi-gfxset packs):
+//   Key = FNV-1a 64-bit hash of tile VRAM bytes + palette + layer
+//   The hash uniquely identifies tile content regardless of VRAM address.
+//   Different gfxsets that load different tiles to the same VRAM address
+//   produce different ContentHash values -> unique keys.
 //
-// For BG tiles: vramAddr = LayerConfig.ChrAddress + (tilemapData & 0x3FF) * wordsPerTile
-//               palette  = (tilemapData >> 10) & 0x07
-//
-// For Sprites:  vramAddr = computed from OAM + name table base
-//               palette  = OAM palette (0-7)
-//               IsSprite flag set to distinguish from BG tiles at same address
+// VramAddress mode (legacy, for single-gfxset packs):
+//   Key = VRAM word address + palette + layer
+//   Original approach; breaks when multiple gfxsets share VRAM addresses.
 
 struct SnesHdTileKey
 {
-	uint16_t VramAddress = 0;   // VRAM word address of the tile's CHR data
+	uint64_t ContentHash = 0;   // FNV-1a 64-bit hash of tile VRAM bytes (0 = legacy VramAddress mode)
+	uint16_t VramAddress = 0;   // VRAM word address (legacy fallback, used when ContentHash == 0)
 	uint8_t PaletteIndex = 0;   // Palette group (0-7)
 	uint8_t LayerIndex = 0;     // 0-3 = BG1-BG4, 4 = Sprites
 
-	uint32_t GetHashCode() const
+	size_t GetHashCode() const
 	{
-		// Combine address + palette + layer into a single hash
-		// VramAddress is 15 bits (0x0000-0x7FFF), palette is 3 bits, layer is 3 bits
-		return ((uint32_t)VramAddress << 8) | ((uint32_t)LayerIndex << 4) | PaletteIndex;
+		if(ContentHash != 0) {
+			// Mix both halves of the 64-bit content hash with palette + layer
+			uint32_t lo = (uint32_t)(ContentHash & 0xFFFFFFFF);
+			uint32_t hi = (uint32_t)(ContentHash >> 32);
+			return (size_t)(lo ^ hi) ^ ((size_t)LayerIndex << 4) ^ (size_t)PaletteIndex;
+		}
+		// Legacy address-based hash
+		return ((size_t)VramAddress << 8) | ((size_t)LayerIndex << 4) | (size_t)PaletteIndex;
 	}
 
 	size_t operator()(const SnesHdTileKey& tile) const
@@ -48,6 +82,11 @@ struct SnesHdTileKey
 
 	bool operator==(const SnesHdTileKey& other) const
 	{
+		if(ContentHash != 0 || other.ContentHash != 0) {
+			return ContentHash == other.ContentHash
+				&& PaletteIndex == other.PaletteIndex
+				&& LayerIndex == other.LayerIndex;
+		}
 		return VramAddress == other.VramAddress
 			&& PaletteIndex == other.PaletteIndex
 			&& LayerIndex == other.LayerIndex;
@@ -221,6 +260,7 @@ private:
 public:
 	uint32_t Scale = 1;         // HD scale factor (e.g. 4 for 4x)
 	uint32_t Version = 0;       // Pack format version
+	bool UseContentHash = false; // true = content hash mode (hashes.bin), false = VramAddress mode (legacy)
 
 	// All loaded PNG files
 	vector<unique_ptr<SnesHdBitmapInfo>> ImageFileData;
@@ -249,13 +289,22 @@ public:
 	}
 
 	// Look up an HD tile replacement.
-	// When vram is provided, selects among multiple candidates by checksum (multi-gfxset packs).
-	// Falls back to first non-transparent tile for legacy packs without checksums.
+	// Content hash mode: direct lookup — the key's ContentHash uniquely identifies tile content.
+	// Legacy mode: when vram is provided, selects among multiple candidates by checksum.
 	SnesHdPackTileInfo* GetMatchingTile(const SnesHdTileKey& key, const uint16_t* vram = nullptr)
 	{
 		auto it = TileByKey.find(key);
 		if(it == TileByKey.end()) return nullptr;
 
+		if(UseContentHash) {
+			// Content hash is the identity — return first non-transparent tile
+			for(SnesHdPackTileInfo* tile : it->second) {
+				if(!tile->IsFullyTransparent) return tile;
+			}
+			return nullptr;
+		}
+
+		// Legacy VramAddress mode: use checksum disambiguation
 		for(SnesHdPackTileInfo* tile : it->second) {
 			if(tile->IsFullyTransparent) continue;
 			if(!tile->HasChecksum || vram == nullptr) return tile;
