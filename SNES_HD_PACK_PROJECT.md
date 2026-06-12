@@ -6,18 +6,37 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Stand: 2026-06-10**  
-**M5.2 — Content-Hash-System implementiert** (Mesen2 + Viewer, noch nicht committed/gebaut/getestet).  
-Ersetzt VramAddress-basierte Tile-Identifikation durch FNV-1a 64-bit Content-Hash.
-Multi-Gfxset-Support (verschiedene Levels laden verschiedene Tiles an dieselbe VRAM-Adresse) wird
-durch den Hash des tatsächlichen VRAM-Inhalts aufgelöst.
+**Stand: 2026-06-12**  
+**M5.3 — Viewer-Patches vorbereitet, Mesen Fingerprint-System implementiert.**
 
-**Nächste Schritte (Priorität):**
-1. **Commit + Build** — Änderungen in beiden Repos committen, Mesen2 neu bauen
-2. **Re-Export** — Texture Pack aus dem aktualisierten Viewer exportieren (generiert `hashes.bin`)
-3. **Test** — Level 1 (gfxset_07) + Level 2 (anderer gfxset) + Worldmap prüfen
-4. **Legacy-Test** — Pack ohne `hashes.bin` testen (Rückwärtskompatibilität, kein Crash)
-5. Bug #5 (BG2 Animation Flicker) — Known Limitation, Diagnose offen
+**Mesen-Seite: ✅ FERTIG** (4 Dateien geändert, noch nicht gebaut)
+- `SnesHdData.h`: Fingerprint-System, Gfxset-Scoping, DetectActiveGfxset()
+- `SnesHdPackLoader.cpp`: LoadFingerprints(), GfxsetIndex-Zuweisung
+- `SnesHdPackLoader.h`: LoadFingerprints() Deklaration
+- `SnesHdVideoFilter.cpp`: DetectActiveGfxset() Aufruf in ApplyFilter()
+
+**Viewer-Seite: Patch-Spezifikation FERTIG** (siehe `VIEWER_PATCH_M53.md`)
+- 11 Änderungsbereiche dokumentiert mit exaktem Vorher/Nachher-Code
+- Änderung 1: BG1 Hash-Fix (`chrRawData` → `vramSnapshot`)
+- Änderung 2: BG1 vramWordAddr `& 0x7FFF` Maske
+- Änderungen 3-6: BG3-Support in Container (Save/Refresh/Export/Import)
+- Änderung 7: BG3 Tile-PNG-Export (2bpp, layer=2)
+- Änderung 8: BG3 Hash-Berechnung in hashes.bin
+- Änderung 9: fingerprints.bin Generierung (nur 4bpp Referenz-Tiles)
+- Änderungen 10-11: Manifest + Alert-Update
+
+**PPU-Verifikation: ✅ BG3 2bpp end-to-end kompatibel**
+- PPU: `RenderTilemap<2,2,...>()` → `ComputeTileContentHash(vram, addr, 8)` → 16 bytes
+- Viewer: `fnv1a_64(vram, addr*2, 16)` → 16 bytes
+- Loader: `bg/bg3/gfxset_XX/` → layer=2 → korrekt
+- Fingerprints: beschränkt auf 4bpp (BG1/BG2) wegen Default-wordCount=16
+
+**Nächste Schritte:**
+1. **Viewer-Patches anwenden** — `VIEWER_PATCH_M53.md` auf DKC2-HD-Tools anwenden
+2. **Mesen bauen** — Fingerprint-Code kompilieren (benötigt VS)
+3. **Container aktualisieren** — ROM laden, Refresh Metadata, BG3-Daten aufnehmen
+4. **Re-Export + Test** — Pack neu exportieren, Level 2 + Worldmap testen
+5. Bug #5 (BG2 Animation Flicker) — Known Limitation, geparkt
 6. M6: HD-Tiles im Tile-Viewer-Debugger
 
 ## Milestone History
@@ -285,6 +304,158 @@ Entry size: 12 Bytes pro Eintrag.
 - Nur `checksums.bin` → Legacy-Checksum-Modus (wie M5.1)
 - Keines vorhanden → Legacy VramAddress-Modus (first-match)
 - Kein Crash bei fehlenden Dateien
+
+### M5.3 — Tiefenanalyse: Warum M5.2 bei Level 2 und Worldmap scheitert (2026-06-12)
+
+**Kontext:** M5.2 (Content-Hash) funktionierte für Level 1 (gfxset_07), aber komplett
+nicht für Level 2 (gfxset_37) und zeigte falsche Tiles auf der Worldmap. Die Analyse
+deckte drei voneinander unabhängige Probleme auf und erforderte einen detaillierten
+Vergleich der NES- und SNES-Architekturen.
+
+#### Problem 1: BG1-Hash-Datenquelle im Viewer (chrRawData ≠ VRAM)
+
+**Symptom:** hash_miss.log zeigt 0/60 MISS-Hashes aus gfxset_37 in hashes.bin gefunden.
+
+**Root Cause:** Der Viewer berechnet BG1-Hashes aus `chrRawData[gfxIndex * 32]` — einem
+sequentiellen Tile-Buffer aus ROM-Decompression. Mesen berechnet Hashes aus
+`_vram[vramWordAddr]` — den tatsächlichen VRAM-Bytes an der Hardware-Adresse.
+
+Für gfxset_07 stimmen diese zufällig überein (Tiles werden in gleicher Reihenfolge an
+gleiche Adressen geladen). Für gfxset_37 weichen die Bytes vollständig ab →
+verschiedene Hashes → 0% Match-Rate.
+
+**Beweis:** hash_load.log und hash_miss.log zeigen null Überlappung zwischen
+Viewer-berechneten und Mesen-berechneten Hashes für gfxset_37.
+
+**Fix (Viewer):** BG1-Hash-Berechnung von `chrRawData` auf `vramSnapshot` umstellen.
+BG2 verwendet bereits `vramSnapshot` und funktioniert korrekt — BG1 muss denselben
+Ansatz verwenden.
+
+#### Problem 2: Palette-Mismatch im Viewer-Export
+
+**Symptom:** Selbst wenn die Hashes übereinstimmen würden, passen die Paletten nicht.
+
+**Root Cause:** 
+- hash_load.log: gfxset_37 BG1-Tiles exportiert mit P06/P04
+- hash_miss.log: Mesen sucht P02 bei Level-2-Start
+- Der Lookup-Key ist `(Hash, Palette, Layer)` → `(Hash, P06, layer0)` ≠ `(Hash, P02, layer0)`
+
+**Ursache im Viewer:** Der Dedup-Key `${gfxset}_0_${vramWordAddr}` enthält keine Palette →
+nur die erste gefundene Palette-Variante wird exportiert. Tiles die in verschiedenen
+Levels mit verschiedenen Paletten verwendet werden, fehlen.
+
+**Fix (Viewer):** Palette-Index in den Dedup-Key aufnehmen:
+`${gfxset}_0_${vramWordAddr}_P${paletteIdx}`. Zusätzlich: Tilemaps ALLER Levels eines
+Gfxsets iterieren, um alle vorkommenden Palette-Varianten zu erfassen.
+
+#### Problem 3: Worldmap False Positives (kein Gfxset-Kontext)
+
+**Symptom:** Worldmap zeigt Level-HD-Tiles an falschen Stellen.
+
+**Root Cause:** Der Content-Hash-Lookup ist gfxset-agnostisch: Key = `(ContentHash,
+Palette, Layer)` ohne Gfxset-Scoping. Wenn ein Worldmap-VRAM-Tile zufällig denselben
+Byte-Inhalt hat wie ein Level-Tile, wird das Level-HD-Tile eingesetzt.
+
+**Warum das ein Architektur-Problem ist:** Content-Hash identifiziert Tiles korrekt
+INNERHALB eines Gfxsets. Aber verschiedene Gfxsets können Tiles mit identischem Inhalt
+an verschiedenen Stellen haben, die semantisch verschiedene Dinge darstellen (z.B.
+ein Worldmap-Tile vs. ein Level-Hintergrund-Tile).
+
+**Fix (Mesen + Viewer): Gfxset-Fingerprint-System** (siehe Lösungsarchitektur unten)
+
+#### NES vs SNES Architekturvergleich (Kernerkenntniss)
+
+Die Wahl von `chrRawData` als BG1-Hash-Quelle basierte auf einem Missverständnis
+der NES HD Pack-Architektur:
+
+| Aspekt | NES CHR ROM | NES CHR RAM | SNES |
+|--------|-------------|-------------|------|
+| Speicher | ROM, unveränderlich | RAM, DMA-befüllt | VRAM, DMA-befüllt |
+| Tile-Key | Absoluter ROM-Offset / 16 | **16 Bytes Raw-Tile-Inhalt** | ? |
+| Datenquelle | `chrPagePointers[]` | `CopyChrTile()` → `_chrRam[]` | `_vram[]` |
+| Content-Check | Nicht nötig (ROM) | **JA** (TileData[16]) | **JA** |
+
+**Kritische Erkenntnis:** SNES ist zu 100% ein CHR-RAM-Fall. Es gibt kein CHR ROM.
+Die korrekte Analogie ist der NES CHR RAM-Pfad in `HdData.h`:
+
+```cpp
+// NES HdData.h — CHR RAM Modus:
+struct HdPackTileInfo {
+    int32_t TileIndex = -1;       // -1 = CHR RAM mode
+    uint8_t TileData[16];         // Die 16 RAW BYTES des Tiles
+    // ...
+};
+// Matching in HdNesPack.cpp:
+// memcmp(tileData, info.TileData, 16)
+```
+
+Der NES-Code liest die Tile-Daten aus `CopyChrTile()` → `memcpy(_chrRam + address, ...)`
+— dem **live CHR RAM**, nicht ROM-decomprimierten Daten. Genau dies entspricht
+`_vram[]` auf der SNES-Seite und `vramSnapshot` auf der Viewer-Seite.
+
+`chrRawData` (ROM-Decompression-Buffer) hat **kein NES-Äquivalent** und war die
+falsche Wahl.
+
+#### VRAM-Byte-Ordering-Verifikation
+
+Bestätigt: Die Byte-Reihenfolge ist identisch zwischen Mesen und Viewer.
+
+```
+DKC2 DMA (Mode 1):
+  B0 → $2118 (VRAM Low)
+  B1 → $2119 (VRAM High)
+  → _vram[addr] = (B1 << 8) | B0
+
+Mesen (C++, x86 little-endian):
+  reinterpret_cast<uint8_t*>(_vram + addr) → B0, B1, B2, B3, ...
+
+Viewer (JavaScript):
+  vramSnapshot (Uint8Array) → B0, B1, B2, B3, ...
+```
+
+Byte-Reihenfolge ist identisch → Hashes sind kompatibel. Dies erklärt auch,
+warum BG2 (bereits auf vramSnapshot basierend) korrekt funktioniert.
+
+#### Viewer-Datenfluss-Analyse
+
+Alle Viewer-Daten sind **level-abhängig:**
+- `loadLevel()` erzeugt frisches VRAM, Paletten, Tilemaps pro Level
+- Container-Save speichert den Zustand des aktuell geladenen Levels
+- `vramSnapshot` und `chrRawData` stammen aus dem aktuell geladenen Level
+
+**ABER:** CHR-Tile-Bytes im VRAM sind **gfxset-abhängig, nicht level-abhängig.**
+Alle Levels mit identischem `style.graphics`-Wert bekommen identische CHR-Daten
+ins VRAM. Unterschiede liegen in Tilemaps und Paletten.
+
+`buildCatalogByGfxSet()` erzeugt VRAM lokal, aktualisiert aber NICHT das globale
+`currentBgData`/`currentTileRawData` — was ein Bug-Risiko darstellt wenn man
+zwischen Catalog- und Level-Modus wechselt.
+
+#### Lösungsarchitektur
+
+**Phase 1 — Level-2-Fix (nur Viewer-Änderungen):**
+1. BG1-Hash-Berechnung: `chrRawData` → `vramSnapshot` (analog zu BG2)
+2. Dedup-Key um Palette-Index erweitern
+3. ALLE Level-Tilemaps pro Gfxset iterieren für vollständige Palette-Abdeckung
+
+**Phase 2 — Worldmap-Fix (Mesen + Viewer):**
+1. **Gfxset-Fingerprint-System:** Pro Gfxset 4-8 Reference-Tile-Hashes mit
+   einzigartigem Inhalt, gespeichert in `fingerprints.bin`
+2. Mesen erkennt den aktiven Gfxset einmal pro Frame durch Prüfung der
+   Reference-Tile-Hashes gegen live VRAM
+3. Tile-Lookup nur innerhalb des aktiven Gfxsets → keine False Positives
+4. Trennung: "Welcher Tile-Satz ist geladen?" (Fingerprint) vs.
+   "Welches Tile ersetzen?" (Content-Hash innerhalb des aktiven Gfxsets)
+
+**Vergleich der drei Identifikationsansätze:**
+
+| Merkmal | Checksum (M5.1) | Content-Hash (M5.2) | Fingerprint (Phase 2) |
+|---------|-----------------|---------------------|-----------------------|
+| Prinzip | Sekundärfilter auf Adress-Key | Inhalt = Identität | Gfxset erkennen, dann scoped Lookup |
+| Gfxset-Kontext | Nein (alle im selben Key-Space) | Nein (gleiche Keys) | Ja (explizite Erkennung) |
+| False Positives | Möglich (Byte-Summenkollision) | Möglich (cross-gfxset) | Ausgeschlossen |
+| VRAM-Zugriff/Frame | Jeder Tile-Lookup | Jeder Tile-Lookup | Nur Fingerprint-Check (4-8 Tiles) |
+| Datenquelle-Bug | Viewer: Byte/Word-Indexierung | Viewer: chrRawData statt VRAM | Nicht betroffen |
 
 ### M6 — Tile Viewer Integration (niedrigere Priorität)
 - HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)

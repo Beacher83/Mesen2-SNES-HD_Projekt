@@ -189,6 +189,8 @@ struct SnesHdPackTileInfo
 	uint32_t VramChecksum = 0;   // Sum of VRAM words for this tile's CHR region (0 = not verified)
 	bool HasChecksum = false;    // If false, tile was exported without checksum data (always match)
 
+	uint8_t GfxsetIndex = 0xFF;  // Gfxset this tile belongs to (0xFF = unscoped/legacy)
+
 	int Brightness = 255;       // Brightness adjustment (0-255)
 	bool Blank = false;         // All pixels are the same color
 	bool HasTransparentPixels = false;
@@ -249,6 +251,22 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Gfxset Fingerprint — identifies which graphics set is currently in VRAM
+// ---------------------------------------------------------------------------
+// Each gfxset has a set of "reference tiles" whose content hashes uniquely
+// identify that gfxset. At runtime, Mesen checks these reference tiles
+// against live VRAM once per frame. If all reference tiles match, that
+// gfxset is considered active. Only tiles from the active gfxset are used
+// for HD replacement — preventing cross-gfxset false positives (e.g.
+// worldmap tiles incorrectly matching level tiles with same byte content).
+
+struct GfxsetFingerprintEntry
+{
+	uint16_t VramWordAddr;   // Where to check in VRAM
+	uint64_t ExpectedHash;   // FNV-1a 64-bit hash the tile should have
+};
+
+// ---------------------------------------------------------------------------
 // SnesHdPackData — All loaded HD pack data for a game
 // ---------------------------------------------------------------------------
 
@@ -272,6 +290,15 @@ public:
 	// Multiple entries per key are possible (for conditional replacements in future)
 	unordered_map<SnesHdTileKey, vector<SnesHdPackTileInfo*>> TileByKey;
 
+	// Gfxset fingerprints for active-gfxset detection.
+	// Key: gfxsetIndex, Value: reference tiles whose content identifies that gfxset.
+	// Populated from fingerprints.bin. Empty = no scoping (all tiles match any context).
+	unordered_map<uint8_t, vector<GfxsetFingerprintEntry>> GfxsetFingerprints;
+
+	// Currently detected active gfxset.
+	// -1 = no gfxset detected (no fingerprints loaded, or no match found)
+	int16_t ActiveGfxset = -1;
+
 	SnesHdPackData() {}
 	~SnesHdPackData() {}
 
@@ -288,8 +315,43 @@ public:
 		}
 	}
 
+	bool HasFingerprints() const { return !GfxsetFingerprints.empty(); }
+
+	// Detect which gfxset is currently loaded in VRAM by checking reference
+	// tile hashes. Called once per frame by the video filter.
+	// Sets ActiveGfxset to the matching gfxset index, or -1 if none matches.
+	//
+	// NOTE: Uses default wordCount=16 (4bpp = 32 bytes per tile).
+	// Fingerprint reference tiles MUST be 4bpp (BG1/BG2 in Mode 1).
+	// The viewer's fingerprint selection only picks layer 0/1 tiles for this reason.
+	void DetectActiveGfxset(const uint16_t* vram)
+	{
+		if(!HasFingerprints() || vram == nullptr) {
+			ActiveGfxset = -1;
+			return;
+		}
+
+		for(const auto& [gfxsetIdx, entries] : GfxsetFingerprints) {
+			bool allMatch = true;
+			for(const auto& entry : entries) {
+				uint64_t liveHash = ComputeTileContentHash(vram, entry.VramWordAddr);
+				if(liveHash != entry.ExpectedHash) {
+					allMatch = false;
+					break;
+				}
+			}
+			if(allMatch) {
+				ActiveGfxset = (int16_t)gfxsetIdx;
+				return;
+			}
+		}
+		ActiveGfxset = -1;  // No gfxset matched — worldmap or unknown context
+	}
+
 	// Look up an HD tile replacement.
 	// Content hash mode: direct lookup — the key's ContentHash uniquely identifies tile content.
+	//   With fingerprints: only returns tiles from the active gfxset (prevents false positives).
+	//   Without fingerprints: returns any matching tile (original behavior).
 	// Legacy mode: when vram is provided, selects among multiple candidates by checksum.
 	SnesHdPackTileInfo* GetMatchingTile(const SnesHdTileKey& key, const uint16_t* vram = nullptr)
 	{
@@ -297,9 +359,18 @@ public:
 		if(it == TileByKey.end()) return nullptr;
 
 		if(UseContentHash) {
-			// Content hash is the identity — return first non-transparent tile
 			for(SnesHdPackTileInfo* tile : it->second) {
-				if(!tile->IsFullyTransparent) return tile;
+				if(tile->IsFullyTransparent) continue;
+
+				// Gfxset scoping: if fingerprints detected an active gfxset,
+				// only match tiles belonging to that gfxset (or unscoped tiles).
+				// tile->GfxsetIndex == 0xFF means the tile is unscoped (matches any gfxset).
+				// ActiveGfxset == -1 means no fingerprints / no detection → match all.
+				if(ActiveGfxset >= 0 && tile->GfxsetIndex != 0xFF
+					&& tile->GfxsetIndex != (uint8_t)ActiveGfxset) {
+					continue;
+				}
+				return tile;
 			}
 			return nullptr;
 		}

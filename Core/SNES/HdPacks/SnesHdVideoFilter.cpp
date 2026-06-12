@@ -74,6 +74,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	FrameInfo frameInfo = _frameInfo;
 	OverscanDimensions overscan = GetOverscan();
 
+	// Detect active gfxset once per frame via fingerprint reference tiles.
+	// Sets _hdData->ActiveGfxset which scopes GetMatchingTile() to the correct gfxset.
+	// If no fingerprints.bin is loaded, this is a no-op (ActiveGfxset stays -1 = match all).
+	_hdData->DetectActiveGfxset(hdScreen->Vram);
+
 	uint32_t hdScale = _hdScale;
 	uint32_t baseWidth = 256;
 	

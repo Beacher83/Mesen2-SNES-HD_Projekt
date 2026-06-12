@@ -71,6 +71,9 @@ bool SnesHdPackLoader::LoadPack()
 	}
 	_data->UseContentHash = _useContentHash;
 
+	// Load gfxset fingerprints for active-gfxset detection (optional)
+	LoadFingerprints();
+
 	bool anyLoaded = false;
 
 	// Load BG tiles for each layer (bg1 through bg4).
@@ -312,6 +315,7 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		tile->Height = bitmap->Height;
 		tile->BitmapIndex = (uint32_t)_data->ImageFileData.size();
 		tile->Brightness = 255;
+		tile->GfxsetIndex = gfxsetIndex;  // Track which gfxset this tile belongs to (0xFF = unscoped)
 
 		// Copy pixel data directly into tile (since each PNG = one tile)
 		tile->HdTileData = bitmap->PixelData;
@@ -402,6 +406,60 @@ bool SnesHdPackLoader::ParseTileFilename(const string& filename, uint16_t& vramA
 	}
 
 	return true;
+}
+
+bool SnesHdPackLoader::LoadFingerprints()
+{
+	// fingerprints.bin format (all little-endian):
+	//   uint8_t gfxsetCount
+	//   gfxsetCount × {
+	//     uint8_t gfxsetIndex
+	//     uint8_t refTileCount
+	//     refTileCount × { uint16_t vramWordAddr (2 bytes), uint64_t expectedHash (8 bytes) }
+	//   }
+	string fpPath = FolderUtilities::CombinePath(_hdPackFolder, "fingerprints.bin");
+
+	ifstream file(fpPath, std::ios::binary);
+	if(!file) {
+		return false;  // No fingerprints file — no gfxset scoping (all tiles match any context)
+	}
+
+	uint8_t gfxsetCount = 0;
+	file.read((char*)&gfxsetCount, 1);
+	if(file.fail() || gfxsetCount == 0 || gfxsetCount > 128) {
+		return false;
+	}
+
+	for(uint8_t g = 0; g < gfxsetCount; g++) {
+		uint8_t gfxsetIdx = 0;
+		uint8_t refCount = 0;
+		file.read((char*)&gfxsetIdx, 1);
+		file.read((char*)&refCount, 1);
+		if(file.fail() || refCount == 0) break;
+
+		vector<GfxsetFingerprintEntry> entries;
+		for(uint8_t r = 0; r < refCount; r++) {
+			GfxsetFingerprintEntry entry;
+			file.read((char*)&entry.VramWordAddr, 2);
+			file.read((char*)&entry.ExpectedHash, 8);
+			if(file.fail()) break;
+			entries.push_back(entry);
+		}
+
+		if(!entries.empty()) {
+			_data->GfxsetFingerprints[gfxsetIdx] = std::move(entries);
+		}
+	}
+
+	if(!_data->GfxsetFingerprints.empty()) {
+		uint32_t totalRefs = 0;
+		for(const auto& [idx, entries] : _data->GfxsetFingerprints) {
+			totalRefs += (uint32_t)entries.size();
+		}
+		MessageManager::Log("[SNES HD Pack] Loaded fingerprints for " + std::to_string(_data->GfxsetFingerprints.size())
+			+ " gfxsets (" + std::to_string(totalRefs) + " reference tiles)");
+	}
+	return !_data->GfxsetFingerprints.empty();
 }
 
 // Implement SnesHdBitmapInfo::Init (declared in SnesHdData.h)

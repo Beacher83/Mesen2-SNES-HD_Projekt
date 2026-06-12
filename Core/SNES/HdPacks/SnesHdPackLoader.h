@@ -31,6 +31,7 @@ private:
 	bool LoadManifest();
 	bool LoadHashes();
 	bool LoadChecksums();
+	bool LoadFingerprints();
 	bool LoadTilesFromDirectory(const string& dirPath, uint8_t layerIndex, bool isSprite, uint8_t gfxsetIndex = 0xFF);
 	bool LoadPngFile(const string& filePath, SnesHdBitmapInfo& bitmap);
 	bool ParseTileFilename(const string& filename, uint16_t& vramAddr, uint8_t& paletteIndex);
