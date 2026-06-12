@@ -11,6 +11,9 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 **Mesen-Seite: ✅ FERTIG** (4 Dateien geändert, noch nicht gebaut)
 - `SnesHdData.h`: Fingerprint-System, Gfxset-Scoping, DetectActiveGfxset()
+  - **Bugfix (Review):** `GetMatchingTile()` Gfxset-Filter war fehlerhaft — wenn ActiveGfxset==-1
+    (kein Gfxset erkannt, z.B. Worldmap), wurden gfxset-scoped Tiles nicht blockiert.
+    Fix: `HasFingerprints() && GfxsetIndex != 0xFF` prüft jetzt korrekt alle Fälle.
 - `SnesHdPackLoader.cpp`: LoadFingerprints(), GfxsetIndex-Zuweisung
 - `SnesHdPackLoader.h`: LoadFingerprints() Deklaration
 - `SnesHdVideoFilter.cpp`: DetectActiveGfxset() Aufruf in ApplyFilter()

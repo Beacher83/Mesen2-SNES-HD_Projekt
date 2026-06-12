@@ -362,13 +362,17 @@ public:
 			for(SnesHdPackTileInfo* tile : it->second) {
 				if(tile->IsFullyTransparent) continue;
 
-				// Gfxset scoping: if fingerprints detected an active gfxset,
-				// only match tiles belonging to that gfxset (or unscoped tiles).
-				// tile->GfxsetIndex == 0xFF means the tile is unscoped (matches any gfxset).
-				// ActiveGfxset == -1 means no fingerprints / no detection → match all.
-				if(ActiveGfxset >= 0 && tile->GfxsetIndex != 0xFF
-					&& tile->GfxsetIndex != (uint8_t)ActiveGfxset) {
-					continue;
+				// Gfxset scoping: when fingerprints are loaded, enforce scoping.
+				// tile->GfxsetIndex == 0xFF means the tile is unscoped (matches any context).
+				// When HasFingerprints() and tile is scoped (GfxsetIndex != 0xFF):
+				//   - ActiveGfxset matches tile's gfxset → allow
+				//   - ActiveGfxset is different → skip (wrong gfxset)
+				//   - ActiveGfxset == -1 (no gfxset detected, e.g. worldmap) → skip
+				// This prevents cross-gfxset false positives (e.g. worldmap showing level tiles).
+				if(HasFingerprints() && tile->GfxsetIndex != 0xFF) {
+					if(ActiveGfxset < 0 || tile->GfxsetIndex != (uint8_t)ActiveGfxset) {
+						continue;
+					}
 				}
 				return tile;
 			}
