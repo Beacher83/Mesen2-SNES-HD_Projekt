@@ -6,27 +6,29 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Stand: 2026-06-12**  
-**M5.3 — Viewer-Patches vorbereitet, Mesen Fingerprint-System implementiert.**
+**Stand: 2026-06-13**  
+**M5.3 — KOMPLETT. Mesen + Viewer beide implementiert und gepusht.**
 
-**Mesen-Seite: ✅ FERTIG** (4 Dateien geändert, noch nicht gebaut)
+**Mesen-Seite: ✅ COMMITTED & PUSHED** (`origin/master`)
+- Commits: `2c278cf9`, `9793696d`
 - `SnesHdData.h`: Fingerprint-System, Gfxset-Scoping, DetectActiveGfxset()
-  - **Bugfix (Review):** `GetMatchingTile()` Gfxset-Filter war fehlerhaft — wenn ActiveGfxset==-1
+  - **Bugfix:** `GetMatchingTile()` Gfxset-Filter war fehlerhaft — wenn ActiveGfxset==-1
     (kein Gfxset erkannt, z.B. Worldmap), wurden gfxset-scoped Tiles nicht blockiert.
     Fix: `HasFingerprints() && GfxsetIndex != 0xFF` prüft jetzt korrekt alle Fälle.
 - `SnesHdPackLoader.cpp`: LoadFingerprints(), GfxsetIndex-Zuweisung
 - `SnesHdPackLoader.h`: LoadFingerprints() Deklaration
 - `SnesHdVideoFilter.cpp`: DetectActiveGfxset() Aufruf in ApplyFilter()
 
-**Viewer-Seite: Patch-Spezifikation FERTIG** (siehe `VIEWER_PATCH_M53.md`)
-- 11 Änderungsbereiche dokumentiert mit exaktem Vorher/Nachher-Code
-- Änderung 1: BG1 Hash-Fix (`chrRawData` → `vramSnapshot`)
-- Änderung 2: BG1 vramWordAddr `& 0x7FFF` Maske
-- Änderungen 3-6: BG3-Support in Container (Save/Refresh/Export/Import)
-- Änderung 7: BG3 Tile-PNG-Export (2bpp, layer=2)
-- Änderung 8: BG3 Hash-Berechnung in hashes.bin
-- Änderung 9: fingerprints.bin Generierung (nur 4bpp Referenz-Tiles)
-- Änderungen 10-11: Manifest + Alert-Update
+**Viewer-Seite: ✅ COMMITTED & PUSHED** (`DKC2-HD-Tools origin/main`, Commit `ca46d89`)
+- Alle 11 Änderungen aus `VIEWER_PATCH_M53.md` angewendet und verifiziert:
+  - Änderung 1: BG1 Hash-Fix (`chrRawData` → `vramSnapshot`) 
+  - Änderung 2: BG1 vramWordAddr `& 0x7FFF` Maske
+  - Änderungen 3-6: BG3-Support in Container (Save/Refresh/Export/Import)
+  - Änderung 7: BG3 Tile-PNG-Export (2bpp, layer=2, 32x32px)
+  - Änderung 8: BG3 Hash-Berechnung in hashes.bin (layer=2)
+  - Änderung 9: fingerprints.bin Generierung (nur 4bpp Referenz-Tiles, max 8 pro Gfxset)
+  - Änderung 10: manifest.json format_version 3, bg3 count, fingerprints flag
+  - Änderung 11: Alert mit BG3 + Fingerprint-Zähler
 
 **PPU-Verifikation: ✅ BG3 2bpp end-to-end kompatibel**
 - PPU: `RenderTilemap<2,2,...>()` → `ComputeTileContentHash(vram, addr, 8)` → 16 bytes
@@ -35,12 +37,11 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 - Fingerprints: beschränkt auf 4bpp (BG1/BG2) wegen Default-wordCount=16
 
 **Nächste Schritte:**
-1. **Viewer-Patches anwenden** — `VIEWER_PATCH_M53.md` auf DKC2-HD-Tools anwenden
-2. **Mesen bauen** — Fingerprint-Code kompilieren (benötigt VS)
-3. **Container aktualisieren** — ROM laden, Refresh Metadata, BG3-Daten aufnehmen
-4. **Re-Export + Test** — Pack neu exportieren, Level 2 + Worldmap testen
-5. Bug #5 (BG2 Animation Flicker) — Known Limitation, geparkt
-6. M6: HD-Tiles im Tile-Viewer-Debugger
+1. **Mesen bauen** — Fingerprint-Code kompilieren (benötigt VS)
+2. **Container aktualisieren** — ROM laden, Refresh Metadata, BG3-Daten aufnehmen
+3. **Re-Export + Test** — Pack neu exportieren, Level 2 + Worldmap testen
+4. Bug #5 (BG2 Animation Flicker) — Known Limitation, geparkt
+5. M6: HD-Tiles im Tile-Viewer-Debugger
 
 ## Milestone History
 
@@ -308,12 +309,16 @@ Entry size: 12 Bytes pro Eintrag.
 - Keines vorhanden → Legacy VramAddress-Modus (first-match)
 - Kein Crash bei fehlenden Dateien
 
-### M5.3 — Tiefenanalyse: Warum M5.2 bei Level 2 und Worldmap scheitert (2026-06-12)
+### M5.3 — BG1 Hash-Fix + BG3-Support + Fingerprint-System (2026-06-12/13, KOMPLETT)
 
 **Kontext:** M5.2 (Content-Hash) funktionierte für Level 1 (gfxset_07), aber komplett
 nicht für Level 2 (gfxset_37) und zeigte falsche Tiles auf der Worldmap. Die Analyse
 deckte drei voneinander unabhängige Probleme auf und erforderte einen detaillierten
 Vergleich der NES- und SNES-Architekturen.
+
+**Commits:**
+- Mesen: `2c278cf9` (feat), `9793696d` (bugfix GetMatchingTile) → `origin/master`
+- Viewer: `ca46d89` (feat, alle 11 Patches) → `DKC2-HD-Tools origin/main`
 
 #### Problem 1: BG1-Hash-Datenquelle im Viewer (chrRawData ≠ VRAM)
 
@@ -434,14 +439,13 @@ ins VRAM. Unterschiede liegen in Tilemaps und Paletten.
 `currentBgData`/`currentTileRawData` — was ein Bug-Risiko darstellt wenn man
 zwischen Catalog- und Level-Modus wechselt.
 
-#### Lösungsarchitektur
+#### Lösungsarchitektur (IMPLEMENTIERT)
 
-**Phase 1 — Level-2-Fix (nur Viewer-Änderungen):**
+**Phase 1 — Level-2-Fix (Viewer-Änderungen 1-2):** ✅
 1. BG1-Hash-Berechnung: `chrRawData` → `vramSnapshot` (analog zu BG2)
-2. Dedup-Key um Palette-Index erweitern
-3. ALLE Level-Tilemaps pro Gfxset iterieren für vollständige Palette-Abdeckung
+2. vramWordAddr `& 0x7FFF` Maske für Konsistenz
 
-**Phase 2 — Worldmap-Fix (Mesen + Viewer):**
+**Phase 2 — Worldmap-Fix (Mesen + Viewer):** ✅
 1. **Gfxset-Fingerprint-System:** Pro Gfxset 4-8 Reference-Tile-Hashes mit
    einzigartigem Inhalt, gespeichert in `fingerprints.bin`
 2. Mesen erkennt den aktiven Gfxset einmal pro Frame durch Prüfung der
@@ -449,6 +453,14 @@ zwischen Catalog- und Level-Modus wechselt.
 3. Tile-Lookup nur innerhalb des aktiven Gfxsets → keine False Positives
 4. Trennung: "Welcher Tile-Satz ist geladen?" (Fingerprint) vs.
    "Welches Tile ersetzen?" (Content-Hash innerhalb des aktiven Gfxsets)
+5. **Bugfix:** `GetMatchingTile()` blockiert jetzt korrekt gfxset-scoped Tiles
+   wenn ActiveGfxset==-1 (keine Erkennung, z.B. Worldmap ohne Fingerprint-Match)
+
+**Phase 3 — BG3-Layer-Support (Viewer-Änderungen 3-8):** ✅
+1. BG3-Tilemap-Extraktion in Container-Save/Refresh/ZIP-Import/Export
+2. BG3-Tile-PNG-Export (2bpp Mode 1, 32x32px, un-flipped)
+3. BG3-Hashes in hashes.bin (layer=2, bg3WordsPerTile=8, bg3BytesPerTile=16)
+4. manifest.json format_version 3 mit BG3-Tile-Count und Fingerprints-Flag
 
 **Vergleich der drei Identifikationsansätze:**
 
@@ -525,9 +537,17 @@ SnesHdTileKey {
 HdPacks/
   {romName}/
     manifest.json
+    hashes.bin                               (M5.2+: content hash lookup table)
+    fingerprints.bin                         (M5.3+: gfxset detection reference tiles)
     bg/
-      bg1/ bg2/ bg3/ bg4/
-        {vramAddr}_P{paletteIdx}.png      e.g. "4000_P03.png"
+      bg1/gfxset_XX/                         (XX = hex gfxset index)
+        {vramAddr}_P{paletteIdx}.png         e.g. "4000_P03.png"
+      bg2/gfxset_XX/
+        {vramAddr}_P{paletteIdx}.png
+      bg3/gfxset_XX/
+        {vramAddr}_P{paletteIdx}.png
+      bg4/gfxset_XX/
+        {vramAddr}_P{paletteIdx}.png
     sprites/
         {vramAddr}_P{paletteIdx}.png
 ```
