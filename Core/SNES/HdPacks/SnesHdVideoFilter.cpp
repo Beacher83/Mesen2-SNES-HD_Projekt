@@ -74,10 +74,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	FrameInfo frameInfo = _frameInfo;
 	OverscanDimensions overscan = GetOverscan();
 
-	// Detect active gfxset once per frame via fingerprint reference tiles.
-	// Sets _hdData->ActiveGfxset which scopes GetMatchingTile() to the correct gfxset.
-	// If no fingerprints.bin is loaded, this is a no-op (ActiveGfxset stays -1 = match all).
-	_hdData->DetectActiveGfxset(hdScreen->Vram);
+	// DISABLED (Phase 1 fix): DetectActiveGfxset() is fundamentally broken for
+	// DKC2 because VBlank DMA overwrites the VRAM regions where fingerprint
+	// reference tiles were stored (pre-DMA snapshot). Result: ActiveGfxset is
+	// always -1, blocking all gfxset-scoped HD tiles.
+	// The corresponding scoping check in GetMatchingTile() is also disabled.
+	// See SnesHdData.h for full explanation.
+	//
+	// _hdData->DetectActiveGfxset(hdScreen->Vram);
 
 	uint32_t hdScale = _hdScale;
 	uint32_t baseWidth = 256;

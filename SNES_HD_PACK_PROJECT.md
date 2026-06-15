@@ -6,56 +6,104 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Stand: 2026-06-13**  
-**M5.3 GETESTET — Content-Hash + Fingerprint-Ansatz gescheitert für animierte Levels.**  
-**Entscheidung: Wechsel zu Tilemap-Hash + VramAddress-Modus (M5.4)**
+**Stand: 2026-06-15**  
+**Phase 2 (M5.4) — Palette-Varianten-Export implementiert. Level 2 Fix bereit zum Testen.**
 
-**Testergebnis Pack `Hash test v1.3` (2026-06-13):**
-- Level 1 (gfxset_07): ✅ HD-Tiles korrekt — Performance schlechter als M5.1
-- Worldmap: ✅ Keine falschen Tiles mehr
-- Level 2 (gfxset_37): ❌ Keine BG1-HD-Tiles
-- BG3: ❌ Sichtbar aber opaque (sollte Color-Math-Nebel sein — HD-Tiles zerstören Effekt)
+### Phase 2 Fix: BG1 Palette-Varianten via ROM-Scan (2026-06-15)
 
-**Root Cause Level 2 — verifiziert:**
+**Problem:** Der Container speichert pro Gfxset nur EINE Level-Map32-Arrangement
+(das Level das beim "Save" aktiv war). Andere Level im selben Gfxset haben
+andere `mapId`-Werte → andere Map32-Tile-Anordnungen → andere Palette-Row-Zuordnungen
+für dieselben CHR-Tiles (gleicher VRAM-Content, gleicher Content-Hash).
 
-DKC2 VBlank-Handler Typ 13 überschreibt alle CHR-Tiles in VRAM jeden Frame per DMA
-(in Session 2026-06-11 bewiesen: alle 40 getesteten Tiles mismatchen zwischen Viewer und Mesen).
-Die Fingerprint-Referenz-Tiles für gfxset_37 (0x21F0, 0x2200, 0x2210, 0x2590 ...) werden
-von dieser DMA überschrieben. `DetectActiveGfxset()` findet keinen stabilen Match →
-`ActiveGfxset = -1` → alle gfxset_37-Tiles geblockt. Selbst bei funktionierender Erkennung
-würden die Tile-Hashes in hashes.bin nicht matchen (VRAM-Inhalt ändert sich pro Frame).
-**Das Content-Hash-System ist grundsätzlich inkompatibel mit CHR-animierten Levels.**
+Beispiel Gfxset 7: Level 1 nutzt Sub-Tile bei VRAM 0x4000 mit P06, Level 2
+nutzt dasselbe Sub-Tile mit P02. Export erzeugte nur `4000_P06.png`.
+Runtime-Key `(hash, P02, layer)` hatte keinen Treffer → Level 2 HD-Tiles fehlten.
 
-**Root Cause BG3-Problem:**
+**Lösung:** Beim Export (`exportAsTexturePack`) wird der ROM gescannt um ALLE
+Palette-Zeilen zu finden die ein VRAM-Tile im gesamten Gfxset nutzt. Fehlende
+Varianten werden als Kopien der existierenden PNG-Datei mit neuem `_Pxx`-Suffix
+erzeugt. Das HD-Bild ist palette-unabhängig (handgezeichneter Ersatz).
 
-SNES Color-Math erzeugt den Nebel-Effekt in "Mainbrace Mayhem" als Hardware-Transparenz.
-HD-Tile-Replacement überschreibt den Pixel vollständig — der Nebel-Effekt geht verloren.
-BG3-HD-Export für Color-Math-Layer ist generell nicht sinnvoll.
+**Neue Funktion:** `collectBG1PaletteVariantsFromROM(gfxSetIndex, chrBase, bgMode)`
+- Iteriert alle Level in `graphicsSetsMap.get(gfxSetIndex).levels`
+- Lädt pro Level die Map32-Arrangement via `loadTileParts(rom, style)`
+- Sammelt alle `(addrHex, palRow)` Paare
+- Überspringt Level mit abweichendem `chrBase` (mit console.warn)
+- Gibt `Map<addrHex, Set<palRow>>` zurück
 
-**Entscheidung: M5.4 — Tilemap-Hash-Modus (konsistent für alle Levels)**
+**Änderungen (committed):**
+- `DKC2-HD-Tools/dkc2-viewer/index.html` (Commit `1b774a6`):
+  - Zeile ~6996: Neue Funktion `collectBG1PaletteVariantsFromROM()`
+  - Zeile ~7079: `bg1PaletteVariants` Counter
+  - Zeile ~7095: `bg1TileBlobs` Map zum Tracking der PNG-Blobs pro addrHex
+  - Zeile ~7169: Blob wird in `bg1TileBlobs` gespeichert
+  - Zeile ~7174-7202: Palette-Variant-Expansion-Block nach dem Primär-Export-Loop
+  - Zeile ~7656-7658: Alert-Message zeigt Palette-Varianten-Anzahl
 
-| Kriterium | Content-Hash (M5.2/5.3) | Tilemap-Hash (M5.4) |
-|-----------|------------------------|---------------------|
-| Tile-Key | FNV-1a der CHR-Bytes | **VramAddress + GfxSetIndex** |
-| Gfxset-Erkennung | Hash von CHR-Referenz-Tiles | **Hash der BG1-Tilemap** |
-| Animierte Levels | ❌ CHR instabil | ✅ Tilemap stabil |
-| Nicht-animierte Levels | ✅ | ✅ |
-| Pack-Datei | hashes.bin + fingerprints.bin | **gfxset_map.bin** |
+**Warum BG2/BG3 nicht betroffen:**
+BG2/BG3-Tilemaps liegen im VRAM und sind Teil des GFX-DMA-Payloads
+(`style.graphics`). Alle Level im selben Gfxset haben identische VRAM-Inhalte,
+inklusive Tilemaps → identische Palette-Rows. Kein Varianten-Problem.
 
-Warum Tilemap stabil: DKC2 VBlank schreibt nur CHR-Daten (tilesheet), nicht Tilemap-Einträge
-(welche Tiles wo stehen). Die Tilemap eines Levels bleibt für die gesamte Laufzeit konstant.
+**Keine Mesen C++ Änderungen nötig:** hashes.bin enthält keine Palette-Info.
+Die Palette kommt ausschließlich aus dem PNG-Dateinamen. Der Mesen-Loader
+kombiniert: `contentHash (aus hashes.bin) + palette (aus Dateiname) + layer → Key`.
 
-**Ausgangspunkt: Stash `wip/gfxset-vram-session-2026-06-11`** (in beiden Repos vorhanden)
-Enthält: GfxSetIndex in SnesHdTileKey, TilemapHashToGfxSet, gfxset_map.bin Loader/Generator,
-Palette-Fix (vramPalLookup aus VRAM-Tilemap statt tileArrangementData). Debug-Logging noch drin.
+### Phase 1 Fix: Fingerprint-Scoping deaktiviert (2026-06-15)
 
-**Nächste Schritte (M5.4):**
-1. **Stash reviewen** — `git stash show -p stash@{0}` in beiden Repos
-2. **Mesen2:** Tilemap-Hash-Erkennung + VramAddress+GfxSetIndex-Key — Debug-Logs entfernen, bauen
-3. **Viewer:** gfxset_map.bin-Generierung + Palette-Fix (vramPalLookup) einbauen
-4. **BG3:** Export standardmäßig abschalten (Checkbox prüfen), Color-Math-Layer nicht exportieren
-5. **Test:** Level 1, Level 2, Worldmap
+**Problem:** Das in M5.3 eingeführte Fingerprint/Gfxset-Scoping-System ist fundamental
+inkompatibel mit DKC2's VBlank-DMA-Verhalten. DKC2 überschreibt VRAM-Regionen
+0x2000-0x21FF und 0x6000-0x61FF **jeden Frame** per DMA mit gemeinsamen Tiles.
+Die Fingerprint-Referenz-Hashes (aus pre-DMA VRAM-Snapshot des Viewers) stimmen
+nie mit dem Live-VRAM (post-DMA) überein → `ActiveGfxset` ist immer `-1` →
+ALLE gfxset-scoped HD-Tiles werden blockiert → Level 1 HD-Tiles flackern/verschwinden.
+
+**Tiefenanalyse (4 parallele Research Tasks):**
+- NES CHR-RAM HD Pack: Identifiziert Tiles rein nach Content-Bytes (16B) + Palette (4B).
+  Kein Address-basiertes Scoping, kein Fingerprint-System. DMA-Volatilität ist by-design
+  kein Problem — System liest Content bei jedem Render neu.
+- SNES PPU: VRAM ist read-only während Active Display (Scanlines 1-224). Unser
+  Injection-Point in `RenderTilemap()` ist optimal — alle Tile-Daten verfügbar, VRAM stabil.
+- SNES DMA: Schreibt nur während VBlank (Scanlines 225+). Kein Hook/Callback vorhanden.
+- SNES Hardware: Kein Hardware-"Tile-ID"-Konzept. Tiles rein durch VRAM-Bytes identifiziert.
+
+**Fazit:** Der Content-Hash-Ansatz (FNV-1a 64-bit) ist korrekt und spiegelt das NES-Modell.
+Das Fingerprint-Layer war die falsche Abstraktion für DKC2's DMA-Muster.
+
+**Änderungen (committed):**
+- `SnesHdData.h:365-378`: Gfxset-Scoping in `GetMatchingTile()` auskommentiert
+  (mit detailliertem Kommentar warum)
+- `SnesHdVideoFilter.cpp:77-84`: `DetectActiveGfxset()` Aufruf auskommentiert
+  (mit Verweis auf SnesHdData.h)
+
+**Wirkung:** Level 1 HD-Tiles funktionieren wieder wie vor M5.3. Content-Hash-Lookup
+ist jetzt rein `(hash, palette, layer)` — exakt wie NES CHR-RAM Modus.
+
+**Bekannte Konsequenz:** Worldmap kann false-positive HD-Tiles zeigen (identische
+Tile-Bytes → identisches Aussehen). Kosmetisch, nicht funktionskritisch.
+Langfristige Lösung: Condition-System (analog NES `<condition>` Tags) in zukünftigem Milestone.
+
+### Bisheriger M5.3 Stand (referenz)
+
+**Mesen-Seite: M5.3 COMMITTED & PUSHED** (`origin/master`)
+- Commits: `2c278cf9`, `9793696d`, `15851fe2`
+- Fingerprint-System, Gfxset-Scoping, DetectActiveGfxset() — **jetzt deaktiviert (s.o.)**
+- `SnesHdPackLoader.cpp`: LoadFingerprints(), GfxsetIndex-Zuweisung (bleibt, lädt aber inaktive Daten)
+
+**Viewer-Seite: ✅ COMMITTED & PUSHED** (`DKC2-HD-Tools origin/main`, Commit `ca46d89`)
+- Alle 11 Änderungen aus `VIEWER_PATCH_M53.md` angewendet und verifiziert
+
+**Nächste Schritte:**
+1. **Mesen bauen + testen** — VS öffnen, Release x64 Build, Level 1 HD-Tiles verifizieren (Phase 1)
+2. ~~**Phase 2: Viewer Palette-Fix**~~ ✅ Implementiert — ROM-Scan für BG1 Palette-Varianten
+3. **Viewer testen** — ROM laden, Container exportieren, prüfen ob Palette-Varianten im ZIP erscheinen,
+   dann in Mesen2 Level 2 testen ob HD-Tiles korrekt angezeigt werden
+4. **Phase 3 (optional): Worldmap-Mitigation** — Triviale Tiles filtern oder Condition-System
+5. **Phase 4: Architektur-Vereinfachung** — Gfxset-Index aus hashes.bin entfernen,
+   Fingerprint-System komplett entfernen, reines (contentHash, palette, layer) Keying
 6. Bug #5 (BG2 Animation Flicker) — Known Limitation, geparkt
+7. M6: HD-Tiles im Tile-Viewer-Debugger
 
 ## Milestone History
 

@@ -362,18 +362,20 @@ public:
 			for(SnesHdPackTileInfo* tile : it->second) {
 				if(tile->IsFullyTransparent) continue;
 
-				// Gfxset scoping: when fingerprints are loaded, enforce scoping.
-				// tile->GfxsetIndex == 0xFF means the tile is unscoped (matches any context).
-				// When HasFingerprints() and tile is scoped (GfxsetIndex != 0xFF):
-				//   - ActiveGfxset matches tile's gfxset → allow
-				//   - ActiveGfxset is different → skip (wrong gfxset)
-				//   - ActiveGfxset == -1 (no gfxset detected, e.g. worldmap) → skip
-				// This prevents cross-gfxset false positives (e.g. worldmap showing level tiles).
-				if(HasFingerprints() && tile->GfxsetIndex != 0xFF) {
-					if(ActiveGfxset < 0 || tile->GfxsetIndex != (uint8_t)ActiveGfxset) {
-						continue;
-					}
-				}
+				// DISABLED (Phase 1 fix): Fingerprint-based gfxset scoping does not work
+				// for DKC2. VBlank DMA overwrites VRAM regions 0x2000-0x21FF and
+				// 0x6000-0x61FF every frame with shared tiles, so fingerprint reference
+				// hashes (computed from pre-DMA VRAM) never match live VRAM → ActiveGfxset
+				// is always -1 → ALL gfxset-scoped tiles get blocked.
+				// Content-hash keys already provide correct tile identity (like NES CHR-RAM
+				// mode). Cross-context issues (worldmap) are cosmetic and should be solved
+				// via a condition system in a future milestone, not via fingerprints.
+				//
+				// if(HasFingerprints() && tile->GfxsetIndex != 0xFF) {
+				// 	if(ActiveGfxset < 0 || tile->GfxsetIndex != (uint8_t)ActiveGfxset) {
+				// 		continue;
+				// 	}
+				// }
 				return tile;
 			}
 			return nullptr;
