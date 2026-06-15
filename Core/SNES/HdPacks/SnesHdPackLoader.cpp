@@ -193,6 +193,20 @@ bool SnesHdPackLoader::LoadHashes()
 			detail += "gfxset_" + std::to_string(gc.first) + "=" + std::to_string(gc.second);
 		}
 		MessageManager::Log("[SNES HD Pack] Loaded " + std::to_string(_hashMap.size()) + " content hashes from hashes.bin (" + detail + ")");
+
+		// DIAGNOSTIC: Dump first 5 hash values per gfxset for comparison with runtime misses
+		std::unordered_map<uint8_t, int> sampleCounts;
+		for(auto& kv : _hashMap) {
+			uint8_t gs = (kv.first >> 24) & 0xFF;
+			if(sampleCounts[gs]++ < 5) {
+				uint16_t va = kv.first & 0xFFFF;
+				uint8_t ly = (kv.first >> 16) & 0xFF;
+				char buf[128];
+				snprintf(buf, sizeof(buf), "[SNES HD diag] LOADED gfxset=%d vram=0x%04X layer=%d hash=%016llX",
+					gs, va, ly, (unsigned long long)kv.second);
+				MessageManager::Log(buf);
+			}
+		}
 	}
 	return !_hashMap.empty();
 }

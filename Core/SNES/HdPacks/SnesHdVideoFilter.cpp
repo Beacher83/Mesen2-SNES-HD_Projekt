@@ -5,6 +5,8 @@
 #include "Shared/EmuSettings.h"
 #include "Shared/Video/BaseVideoFilter.h"
 #include "Shared/ColorUtilities.h"
+#include "Shared/MessageManager.h"
+#include <unordered_set>
 
 SnesHdVideoFilter::SnesHdVideoFilter(Emulator* emu, SnesConsole* console, SnesHdPackData* hdData) : BaseVideoFilter(emu)
 {
@@ -104,10 +106,26 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPackTileInfo* hdTile = nullptr;
 			SnesHdPpuTileInfo* tileInfo = nullptr;
 
-			if(pixelInfo.BgTileCount > 0) {
+		if(pixelInfo.BgTileCount > 0) {
 				hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
 				if(hdTile) {
 					tileInfo = &pixelInfo.BgTiles[0];
+				} else {
+					// DIAGNOSTIC: Log first 30 unique hash misses to identify VRAM content mismatch
+					static int diagMissCount = 0;
+					static std::unordered_set<uint64_t> diagLoggedHashes;
+					if(diagMissCount < 30) {
+						auto& key = pixelInfo.BgTiles[0].Key;
+						if(key.ContentHash != 0 && diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
+							diagLoggedHashes.insert(key.ContentHash);
+							char buf[256];
+							snprintf(buf, sizeof(buf),
+								"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d",
+								(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex);
+							MessageManager::Log(buf);
+							diagMissCount++;
+						}
+					}
 				}
 			}
 
