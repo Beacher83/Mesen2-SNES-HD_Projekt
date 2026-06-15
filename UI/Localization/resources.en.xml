@@ -3530,6 +3530,7 @@ E
 			<Value ID="VideoRecorder">Video Recorder</Value>
 			<Value ID="Cheats">Cheats</Value>
 			<Value ID="LogWindow">Log Window</Value>
+			<Value ID="DumpVram">Dump VRAM to File</Value>
 			<Value ID="HdPacks">HD Packs (NES)</Value>
 			<Value ID="InstallHdPack">Install HD Pack</Value>
 			<Value ID="HdPackBuilder">HD Pack Builder</Value>

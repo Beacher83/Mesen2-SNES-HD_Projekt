@@ -614,6 +614,9 @@ namespace Mesen.Debugger.Utilities
 		[IconFile("LogWindow")]
 		LogWindow,
 
+		[IconFile("Export")]
+		DumpVram,
+
 		[IconFile("Camera")]
 		TakeScreenshot,
 

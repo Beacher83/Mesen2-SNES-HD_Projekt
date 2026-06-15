@@ -7,7 +7,50 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 ## Current Status
 
 **Stand: 2026-06-15**  
-**Phase 2 (M5.4) — Palette-Varianten-Export implementiert. Level 2 Fix bereit zum Testen.**
+**VRAM Dump/Import System implementiert — bereit zum Testen.**
+
+### VRAM Dump/Import Feature (2026-06-15)
+
+**Problem:** Viewer's VRAM-Simulation (`loadLevelBackground()`) weicht für bestimmte
+Gfxsets (z.B. 37 = Lava-Levels) vom echten Mesen-Runtime-VRAM ab. Ursache: VBlank
+DMA Type 13, Init-Code VRAM-Writes und andere Runtime-Modifikationen die der Viewer
+nicht simuliert. Content-Hashes im Export stimmen daher nicht mit Mesen's Runtime-Hashes
+überein → HD-Tiles werden nicht angezeigt. (Gfxset 7 funktioniert zufällig, weil die
+Simulation dort übereinstimmt.)
+
+**Lösung:** VRAM Dump/Import System:
+1. Mesen: Neuer Menüpunkt "Dump VRAM to File" (Tools-Menü)
+2. User spielt Level, pausiert, dumpt VRAM → 64KB Binärdatei
+3. Viewer: Per-Gfxset Import-Button im Container Manager
+4. Import ersetzt `vramSnapshot` in IndexedDB → Hashes werden aus echtem VRAM berechnet
+
+**Mesen-Änderungen (noch nicht committed):**
+- `UI/Debugger/Utilities/ContextMenuAction.cs`: Neuer `ActionType.DumpVram` Enum-Wert
+- `UI/Localization/resources.en.xml`: Lokalisierung "Dump VRAM to File"
+- `UI/ViewModels/MainMenuViewModel.cs` (Zeile ~794-811): Menüpunkt im Tools-Menü
+  - Nutzt `DebugApi.GetMemoryState(MemoryType.SnesVideoRam)` (65536 bytes)
+  - Save-Dialog startet im HD-Pack-Verzeichnis
+  - On-Screen-Nachricht via `DisplayMessageHelper`
+  - Nur für SNES-ROMs sichtbar
+
+**Viewer-Änderungen (noch nicht committed):**
+- `index.html` (Container Modal): Hidden `<input type="file" id="vramDumpInput" accept=".bin,.dmp">`
+- `index.html` (Zeile ~7889-7897): Per-Set VRAM-Status-Indikator im Container-Manager
+  - Grüner Kreis (●) = VRAM Snapshot vorhanden
+  - Roter Kreis (○) = Kein Snapshot, Import nötig
+  - Klick öffnet Dateiauswahl
+- `index.html` (Zeile ~7914-7977): Neue Funktion `importVramForSet(containerName, type, setId)`
+  - Akzeptiert 64KB (Mesen-Dump, wird auf 128KB gepaddet) oder 128KB
+  - Ersetzt `vramSnapshot` im bestehenden IndexedDB-Set
+  - Loggt Fingerprint zur Verifikation
+  - Statusmeldung im Container-Manager
+
+**Workflow:**
+1. Level in Mesen spielen, pausieren
+2. Tools → "Dump VRAM to File" → Datei speichern
+3. Viewer öffnen, Container-Manager öffnen
+4. Beim Gfxset-Tag auf den Kreis-Button klicken → .bin Datei auswählen
+5. "Texture Pack" exportieren → Hashes basieren jetzt auf echtem Mesen-VRAM
 
 ### Phase 2 Fix: BG1 Palette-Varianten via ROM-Scan (2026-06-15)
 

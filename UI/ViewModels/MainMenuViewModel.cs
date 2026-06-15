@@ -784,10 +784,29 @@ namespace Mesen.ViewModels
 
 				new ContextMenuSeparator(),
 				
-				new MainMenuAction() {
+			new MainMenuAction() {
 					ActionType = ActionType.LogWindow,
 					OnClick = () => {
 						ApplicationHelper.GetOrCreateUniqueWindow(wnd, () => new LogWindow());
+					}
+				},
+
+				new MainMenuAction() {
+					ActionType = ActionType.DumpVram,
+					IsEnabled = () => IsGameRunning && MainWindow.RomInfo.ConsoleType == ConsoleType.Snes,
+					OnClick = async () => {
+						string romName = EmuApi.GetRomInfo().GetRomName();
+						string defaultName = romName + " - VRAM.bin";
+						string hdPackDir = Path.Combine(ConfigManager.HdPackFolder, romName);
+						string? filename = await FileDialogHelper.SaveFile(
+							Directory.Exists(hdPackDir) ? hdPackDir : ConfigManager.HdPackFolder,
+							defaultName, wnd, FileDialogHelper.BinExt
+						);
+						if(filename != null) {
+							byte[] vram = DebugApi.GetMemoryState(MemoryType.SnesVideoRam);
+							File.WriteAllBytes(filename, vram);
+							DisplayMessageHelper.DisplayMessage("HD Pack", "VRAM dumped (" + vram.Length + " bytes)");
+						}
 					}
 				},
 
