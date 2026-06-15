@@ -181,7 +181,18 @@ bool SnesHdPackLoader::LoadHashes()
 	}
 
 	if(!_hashMap.empty()) {
-		MessageManager::Log("[SNES HD Pack] Loaded " + std::to_string(_hashMap.size()) + " content hashes from hashes.bin");
+		// Log per-gfxset breakdown
+		std::unordered_map<uint8_t, int> gfxsetCounts;
+		for(auto& kv : _hashMap) {
+			uint8_t gs = (kv.first >> 24) & 0xFF;
+			gfxsetCounts[gs]++;
+		}
+		string detail;
+		for(auto& gc : gfxsetCounts) {
+			if(!detail.empty()) detail += ", ";
+			detail += "gfxset_" + std::to_string(gc.first) + "=" + std::to_string(gc.second);
+		}
+		MessageManager::Log("[SNES HD Pack] Loaded " + std::to_string(_hashMap.size()) + " content hashes from hashes.bin (" + detail + ")");
 	}
 	return !_hashMap.empty();
 }
@@ -337,6 +348,11 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		_data->Tiles.push_back(std::move(tile));
 		_data->ImageFileData.push_back(std::move(bitmap));
 		loadedCount++;
+	}
+
+	if(loadedCount > 0 || !files.empty()) {
+		MessageManager::Log("[SNES HD Pack] gfxset_" + std::to_string(gfxsetIndex) + " layer " + std::to_string(layerIndex)
+			+ ": loaded " + std::to_string(loadedCount) + "/" + std::to_string(files.size()) + " tiles");
 	}
 
 	return loadedCount > 0;
