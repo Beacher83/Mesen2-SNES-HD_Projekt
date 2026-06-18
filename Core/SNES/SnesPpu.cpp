@@ -1084,12 +1084,13 @@ void SnesPpu::RenderTilemap()
 				}
 			}
 
-			// HD Pack: only record tile info when this BG layer wins the pixel.
-			// Always writes to BgTiles[0] so a higher-priority layer rendered later overwrites it.
-			// BgTileCount=0 means sprite or backdrop won — filter uses native SNES pixel.
-			if(winsMain && hdValid && x < SnesHdScreenInfo::ScreenWidth) {
+		// HD Pack: record tile info for ALL non-transparent BG layers at this pixel,
+			// not just the compositing winner. Each layer writes to BgTiles[layerIndex].
+			// The HD video filter tries the winner first; if no HD tile exists for
+			// the winner, it falls back to other layers (e.g. BG1 under BG3 fog).
+			if(drawMain && hdValid && x < SnesHdScreenInfo::ScreenWidth) {
 				SnesHdPpuPixelInfo& pixelInfo = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
-				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[0];
+				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[layerIndex];
 				uint16_t tileIndex = tilemapData & 0x3FF;
 				uint16_t vramWordAddr = (_state.Layers[layerIndex].ChrAddress + tileIndex * 4 * bpp) & 0x7FFF;
 				if(_hdData->UseContentHash) {
@@ -1114,7 +1115,10 @@ void SnesPpu::RenderTilemap()
 				}
 				uint16_t realY = IsDoubleHeight() ? (_oddFrame ? ((_scanline << 1) + 1) : (_scanline << 1)) : _scanline;
 				tileInfo.OffsetY = (realY + _layerData[layerIndex].Tiles[lookupIndex].VScroll) & 0x07;
-				pixelInfo.BgTileCount = 1;
+				pixelInfo.BgLayerMask |= (1 << layerIndex);
+				if(winsMain) {
+					pixelInfo.BgWinnerLayer = layerIndex;
+				}
 			}
 		}
 

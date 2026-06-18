@@ -131,8 +131,9 @@ struct SnesHdPpuTileInfo
 
 struct SnesHdPpuPixelInfo
 {
-	SnesHdPpuTileInfo BgTiles[4] = {};   // BG1-BG4 tile info at this pixel
-	uint8_t BgTileCount = 0;             // How many BG layers contributed
+	SnesHdPpuTileInfo BgTiles[4] = {};   // BG1-BG4 tile info at this pixel (indexed by layerIndex 0-3)
+	uint8_t BgLayerMask = 0;             // Bitmask: bit N set = BgTiles[N] has a non-transparent tile
+	uint8_t BgWinnerLayer = 0xFF;        // Which BG layer won compositing (0-3), or 0xFF = sprite/backdrop
 
 	SnesHdPpuTileInfo Sprites[4] = {};   // Up to 4 sprite tiles at this pixel
 	uint8_t SpriteCount = 0;

@@ -144,6 +144,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameHdMatch = 0;
 	uint32_t frameHdMiss = 0;
 	uint32_t framePalMismatch = 0;
+	uint32_t frameFallback = 0;
 
 	// For each pixel in the original SNES frame (always 256x239 for HD info)
 	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
@@ -154,27 +155,66 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			// Index into ppuOutputBuffer (accounts for hi-res doubling)
 			uint32_t ppuIndex = isHiRes ? (y * 2 * ppuWidth + x * 2) : (y * ppuWidth + x);
 
-			// BgTileCount is 0 (sprite/backdrop won) or 1 (the winning BG layer's tile).
-			// Only apply HD tile when a BG layer won the pixel.
+			// -----------------------------------------------------------------
+			// Multi-layer HD tile lookup with fallback
+			// -----------------------------------------------------------------
+			// BgLayerMask is a bitmask of which BG layers have non-transparent
+			// tiles at this pixel. BgWinnerLayer is the compositing winner.
+			// Strategy: try the winner layer first. If no HD tile exists for
+			// the winner, try other layers (e.g. BG1 under BG3 fog in DKC2).
 			SnesHdPackTileInfo* hdTile = nullptr;
 			SnesHdPpuTileInfo* tileInfo = nullptr;
+			bool usedFallbackLayer = false;
 
-		if(pixelInfo.BgTileCount > 0) {
+			// Only attempt HD BG tile replacement when:
+			// 1) At least one BG layer has a non-transparent tile at this pixel
+			// 2) A sprite did NOT win compositing (IsSpritePixel flag in MainScreenFlags)
+			// Without the sprite guard, BG tile info stored by the PPU (for fallback)
+			// would incorrectly replace sprite pixels with BG HD tiles.
+			bool spriteWon = (pixelInfo.MainScreenFlags & 0x40) != 0;
+
+		if(pixelInfo.BgLayerMask != 0 && !spriteWon) {
 				frameBgPixels++;
-				hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
-				if(hdTile) {
-					tileInfo = &pixelInfo.BgTiles[0];
-					frameHdMatch++;
 
-					// DIAGNOSTIC: Log first 5 unique MATCHES to confirm tiles are working
+				// 1) Try the compositing winner first
+				uint8_t winLayer = pixelInfo.BgWinnerLayer;
+				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
+					if(hdTile) {
+						tileInfo = &pixelInfo.BgTiles[winLayer];
+					}
+				}
+
+				// 2) Fallback: try other layers if winner has no HD tile
+				if(!hdTile) {
+					for(int i = 0; i < 4; i++) {
+						if(i == (int)winLayer) continue;
+						if(pixelInfo.BgLayerMask & (1 << i)) {
+							hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[i].Key, hdScreen->Vram);
+							if(hdTile) {
+								tileInfo = &pixelInfo.BgTiles[i];
+								usedFallbackLayer = true;
+								break;
+							}
+						}
+					}
+				}
+
+				if(hdTile) {
+					frameHdMatch++;
+					if(usedFallbackLayer) {
+						frameFallback++;
+					}
+
+					// DIAGNOSTIC: Log first 5 unique MATCHES
 					if(diagMatchCount < 5) {
-						auto& key = pixelInfo.BgTiles[0].Key;
+						auto& key = tileInfo->Key;
 						if(key.ContentHash != 0 && diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
-							// Don't add to diagLoggedHashes — keep match logging separate from miss logging
 							char buf[256];
 							snprintf(buf, sizeof(buf),
-								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d",
-								(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex);
+								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s",
+								(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
+								usedFallbackLayer ? " (FALLBACK)" : "");
 							MessageManager::Log(buf);
 							diagMatchCount++;
 						}
@@ -182,10 +222,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				} else {
 					frameHdMiss++;
 
-					auto& key = pixelInfo.BgTiles[0].Key;
+					// DIAGNOSTIC: Log misses for the winner layer
+					auto& key = (winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer)))
+						? pixelInfo.BgTiles[winLayer].Key
+						: pixelInfo.BgTiles[0].Key;
 					if(key.ContentHash != 0) {
-						// DIAGNOSTIC: Check if ContentHash exists with a DIFFERENT palette
-						// This detects the suspected palette mismatch bug
 						bool foundWithOtherPal = false;
 						for(int tryPal = 0; tryPal < 8; tryPal++) {
 							if(tryPal == key.PaletteIndex) continue;
@@ -209,21 +250,21 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							}
 						}
 
-						// DIAGNOSTIC: Log unique misses (not palette mismatch) — increased limit to 60
 						if(!foundWithOtherPal && diagMissCount < 60) {
 							if(diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
 								diagLoggedHashes.insert(key.ContentHash);
 								char buf[256];
 								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d",
-									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex);
+									"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d layers=0x%02X win=%d",
+									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
+									pixelInfo.BgLayerMask, pixelInfo.BgWinnerLayer);
 								MessageManager::Log(buf);
 								diagMissCount++;
 							}
 						}
-					} // end if(key.ContentHash != 0)
-				} // end else (no hdTile match)
-			} // end if(pixelInfo.BgTileCount > 0)
+					}
+				}
+			} // end if(pixelInfo.BgLayerMask != 0)
 
 			uint32_t outX = (x - overscan.Left) * hdScale;
 			uint32_t outY = (y - overscan.Top) * hdScale;
@@ -290,10 +331,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	if(frameBgPixels > 0 && diagFrameCount < 10) {
 		char buf[512];
 		snprintf(buf, sizeof(buf),
-			"[SNES HD diag] FRAME %d [%s]: bgPixels=%u match=%u miss=%u palMismatch=%u (TileByKey=%zu, sig=%016llX)",
+			"[SNES HD diag] FRAME %d [%s]: bgPixels=%u match=%u (fallback=%u) miss=%u palMismatch=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount,
 			isLevel2 ? "LEVEL2" : "other",
-			frameBgPixels, frameHdMatch, frameHdMiss, framePalMismatch,
+			frameBgPixels, frameHdMatch, frameFallback, frameHdMiss, framePalMismatch,
 			_hdData->TileByKey.size(),
 			(unsigned long long)vramSig);
 		MessageManager::Log(buf);
