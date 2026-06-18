@@ -417,9 +417,16 @@ Entry size: 12 Bytes pro Eintrag.
 ### M5.3 — BG1 Hash-Fix + BG3-Support + Fingerprint-System (2026-06-12/13, KOMPLETT)
 
 **Kontext:** M5.2 (Content-Hash) funktionierte für Level 1 (gfxset_07), aber komplett
-nicht für Level 2 (gfxset_37) und zeigte falsche Tiles auf der Worldmap. Die Analyse
+nicht für Level 2 (gfxset_25, dezimal 37) und zeigte falsche Tiles auf der Worldmap. Die Analyse
 deckte drei voneinander unabhängige Probleme auf und erforderte einen detaillierten
 Vergleich der NES- und SNES-Architekturen.
+
+> **Hinweis zur "gfxset 0x37"-Verwechslung:** Die Projekt-Dokumentation verwendete
+> anfangs fälschlicherweise "gfxset 0x37" für Level 2. Der Fehler entstand weil
+> `style.graphics = 37` (dezimal) als Hex-Wert 0x37 interpretiert wurde. Korrekt:
+> 37 dezimal = **0x25 hex**. Der Viewer-Code arbeitet intern korrekt mit dezimalen
+> Indizes und konvertiert nur bei Container-Benennung nach Hex (`.toString(16)`).
+> gfxset hex 0x37 = dezimal 55 existiert nicht — kein Level referenziert es.
 
 **Commits:**
 - Mesen: `2c278cf9` (feat), `9793696d` (bugfix GetMatchingTile) → `origin/master`
@@ -427,18 +434,18 @@ Vergleich der NES- und SNES-Architekturen.
 
 #### Problem 1: BG1-Hash-Datenquelle im Viewer (chrRawData ≠ VRAM)
 
-**Symptom:** hash_miss.log zeigt 0/60 MISS-Hashes aus gfxset_37 in hashes.bin gefunden.
+**Symptom:** hash_miss.log zeigt 0/60 MISS-Hashes aus gfxset_25 in hashes.bin gefunden.
 
 **Root Cause:** Der Viewer berechnet BG1-Hashes aus `chrRawData[gfxIndex * 32]` — einem
 sequentiellen Tile-Buffer aus ROM-Decompression. Mesen berechnet Hashes aus
 `_vram[vramWordAddr]` — den tatsächlichen VRAM-Bytes an der Hardware-Adresse.
 
 Für gfxset_07 stimmen diese zufällig überein (Tiles werden in gleicher Reihenfolge an
-gleiche Adressen geladen). Für gfxset_37 weichen die Bytes vollständig ab →
+gleiche Adressen geladen). Für gfxset_25 weichen die Bytes vollständig ab →
 verschiedene Hashes → 0% Match-Rate.
 
 **Beweis:** hash_load.log und hash_miss.log zeigen null Überlappung zwischen
-Viewer-berechneten und Mesen-berechneten Hashes für gfxset_37.
+Viewer-berechneten und Mesen-berechneten Hashes für gfxset_25.
 
 **Fix (Viewer):** BG1-Hash-Berechnung von `chrRawData` auf `vramSnapshot` umstellen.
 BG2 verwendet bereits `vramSnapshot` und funktioniert korrekt — BG1 muss denselben
@@ -449,7 +456,7 @@ Ansatz verwenden.
 **Symptom:** Selbst wenn die Hashes übereinstimmen würden, passen die Paletten nicht.
 
 **Root Cause:** 
-- hash_load.log: gfxset_37 BG1-Tiles exportiert mit P06/P04
+- hash_load.log: gfxset_25 BG1-Tiles exportiert mit P06/P04
 - hash_miss.log: Mesen sucht P02 bei Level-2-Start
 - Der Lookup-Key ist `(Hash, Palette, Layer)` → `(Hash, P06, layer0)` ≠ `(Hash, P02, layer0)`
 
@@ -566,6 +573,51 @@ zwischen Catalog- und Level-Modus wechselt.
 2. BG3-Tile-PNG-Export (2bpp Mode 1, 32x32px, un-flipped)
 3. BG3-Hashes in hashes.bin (layer=2, bg3WordsPerTile=8, bg3BytesPerTile=16)
 4. manifest.json format_version 3 mit BG3-Tile-Count und Fingerprints-Flag
+
+**Phase 4 — VBlank DMA Injection (Viewer-Fix für animierte Tiles):** 🔧 IN TEST
+
+Levels mit VBlank-Animationstypen (7, 8, 13, 19) überschreiben nach dem initialen
+DMA-Load Teile des VRAMs jeden VBlank-Frame (z.B. Piratenflagge in gfxset_25,
+vblankType 13: 960 Bytes → VRAM 0x2010-0x21E0, Tiles 1-30).
+
+**Problem:** Der Viewer exportierte Hashes vom PRE-VBlank VRAM (initiale DMA-Daten),
+Mesen berechnet Hashes vom POST-VBlank VRAM (nach Animation-Overwrite) → 0% Match
+für die betroffenen Tiles.
+
+**Analyse (VramCompare2, VRAM-Dump bei Leveleintritt):**
+- VRAM-Dump bestätigt als Level 2 (gfxset_25 statische Tiles matchen perfekt)
+- Statische Tiles (31+): alle 5 getesteten LOADED-Hashes → MATCH
+- VBlank DMA-Region (Tiles 1-30): VRAM bei Leveleintritt enthält initiale gfxset-Daten
+  (Piratenflagge noch nicht sichtbar → Animation noch nicht gestartet)
+- MISS-Hashes (aus Gameplay-Log) stammen von einem späteren Zeitpunkt wenn VBlank-
+  Animation aktiv ist → 0/30 im Dump gefunden → bestätigt zwei verschiedene VRAM-Zustände
+- ROM Frame-0-Daten (0x3A5FC1) vs Dump: nur 7.8% Übereinstimmung → Dump ≠ Animation
+
+**Palette-Mismatch (aus Debug-Session mit Commit 85c0b29):**
+- MISS-Hashes zeigten pal=2, LOADED-Hashes P04/P06
+- Kopieren P04→P02 half NICHT → bestätigt Hash-Mismatch als primäres Problem
+- Palette Variant Expansion (Commit 1b774a6, `collectBG1PaletteVariantsFromROM()`)
+  war bereits implementiert → erzeugt PNG-Kopien für alle Paletten-Varianten
+- **Mit korrektem Hash + Palette Expansion sind beide Issues abgedeckt**
+
+**Dezimal/Hex-Verwechslung (aufgelöst):** `style.graphics = 37` (dezimal) wurde
+in der Projektdoku als "gfxset 0x37" (hex) notiert. Korrekt: 37 dez = 0x25 hex.
+gfxset 0x37 (= 55 dez) existiert nicht. Der Viewer konvertiert korrekt mit
+`.toString(16)`. Alle Referenzen in dieser Datei korrigiert.
+
+**Fix (Viewer, Commits 885c867 + a831c5d):**
+1. `injectAnimatedTilesIntoVram()` — schreibt Frame-0-Animationsdaten ins VRAM
+2. Aufruf in `loadLevelBackground()` nach DMA-Entries
+3. `buildCatalogByGfxSet()` gibt `catalogVram` + `catalogBg3TilemapData` zurück
+4. Container-Save/Refresh nutzt `catalogData.vram` als Fallback
+5. **Auto-Injection im Export** — `exportAsTexturePack()` injiziert VBlank-Daten
+   automatisch in gespeicherte VRAM-Snapshots aller Sets vor Hash-Berechnung.
+   Kein manuelles "Refresh Metadata" nötig, auch für alte Container.
+   Lookup: `graphicsSetsMap.get(gfxSetIndex).levels[0].style.vblankType`
+
+**Offener Punkt:** Nur Frame 0 wird injiziert. Piratenflagge zykliert durch N Frames →
+Tiles 1-30 matchen nur während Frame 0 der Animation. Multi-Frame-Support wäre die
+vollständige Lösung, ist aber ein separater Meilenstein.
 
 **Vergleich der drei Identifikationsansätze:**
 
@@ -729,3 +781,35 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 - `EnableHdPacks` setting in `SnesConfig` (default: `true`) controls whether HD filter is used
 - `SnesHdTileKey` uses `LayerIndex=4` for sprites (no separate `IsSprite` flag)
 - BG-Tile-Info wird nur für den Pixel-Gewinner-Layer gespeichert (`BgTiles[0]`, `BgTileCount` = 0 oder 1). `BgTileCount=0` = Sprite oder Backdrop hat gewonnen → Filter verwendet nativen SNES-Pixel.
+
+---
+
+## Session-Status (17. Juni 2025)
+
+### Erledigt heute
+
+1. **GitHub Push erfolgreich** — 3 Commits auf `origin/main` gepusht:
+   - `885c867` — VBlank DMA frame 0 Injection in VRAM-Snapshot
+   - `a831c5d` — Auto-Injection bei Export (kein manuelles Refresh nötig)
+   - `c3e3045` — CHANGELOG.md hinzugefügt
+   - (+ `85c0b29` war bereits vorher gepusht: generisches DMA-Loading)
+
+2. **Analyse abgeschlossen** — VramCompare2 bestätigt:
+   - Level 2 VRAM-Dump matcht alle 5 LOADED-Hashes (statische Tiles 31+)
+   - MISS-Hashes stammen aus VBlank-Animations-State (Tiles 1-30)
+   - ROM frame 0 (0x3A5FC1) ≠ initialer Dump → bestätigt Timing-Unterschied
+
+3. **Dokumentation auf aktuellem Stand** — alle hex/decimal-Korrekturen, Phase 4 vollständig
+
+### Nächste Schritte (morgen)
+
+1. **Test auf zweitem PC:**
+   - `git pull` im DKC2-HD-Tools Repo
+   - Viewer öffnen → bestehenden Container (Level 1 + Level 2) laden
+   - HD Pack exportieren → in Mesen laden → Level 2 (Mainbrace Mayhem) starten
+   - **Erwartetes Ergebnis:** HD-Tiles werden angezeigt (zumindest statische Tiles 31+)
+   - Pirate-Flag-Tiles (1-30) matchen nur während VBlank frame 0 → teilweises Flackern möglich
+
+2. **Bei Erfolg:** Multi-Frame-Animation planen (alle N Frames der Pirate-Flag exportieren)
+
+3. **Bei Misserfolg:** Exported hashes.bin mit Mesen-Runtime-Hashes vergleichen (Debugger-Breakpoint in `ComputeTileContentHash`)

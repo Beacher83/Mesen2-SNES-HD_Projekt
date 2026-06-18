@@ -92,6 +92,59 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t ppuWidth = _baseFrameInfo.Width;
 	bool isHiRes = (ppuWidth == 512);
 
+	// =====================================================================
+	// DIAGNOSTIC: Context-aware logging with VRAM-based level detection
+	// =====================================================================
+	// Problem: Mesen auto-loads last save state (could be worldmap).
+	// Static counters would log worldmap data and exhaust limits before
+	// the user enters Level 2. Solution: detect context changes via
+	// VRAM content hash at stable reference addresses (outside VBlank DMA).
+	//
+	// Reference tiles (from VramCompare2.cs):
+	//   gfxset_37 (Level 2): VRAM 0x32E0 → hash 0x1585855B0633F405
+	//   gfxset_07 (Level 1): VRAM 0x2080 → hash 0xF33C58BA8611DF5D
+	// Both are outside VBlank DMA range (0x2000-0x21D0), so stable.
+	// =====================================================================
+
+	static uint64_t diagPrevVramSig = 0;
+	static int diagFrameCount = 0;
+	static int diagMissCount = 0;
+	static int diagPalMismatchCount = 0;
+	static int diagMatchCount = 0;
+	static std::unordered_set<uint64_t> diagLoggedHashes;
+
+	// Compute VRAM context signature from two stable reference tiles
+	uint64_t sigA = 0, sigB = 0;
+	bool isLevel2 = false;
+	if(hdScreen->Vram) {
+		sigA = ComputeTileContentHash(hdScreen->Vram, 0x32E0);  // gfxset_37 ref tile
+		sigB = ComputeTileContentHash(hdScreen->Vram, 0x2080);  // gfxset_07 ref tile
+		isLevel2 = (sigA == 0x1585855B0633F405ULL);
+	}
+	uint64_t vramSig = sigA ^ (sigB << 1);  // simple combined signature
+
+	// Detect context change (level transition) → reset all diagnostic counters
+	if(vramSig != diagPrevVramSig && diagPrevVramSig != 0) {
+		char buf[256];
+		snprintf(buf, sizeof(buf),
+			"[SNES HD diag] CONTEXT CHANGE: sig %016llX -> %016llX (isLevel2=%s)",
+			(unsigned long long)diagPrevVramSig, (unsigned long long)vramSig,
+			isLevel2 ? "YES" : "no");
+		MessageManager::Log(buf);
+		diagFrameCount = 0;
+		diagMissCount = 0;
+		diagPalMismatchCount = 0;
+		diagMatchCount = 0;
+		diagLoggedHashes.clear();
+	}
+	diagPrevVramSig = vramSig;
+
+	// Per-frame counters (reset each frame, not static)
+	uint32_t frameBgPixels = 0;
+	uint32_t frameHdMatch = 0;
+	uint32_t frameHdMiss = 0;
+	uint32_t framePalMismatch = 0;
+
 	// For each pixel in the original SNES frame (always 256x239 for HD info)
 	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
 		for(uint32_t x = overscan.Left; x < baseWidth - overscan.Right; x++) {
@@ -107,27 +160,70 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPpuTileInfo* tileInfo = nullptr;
 
 		if(pixelInfo.BgTileCount > 0) {
+				frameBgPixels++;
 				hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
 				if(hdTile) {
 					tileInfo = &pixelInfo.BgTiles[0];
-				} else {
-					// DIAGNOSTIC: Log first 30 unique hash misses to identify VRAM content mismatch
-					static int diagMissCount = 0;
-					static std::unordered_set<uint64_t> diagLoggedHashes;
-					if(diagMissCount < 30) {
+					frameHdMatch++;
+
+					// DIAGNOSTIC: Log first 5 unique MATCHES to confirm tiles are working
+					if(diagMatchCount < 5) {
 						auto& key = pixelInfo.BgTiles[0].Key;
 						if(key.ContentHash != 0 && diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
-							diagLoggedHashes.insert(key.ContentHash);
+							// Don't add to diagLoggedHashes — keep match logging separate from miss logging
 							char buf[256];
 							snprintf(buf, sizeof(buf),
-								"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d",
+								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d",
 								(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex);
 							MessageManager::Log(buf);
-							diagMissCount++;
+							diagMatchCount++;
 						}
 					}
-				}
-			}
+				} else {
+					frameHdMiss++;
+
+					auto& key = pixelInfo.BgTiles[0].Key;
+					if(key.ContentHash != 0) {
+						// DIAGNOSTIC: Check if ContentHash exists with a DIFFERENT palette
+						// This detects the suspected palette mismatch bug
+						bool foundWithOtherPal = false;
+						for(int tryPal = 0; tryPal < 8; tryPal++) {
+							if(tryPal == key.PaletteIndex) continue;
+							SnesHdTileKey tryKey;
+							tryKey.ContentHash = key.ContentHash;
+							tryKey.PaletteIndex = (uint8_t)tryPal;
+							tryKey.LayerIndex = key.LayerIndex;
+							auto it = _hdData->TileByKey.find(tryKey);
+							if(it != _hdData->TileByKey.end()) {
+								foundWithOtherPal = true;
+								framePalMismatch++;
+								if(diagPalMismatchCount < 20) {
+									char buf[256];
+									snprintf(buf, sizeof(buf),
+										"[SNES HD diag] PAL MISMATCH hash=%016llX runtime_pal=%d pack_pal=%d layer=%d",
+										(unsigned long long)key.ContentHash, key.PaletteIndex, tryPal, key.LayerIndex);
+									MessageManager::Log(buf);
+									diagPalMismatchCount++;
+								}
+								break;
+							}
+						}
+
+						// DIAGNOSTIC: Log unique misses (not palette mismatch) — increased limit to 60
+						if(!foundWithOtherPal && diagMissCount < 60) {
+							if(diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
+								diagLoggedHashes.insert(key.ContentHash);
+								char buf[256];
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d",
+									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex);
+								MessageManager::Log(buf);
+								diagMissCount++;
+							}
+						}
+					} // end if(key.ContentHash != 0)
+				} // end else (no hdTile match)
+			} // end if(pixelInfo.BgTileCount > 0)
 
 			uint32_t outX = (x - overscan.Left) * hdScale;
 			uint32_t outY = (y - overscan.Top) * hdScale;
@@ -187,6 +283,20 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					}
 				}
 			}
-		}
+		} // end for(x)
+	} // end for(y)
+
+	// DIAGNOSTIC: Log per-frame summary for first 10 frames that have BG tile lookups
+	if(frameBgPixels > 0 && diagFrameCount < 10) {
+		char buf[512];
+		snprintf(buf, sizeof(buf),
+			"[SNES HD diag] FRAME %d [%s]: bgPixels=%u match=%u miss=%u palMismatch=%u (TileByKey=%zu, sig=%016llX)",
+			diagFrameCount,
+			isLevel2 ? "LEVEL2" : "other",
+			frameBgPixels, frameHdMatch, frameHdMiss, framePalMismatch,
+			_hdData->TileByKey.size(),
+			(unsigned long long)vramSig);
+		MessageManager::Log(buf);
+		diagFrameCount++;
 	}
 }
