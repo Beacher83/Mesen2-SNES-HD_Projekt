@@ -352,38 +352,51 @@ public:
 
 	// Look up an HD tile replacement.
 	// Content hash mode: direct lookup — the key's ContentHash uniquely identifies tile content.
+	//   Stage 1: exact match (hash + palette + layer)
+	//   Stage 2: palette fallback — same hash + layer, try all 8 palettes (M5.5f)
+	//            HD PNG tiles have correct colors baked in; the SNES palette index
+	//            in the key only matters if different palette selections produce
+	//            visually distinct tiles from the same VRAM data. For most exported
+	//            packs the palette was captured at export time and may differ from
+	//            runtime (e.g. viewer exports pal=0, runtime uses pal=2).
 	//   With fingerprints: only returns tiles from the active gfxset (prevents false positives).
 	//   Without fingerprints: returns any matching tile (original behavior).
 	// Legacy mode: when vram is provided, selects among multiple candidates by checksum.
 	SnesHdPackTileInfo* GetMatchingTile(const SnesHdTileKey& key, const uint16_t* vram = nullptr)
 	{
-		auto it = TileByKey.find(key);
-		if(it == TileByKey.end()) return nullptr;
-
-		if(UseContentHash) {
-			for(SnesHdPackTileInfo* tile : it->second) {
-				if(tile->IsFullyTransparent) continue;
-
-				// DISABLED (Phase 1 fix): Fingerprint-based gfxset scoping does not work
-				// for DKC2. VBlank DMA overwrites VRAM regions 0x2000-0x21FF and
-				// 0x6000-0x61FF every frame with shared tiles, so fingerprint reference
-				// hashes (computed from pre-DMA VRAM) never match live VRAM → ActiveGfxset
-				// is always -1 → ALL gfxset-scoped tiles get blocked.
-				// Content-hash keys already provide correct tile identity (like NES CHR-RAM
-				// mode). Cross-context issues (worldmap) are cosmetic and should be solved
-				// via a condition system in a future milestone, not via fingerprints.
-				//
-				// if(HasFingerprints() && tile->GfxsetIndex != 0xFF) {
-				// 	if(ActiveGfxset < 0 || tile->GfxsetIndex != (uint8_t)ActiveGfxset) {
-				// 		continue;
-				// 	}
-				// }
-				return tile;
+		if(UseContentHash && key.ContentHash != 0) {
+			// Stage 1: Exact match (hash + palette + layer)
+			auto it = TileByKey.find(key);
+			if(it != TileByKey.end()) {
+				for(SnesHdPackTileInfo* tile : it->second) {
+					if(tile->IsFullyTransparent) continue;
+					return tile;
+				}
 			}
+
+			// Stage 2: Palette fallback — same hash + layer, any palette
+			for(uint8_t tryPal = 0; tryPal < 8; tryPal++) {
+				if(tryPal == key.PaletteIndex) continue;
+				SnesHdTileKey palKey;
+				palKey.ContentHash = key.ContentHash;
+				palKey.PaletteIndex = tryPal;
+				palKey.LayerIndex = key.LayerIndex;
+				auto it2 = TileByKey.find(palKey);
+				if(it2 != TileByKey.end()) {
+					for(SnesHdPackTileInfo* tile : it2->second) {
+						if(tile->IsFullyTransparent) continue;
+						return tile;
+					}
+				}
+			}
+
 			return nullptr;
 		}
 
-		// Legacy VramAddress mode: use checksum disambiguation
+		// Legacy VramAddress mode: exact match with optional checksum
+		auto it = TileByKey.find(key);
+		if(it == TileByKey.end()) return nullptr;
+
 		for(SnesHdPackTileInfo* tile : it->second) {
 			if(tile->IsFullyTransparent) continue;
 			if(!tile->HasChecksum || vram == nullptr) return tile;

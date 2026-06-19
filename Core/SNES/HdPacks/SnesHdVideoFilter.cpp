@@ -11,7 +11,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.5e"
+#define SNES_HD_BUILD_VERSION "M5.5f"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -156,6 +156,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagPalMismatchCount = 0;
 	static int diagLayerMismatchCount = 0;
 	static int diagMatchCount = 0;
+	static int diagPalFallbackCount = 0;
 	static int diagDetailCount = 0;
 	static std::unordered_set<uint64_t> diagLoggedHashes;
 
@@ -182,6 +183,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagPalMismatchCount = 0;
 		diagLayerMismatchCount = 0;
 		diagMatchCount = 0;
+		diagPalFallbackCount = 0;
 		diagDetailCount = 0;
 		diagLoggedHashes.clear();
 	}
@@ -197,6 +199,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameBg1MissPixels = 0;       // BG1 miss pixel count
 	uint32_t frameBg1NotInPack = 0;        // BG1 unique hashes not in pack at all
 	uint32_t frameFallback = 0;
+	uint32_t framePalFallbackMatch = 0;    // Matches via palette fallback (Stage 2)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
 	uint32_t frameLayerBits[4] = {};       // Per-layer pixel counts (bit N set in mask)
@@ -223,6 +226,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPackTileInfo* hdTile = nullptr;
 			SnesHdPpuTileInfo* tileInfo = nullptr;
 			bool usedFallbackLayer = false;
+			int fallbackStopLayer = -1;  // Which layer stopped the fallback loop (for miss diagnostics)
 
 			// Only attempt HD BG tile replacement when:
 			// 1) At least one BG layer has a non-transparent tile at this pixel
@@ -270,6 +274,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							if(hdTile) {
 								tileInfo = &pixelInfo.BgTiles[i];
 								usedFallbackLayer = true;
+							} else {
+								fallbackStopLayer = i;  // Track for miss diagnostics
 							}
 							// Stop here: this layer has data. Either we found
 							// an HD tile and will use it, or we didn't and the
@@ -287,16 +293,36 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						frameFallback++;
 					}
 
-					// DIAGNOSTIC: Log first 5 unique MATCHES
-					if(diagMatchCount < 5) {
+					// Detect palette fallback: GetMatchingTile Stage 2 returned
+					// a tile whose pack palette differs from runtime palette
+					bool palFallback = (hdTile->Key.PaletteIndex != tileInfo->Key.PaletteIndex);
+					if(palFallback) {
+						framePalFallbackMatch++;
+					}
+
+					// DIAGNOSTIC: Log first 5 unique MATCHES + first 10 palette fallbacks
+					if(diagMatchCount < 5 || (palFallback && diagPalFallbackCount < 10)) {
 						auto& key = tileInfo->Key;
 						if(key.ContentHash != 0 && diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
-							char buf[256];
-							snprintf(buf, sizeof(buf),
-								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s",
-								(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
-								usedFallbackLayer ? " (FALLBACK)" : "");
-							DiagLog(buf);
+							diagLoggedHashes.insert(key.ContentHash);
+							char buf[320];
+							if(palFallback) {
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] PAL_FALLBACK_MATCH hash=%016llX runtime_pal=%d "
+									"pack_pal=%d layer=%d vram=0x%04X%s",
+									(unsigned long long)key.ContentHash, key.PaletteIndex,
+									hdTile->Key.PaletteIndex, key.LayerIndex,
+									tileInfo->VramWordAddr,
+									usedFallbackLayer ? " (FALLBACK_LAYER)" : "");
+								DiagLog(buf);
+								diagPalFallbackCount++;
+							} else {
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s",
+									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
+									usedFallbackLayer ? " (FALLBACK)" : "");
+								DiagLog(buf);
+							}
 							diagMatchCount++;
 						}
 					}
@@ -304,14 +330,31 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					frameHdMiss++;
 
 					// DIAGNOSTIC: Enhanced miss analysis with layer-mismatch and VRAM address
-					// Determine which layer's tile info to analyze
+					//
+					// KEY FIX (M5.5f): When the fallback loop stopped at a layer
+					// (has data but no HD tile), analyze THAT layer's tile info.
+					// Previously we always analyzed the winner layer, which meant
+					// BG3 fog (winner) was checked instead of BG1 (fallback stop).
+					// This made BG1miss always 0 and hid palette mismatches.
+					//
+					// Priority: fallbackStopLayer > winner > first layer with data
 					SnesHdPpuTileInfo* missLayerInfo = nullptr;
-					if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+					const char* missSource = "unknown";
+
+					if(fallbackStopLayer >= 0 && fallbackStopLayer < 4) {
+						// Fallback loop stopped at this layer — it's the actual
+						// failing lookup we care about (e.g. BG1 under BG3 fog)
+						missLayerInfo = &pixelInfo.BgTiles[fallbackStopLayer];
+						missSource = "fallback";
+					} else if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+						// No fallback layers had data — only the winner missed
 						missLayerInfo = &pixelInfo.BgTiles[winLayer];
+						missSource = "winner";
 					} else {
 						for(int mi = 0; mi < 4; mi++) {
 							if(pixelInfo.BgLayerMask & (1 << mi)) {
 								missLayerInfo = &pixelInfo.BgTiles[mi];
+								missSource = "first";
 								break;
 							}
 						}
@@ -387,11 +430,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									char buf[512];
 									snprintf(buf, sizeof(buf),
 										"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d vram=0x%04X%s "
-										"mask=0x%02X win=%d",
+										"mask=0x%02X win=%d src=%s",
 										(unsigned long long)key.ContentHash, key.PaletteIndex,
 										key.LayerIndex, missLayerInfo->VramWordAddr,
 										inDmaRange ? " [DMA_RANGE]" : "",
-										pixelInfo.BgLayerMask, pixelInfo.BgWinnerLayer);
+										pixelInfo.BgLayerMask, pixelInfo.BgWinnerLayer,
+										missSource);
 									DiagLog(buf);
 									diagMissCount++;
 
@@ -487,12 +531,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u) miss=%u palMis=%u layerMis=%u notInPack=%u"
+			": total=%u bg=%u match=%u (fb=%u palFB=%u) miss=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount,
 			isLevel2 ? "LEVEL2" : "other",
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameHdMiss,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, framePalFallbackMatch,
+			frameHdMiss,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
