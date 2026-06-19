@@ -1088,7 +1088,10 @@ void SnesPpu::RenderTilemap()
 			// not just the compositing winner. Each layer writes to BgTiles[layerIndex].
 			// The HD video filter tries the winner first; if no HD tile exists for
 			// the winner, it falls back to other layers (e.g. BG1 under BG3 fog).
-			if(drawMain && hdValid && x < SnesHdScreenInfo::ScreenWidth) {
+			// Must check drawSub too: DKC2 Level 2 puts BG1 on sub-screen only
+			// (BG3 fog on main, color math blends sub into main). Without drawSub,
+			// BG1 tiles are never stored and HD fallback can't find them.
+			if((drawMain || drawSub) && hdValid && x < SnesHdScreenInfo::ScreenWidth) {
 				SnesHdPpuPixelInfo& pixelInfo = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
 				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[layerIndex];
 				uint16_t tileIndex = tilemapData & 0x3FF;
