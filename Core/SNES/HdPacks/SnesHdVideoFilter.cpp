@@ -11,7 +11,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.5d"
+#define SNES_HD_BUILD_VERSION "M5.5e"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -154,6 +154,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagFrameCount = 0;
 	static int diagMissCount = 0;
 	static int diagPalMismatchCount = 0;
+	static int diagLayerMismatchCount = 0;
 	static int diagMatchCount = 0;
 	static int diagDetailCount = 0;
 	static std::unordered_set<uint64_t> diagLoggedHashes;
@@ -179,6 +180,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagFrameCount = 0;
 		diagMissCount = 0;
 		diagPalMismatchCount = 0;
+		diagLayerMismatchCount = 0;
 		diagMatchCount = 0;
 		diagDetailCount = 0;
 		diagLoggedHashes.clear();
@@ -190,6 +192,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameHdMatch = 0;
 	uint32_t frameHdMiss = 0;
 	uint32_t framePalMismatch = 0;
+	uint32_t frameLayerMismatch = 0;
+	uint32_t frameNotInPack = 0;           // Hashes not found with ANY pal×layer combo
+	uint32_t frameBg1MissPixels = 0;       // BG1 miss pixel count
+	uint32_t frameBg1NotInPack = 0;        // BG1 unique hashes not in pack at all
 	uint32_t frameFallback = 0;
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
@@ -297,57 +303,116 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				} else {
 					frameHdMiss++;
 
-					// DIAGNOSTIC: Log misses for the winner layer
-					auto& key = (winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer)))
-						? pixelInfo.BgTiles[winLayer].Key
-						: pixelInfo.BgTiles[0].Key;
-					if(key.ContentHash != 0) {
-						bool foundWithOtherPal = false;
-						for(int tryPal = 0; tryPal < 8; tryPal++) {
-							if(tryPal == key.PaletteIndex) continue;
-							SnesHdTileKey tryKey;
-							tryKey.ContentHash = key.ContentHash;
-							tryKey.PaletteIndex = (uint8_t)tryPal;
-							tryKey.LayerIndex = key.LayerIndex;
-							auto it = _hdData->TileByKey.find(tryKey);
-							if(it != _hdData->TileByKey.end()) {
-								foundWithOtherPal = true;
-								framePalMismatch++;
-								if(diagPalMismatchCount < 20) {
-									char buf[256];
-									snprintf(buf, sizeof(buf),
-										"[SNES HD diag] PAL MISMATCH hash=%016llX runtime_pal=%d pack_pal=%d layer=%d",
-										(unsigned long long)key.ContentHash, key.PaletteIndex, tryPal, key.LayerIndex);
-									DiagLog(buf);
-									diagPalMismatchCount++;
-								}
+					// DIAGNOSTIC: Enhanced miss analysis with layer-mismatch and VRAM address
+					// Determine which layer's tile info to analyze
+					SnesHdPpuTileInfo* missLayerInfo = nullptr;
+					if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+						missLayerInfo = &pixelInfo.BgTiles[winLayer];
+					} else {
+						for(int mi = 0; mi < 4; mi++) {
+							if(pixelInfo.BgLayerMask & (1 << mi)) {
+								missLayerInfo = &pixelInfo.BgTiles[mi];
 								break;
 							}
 						}
+					}
 
-						if(!foundWithOtherPal && diagMissCount < 60) {
-							if(diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
-								diagLoggedHashes.insert(key.ContentHash);
-								char buf[512];
-								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d mask=0x%02X win=%d",
-									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
-									pixelInfo.BgLayerMask, pixelInfo.BgWinnerLayer);
-								DiagLog(buf);
-								diagMissCount++;
+					if(missLayerInfo && missLayerInfo->Key.ContentHash != 0) {
+						auto& key = missLayerInfo->Key;
+						bool isBg1Miss = (key.LayerIndex == 0);
+						if(isBg1Miss) frameBg1MissPixels++;
 
-								// For first 5 misses, also dump all layer hashes for this pixel
-								if(diagDetailCount < 5) {
-									for(int dli = 0; dli < 4; dli++) {
-										if(pixelInfo.BgLayerMask & (1 << dli)) {
-											auto& dk = pixelInfo.BgTiles[dli].Key;
-											snprintf(buf, sizeof(buf),
-												"[SNES HD diag]   -> BgTiles[%d]: hash=%016llX pal=%d layer=%d",
-												dli, (unsigned long long)dk.ContentHash, dk.PaletteIndex, dk.LayerIndex);
-											DiagLog(buf);
-										}
+						// Exhaustive search: check all palette × layer combinations
+						bool foundWithOtherPal = false;
+						bool foundWithOtherLayer = false;
+						uint8_t foundPal = 0;
+						uint8_t foundLayer = 0;
+
+						for(int tryLayer = 0; tryLayer < 4; tryLayer++) {
+							for(int tryPal = 0; tryPal < 8; tryPal++) {
+								if(tryPal == key.PaletteIndex && tryLayer == key.LayerIndex) continue;
+								SnesHdTileKey tryKey;
+								tryKey.ContentHash = key.ContentHash;
+								tryKey.PaletteIndex = (uint8_t)tryPal;
+								tryKey.LayerIndex = (uint8_t)tryLayer;
+								auto it = _hdData->TileByKey.find(tryKey);
+								if(it != _hdData->TileByKey.end()) {
+									foundPal = (uint8_t)tryPal;
+									foundLayer = (uint8_t)tryLayer;
+									if(tryPal != key.PaletteIndex) {
+										foundWithOtherPal = true;
+									} else {
+										foundWithOtherLayer = true;
 									}
-									diagDetailCount++;
+									goto foundMatch;
+								}
+							}
+						}
+						foundMatch:
+
+						if(foundWithOtherPal) {
+							framePalMismatch++;
+							if(diagPalMismatchCount < 20) {
+								char buf[320];
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] PAL MISMATCH hash=%016llX runtime_pal=%d pack_pal=%d "
+									"runtime_layer=%d pack_layer=%d vram=0x%04X",
+									(unsigned long long)key.ContentHash, key.PaletteIndex, foundPal,
+									key.LayerIndex, foundLayer, missLayerInfo->VramWordAddr);
+								DiagLog(buf);
+								diagPalMismatchCount++;
+							}
+						} else if(foundWithOtherLayer) {
+							frameLayerMismatch++;
+							if(diagLayerMismatchCount < 20) {
+								char buf[320];
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] LAYER MISMATCH hash=%016llX pal=%d runtime_layer=%d "
+									"pack_layer=%d vram=0x%04X",
+									(unsigned long long)key.ContentHash, key.PaletteIndex,
+									key.LayerIndex, foundLayer, missLayerInfo->VramWordAddr);
+								DiagLog(buf);
+								diagLayerMismatchCount++;
+							}
+						} else {
+							// Hash not found in pack with ANY key combination
+							frameNotInPack++;
+							if(isBg1Miss) frameBg1NotInPack++;
+
+							if(diagMissCount < 60) {
+								if(diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
+									diagLoggedHashes.insert(key.ContentHash);
+									bool inDmaRange = (missLayerInfo->VramWordAddr >= 0x2000
+										&& missLayerInfo->VramWordAddr <= 0x21D0);
+									char buf[512];
+									snprintf(buf, sizeof(buf),
+										"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d vram=0x%04X%s "
+										"mask=0x%02X win=%d",
+										(unsigned long long)key.ContentHash, key.PaletteIndex,
+										key.LayerIndex, missLayerInfo->VramWordAddr,
+										inDmaRange ? " [DMA_RANGE]" : "",
+										pixelInfo.BgLayerMask, pixelInfo.BgWinnerLayer);
+									DiagLog(buf);
+									diagMissCount++;
+
+									// For first 5 misses, dump all layer hashes with VRAM addr
+									if(diagDetailCount < 5) {
+										for(int dli = 0; dli < 4; dli++) {
+											if(pixelInfo.BgLayerMask & (1 << dli)) {
+												auto& dk = pixelInfo.BgTiles[dli].Key;
+												bool dInDma = (pixelInfo.BgTiles[dli].VramWordAddr >= 0x2000
+													&& pixelInfo.BgTiles[dli].VramWordAddr <= 0x21D0);
+												snprintf(buf, sizeof(buf),
+													"[SNES HD diag]   -> BgTiles[%d]: hash=%016llX pal=%d "
+													"layer=%d vram=0x%04X%s",
+													dli, (unsigned long long)dk.ContentHash, dk.PaletteIndex,
+													dk.LayerIndex, pixelInfo.BgTiles[dli].VramWordAddr,
+													dInDma ? " [DMA_RANGE]" : "");
+												DiagLog(buf);
+											}
+										}
+										diagDetailCount++;
+									}
 								}
 							}
 						}
@@ -419,16 +484,19 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// DIAGNOSTIC: Log per-frame summary for first 10 frames
 	// Also log if frameBgPixels==0 (catches stale build where BgLayerMask is never set)
 	if(frameTotalPixels > 0 && diagFrameCount < 10) {
-		char buf[768];
+		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u) miss=%u palMis=%u sprWon=%u mask0=%u"
-			" BG1=%u BG2=%u BG3=%u BG4=%u (TileByKey=%zu, sig=%016llX)",
+			": total=%u bg=%u match=%u (fb=%u) miss=%u palMis=%u layerMis=%u notInPack=%u"
+			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
+			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount,
 			isLevel2 ? "LEVEL2" : "other",
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameHdMiss, framePalMismatch,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameHdMiss,
+			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
+			frameBg1MissPixels, frameBg1NotInPack,
 			_hdData->TileByKey.size(),
 			(unsigned long long)vramSig);
 		DiagLog(buf);

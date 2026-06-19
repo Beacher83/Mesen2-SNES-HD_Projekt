@@ -120,6 +120,7 @@ struct SnesHdPpuTileInfo
 	uint8_t Priority = 0;       // SNES tile priority (from tilemap bit 13)
 
 	uint16_t TilemapData = 0;   // Raw 16-bit tilemap word (for conditions/debugging)
+	uint16_t VramWordAddr = 0;  // VRAM word address used for content hash (diagnostic: detect DMA range)
 };
 
 // ---------------------------------------------------------------------------

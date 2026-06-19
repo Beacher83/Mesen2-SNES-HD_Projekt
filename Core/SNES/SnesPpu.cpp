@@ -1103,6 +1103,7 @@ void SnesPpu::RenderTilemap()
 				}
 				tileInfo.Key.PaletteIndex = paletteIndex;
 				tileInfo.Key.LayerIndex = layerIndex;
+				tileInfo.VramWordAddr = vramWordAddr;
 				bool hMirrorHd = (tilemapData & 0x4000) != 0;
 				bool vMirrorHd = (tilemapData & 0x8000) != 0;
 				tileInfo.HorizontalMirror = hMirrorHd;
