@@ -190,3 +190,6 @@ packages/*
 
 TestHelper/*
 UI/Dependencies.zip
+
+# HD tile test assets (large ZIPs from GitHub releases)
+DKC2-HD-Tools/test-assets/

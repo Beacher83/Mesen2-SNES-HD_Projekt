@@ -7,6 +7,50 @@
 #include "Shared/ColorUtilities.h"
 #include "Shared/MessageManager.h"
 #include <unordered_set>
+#include <cstdlib>    // getenv (for DiagLog file path)
+
+// Build version — logged in diagnostics so test PC can verify correct code is running.
+// Increment this on every push to catch stale-build issues.
+#define SNES_HD_BUILD_VERSION "M5.5b"
+
+// ---------------------------------------------------------------------------
+// DiagLog — writes to both Mesen's log window AND a persistent text file.
+// File is created once per session at %USERPROFILE%\Downloads\snes_hd_diag.txt
+// (or $HOME/Downloads/ on non-Windows). Flushed after every write so crash
+// won't lose data. The user can open the file after the session.
+// ---------------------------------------------------------------------------
+static void DiagLog(const char* msg)
+{
+	MessageManager::Log(msg);
+
+	static FILE* diagFile = nullptr;
+	static bool diagFileAttempted = false;
+
+	if(!diagFileAttempted) {
+		diagFileAttempted = true;
+		const char* home = getenv("USERPROFILE");
+		if(!home) home = getenv("HOME");
+		if(home) {
+			char path[512];
+#ifdef _WIN32
+			snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_diag.txt", home);
+#else
+			snprintf(path, sizeof(path), "%s/Downloads/snes_hd_diag.txt", home);
+#endif
+			diagFile = fopen(path, "w");
+			if(diagFile) {
+				fprintf(diagFile, "=== SNES HD Pack Diagnostics (build " SNES_HD_BUILD_VERSION ") ===\n");
+				fprintf(diagFile, "Log file: %s\n\n", path);
+				fflush(diagFile);
+			}
+		}
+	}
+
+	if(diagFile) {
+		fprintf(diagFile, "%s\n", msg);
+		fflush(diagFile);
+	}
+}
 
 SnesHdVideoFilter::SnesHdVideoFilter(Emulator* emu, SnesConsole* console, SnesHdPackData* hdData) : BaseVideoFilter(emu)
 {
@@ -111,6 +155,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagMissCount = 0;
 	static int diagPalMismatchCount = 0;
 	static int diagMatchCount = 0;
+	static int diagDetailCount = 0;
 	static std::unordered_set<uint64_t> diagLoggedHashes;
 
 	// Compute VRAM context signature from two stable reference tiles
@@ -127,14 +172,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	if(vramSig != diagPrevVramSig && diagPrevVramSig != 0) {
 		char buf[256];
 		snprintf(buf, sizeof(buf),
-			"[SNES HD diag] CONTEXT CHANGE: sig %016llX -> %016llX (isLevel2=%s)",
+			"[SNES HD diag] CONTEXT CHANGE (build=" SNES_HD_BUILD_VERSION "): sig %016llX -> %016llX (isLevel2=%s)",
 			(unsigned long long)diagPrevVramSig, (unsigned long long)vramSig,
 			isLevel2 ? "YES" : "no");
-		MessageManager::Log(buf);
+		DiagLog(buf);
 		diagFrameCount = 0;
 		diagMissCount = 0;
 		diagPalMismatchCount = 0;
 		diagMatchCount = 0;
+		diagDetailCount = 0;
 		diagLoggedHashes.clear();
 	}
 	diagPrevVramSig = vramSig;
@@ -145,6 +191,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameHdMiss = 0;
 	uint32_t framePalMismatch = 0;
 	uint32_t frameFallback = 0;
+	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
+	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
+	uint32_t frameLayerBits[4] = {};       // Per-layer pixel counts (bit N set in mask)
+	uint32_t frameTotalPixels = 0;         // Total pixels iterated
 
 	// For each pixel in the original SNES frame (always 256x239 for HD info)
 	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
@@ -154,6 +204,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 			// Index into ppuOutputBuffer (accounts for hi-res doubling)
 			uint32_t ppuIndex = isHiRes ? (y * 2 * ppuWidth + x * 2) : (y * ppuWidth + x);
+
+			frameTotalPixels++;
 
 			// -----------------------------------------------------------------
 			// Multi-layer HD tile lookup with fallback
@@ -173,8 +225,20 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			// would incorrectly replace sprite pixels with BG HD tiles.
 			bool spriteWon = (pixelInfo.MainScreenFlags & 0x40) != 0;
 
-		if(pixelInfo.BgLayerMask != 0 && !spriteWon) {
+			// Track pixel classification for diagnostics
+			if(spriteWon) {
+				frameSpriteWon++;
+			} else if(pixelInfo.BgLayerMask == 0) {
+				frameMaskZero++;
+			}
+
+			if(pixelInfo.BgLayerMask != 0 && !spriteWon) {
 				frameBgPixels++;
+
+				// Count which layers are present at BG pixels
+				for(int li = 0; li < 4; li++) {
+					if(pixelInfo.BgLayerMask & (1 << li)) frameLayerBits[li]++;
+				}
 
 				// 1) Try the compositing winner first
 				uint8_t winLayer = pixelInfo.BgWinnerLayer;
@@ -215,7 +279,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s",
 								(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
 								usedFallbackLayer ? " (FALLBACK)" : "");
-							MessageManager::Log(buf);
+							DiagLog(buf);
 							diagMatchCount++;
 						}
 					}
@@ -243,7 +307,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									snprintf(buf, sizeof(buf),
 										"[SNES HD diag] PAL MISMATCH hash=%016llX runtime_pal=%d pack_pal=%d layer=%d",
 										(unsigned long long)key.ContentHash, key.PaletteIndex, tryPal, key.LayerIndex);
-									MessageManager::Log(buf);
+									DiagLog(buf);
 									diagPalMismatchCount++;
 								}
 								break;
@@ -253,13 +317,27 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						if(!foundWithOtherPal && diagMissCount < 60) {
 							if(diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
 								diagLoggedHashes.insert(key.ContentHash);
-								char buf[256];
+								char buf[512];
 								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d layers=0x%02X win=%d",
+									"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d mask=0x%02X win=%d",
 									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
 									pixelInfo.BgLayerMask, pixelInfo.BgWinnerLayer);
-								MessageManager::Log(buf);
+								DiagLog(buf);
 								diagMissCount++;
+
+								// For first 5 misses, also dump all layer hashes for this pixel
+								if(diagDetailCount < 5) {
+									for(int dli = 0; dli < 4; dli++) {
+										if(pixelInfo.BgLayerMask & (1 << dli)) {
+											auto& dk = pixelInfo.BgTiles[dli].Key;
+											snprintf(buf, sizeof(buf),
+												"[SNES HD diag]   -> BgTiles[%d]: hash=%016llX pal=%d layer=%d",
+												dli, (unsigned long long)dk.ContentHash, dk.PaletteIndex, dk.LayerIndex);
+											DiagLog(buf);
+										}
+									}
+									diagDetailCount++;
+								}
 							}
 						}
 					}
@@ -327,17 +405,31 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		} // end for(x)
 	} // end for(y)
 
-	// DIAGNOSTIC: Log per-frame summary for first 10 frames that have BG tile lookups
-	if(frameBgPixels > 0 && diagFrameCount < 10) {
-		char buf[512];
+	// DIAGNOSTIC: Log per-frame summary for first 10 frames
+	// Also log if frameBgPixels==0 (catches stale build where BgLayerMask is never set)
+	if(frameTotalPixels > 0 && diagFrameCount < 10) {
+		char buf[768];
 		snprintf(buf, sizeof(buf),
-			"[SNES HD diag] FRAME %d [%s]: bgPixels=%u match=%u (fallback=%u) miss=%u palMismatch=%u (TileByKey=%zu, sig=%016llX)",
+			"[SNES HD diag] FRAME %d [%s] build=" SNES_HD_BUILD_VERSION
+			": total=%u bg=%u match=%u (fb=%u) miss=%u palMis=%u sprWon=%u mask0=%u"
+			" BG1=%u BG2=%u BG3=%u BG4=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount,
 			isLevel2 ? "LEVEL2" : "other",
-			frameBgPixels, frameHdMatch, frameFallback, frameHdMiss, framePalMismatch,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameHdMiss, framePalMismatch,
+			frameSpriteWon, frameMaskZero,
+			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			_hdData->TileByKey.size(),
 			(unsigned long long)vramSig);
-		MessageManager::Log(buf);
+		DiagLog(buf);
 		diagFrameCount++;
+	}
+
+	// Log build version once at startup
+	static bool buildVersionLogged = false;
+	if(!buildVersionLogged) {
+		char buf[128];
+		snprintf(buf, sizeof(buf), "[SNES HD diag] Build version: " SNES_HD_BUILD_VERSION);
+		DiagLog(buf);
+		buildVersionLogged = true;
 	}
 }
