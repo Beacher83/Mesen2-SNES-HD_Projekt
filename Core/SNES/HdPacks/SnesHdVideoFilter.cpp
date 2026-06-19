@@ -11,7 +11,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.5c"
+#define SNES_HD_BUILD_VERSION "M5.5d"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -250,6 +250,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 
 				// 2) Fallback: try other layers if winner has no HD tile
+				//    IMPORTANT: stop at the FIRST layer that has tile data
+				//    (BgLayerMask bit set), regardless of whether an HD tile
+				//    exists.  This prevents lower-priority layers (e.g. BG2
+				//    far-background) from replacing native composited pixels
+				//    that contain higher-priority content (BG1 level graphics
+				//    + BG3 fog blend + sprites).
 				if(!hdTile) {
 					for(int i = 0; i < 4; i++) {
 						if(i == (int)winLayer) continue;
@@ -258,8 +264,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							if(hdTile) {
 								tileInfo = &pixelInfo.BgTiles[i];
 								usedFallbackLayer = true;
-								break;
 							}
+							// Stop here: this layer has data. Either we found
+							// an HD tile and will use it, or we didn't and the
+							// pixel should fall through to native rendering.
+							// Continuing would let a lower-priority layer's HD
+							// tile incorrectly cover this pixel.
+							break;
 						}
 					}
 				}
