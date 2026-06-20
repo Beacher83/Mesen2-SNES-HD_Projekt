@@ -989,6 +989,15 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 				uint16_t paletteRamOffset = 128 + (_spritePalette[x] << 4) + _spriteColors[x];
 				_subScreenBuffer[x] = _cgram[paletteRamOffset];
 				_subScreenPriority[x] = spritePrio;
+
+				// HD: sub-screen sprite guard — in DKC2 Level 2, sprites appear through
+				// BG3 fog via color math (sub-screen only). IsSpritePixel is never set
+				// because BG3 wins the main screen. Without this flag the filter would
+				// apply a fallback BG tile and cover the sprite.
+				uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
+				if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight && x < SnesHdScreenInfo::ScreenWidth) {
+					_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].SubScreenHasSprite = true;
+				}
 			}
 		}
 	}
@@ -1096,10 +1105,9 @@ void SnesPpu::RenderTilemap()
 				SnesHdPpuTileInfo& tileInfo = pixelInfo.BgTiles[layerIndex];
 				uint16_t tileIndex = tilemapData & 0x3FF;
 				uint16_t vramWordAddr = (_state.Layers[layerIndex].ChrAddress + tileIndex * 4 * bpp) & 0x7FFF;
+				tileInfo.Key.VramAddress = vramWordAddr;
 				if(_hdData->UseContentHash) {
 					tileInfo.Key.ContentHash = ComputeTileContentHash(_vram, vramWordAddr, 4 * bpp);
-				} else {
-					tileInfo.Key.VramAddress = vramWordAddr;
 				}
 				tileInfo.Key.PaletteIndex = paletteIndex;
 				tileInfo.Key.LayerIndex = layerIndex;

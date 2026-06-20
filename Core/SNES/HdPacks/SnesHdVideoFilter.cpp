@@ -11,7 +11,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.5f"
+#define SNES_HD_BUILD_VERSION "M5.6"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -156,7 +156,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagPalMismatchCount = 0;
 	static int diagLayerMismatchCount = 0;
 	static int diagMatchCount = 0;
-	static int diagPalFallbackCount = 0;
+	static int diagPalFallbackCount = 0;  // kept for potential future use
 	static int diagDetailCount = 0;
 	static std::unordered_set<uint64_t> diagLoggedHashes;
 
@@ -199,7 +199,6 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameBg1MissPixels = 0;       // BG1 miss pixel count
 	uint32_t frameBg1NotInPack = 0;        // BG1 unique hashes not in pack at all
 	uint32_t frameFallback = 0;
-	uint32_t framePalFallbackMatch = 0;    // Matches via palette fallback (Stage 2)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
 	uint32_t frameLayerBits[4] = {};       // Per-layer pixel counts (bit N set in mask)
@@ -230,10 +229,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 			// Only attempt HD BG tile replacement when:
 			// 1) At least one BG layer has a non-transparent tile at this pixel
-			// 2) A sprite did NOT win compositing (IsSpritePixel flag in MainScreenFlags)
-			// Without the sprite guard, BG tile info stored by the PPU (for fallback)
-			// would incorrectly replace sprite pixels with BG HD tiles.
-			bool spriteWon = (pixelInfo.MainScreenFlags & 0x40) != 0;
+			// 2) A sprite did NOT win compositing
+			// Two cases: sprite wins main screen (IsSpritePixel in MainScreenFlags),
+			// or sprite wins sub-screen only (SubScreenHasSprite). In DKC2 Level 2,
+			// BG3 fog wins main screen while sprites contribute via color math from
+			// sub-screen — IsSpritePixel is never set there, but SubScreenHasSprite is.
+			bool spriteWon = (pixelInfo.MainScreenFlags & 0x40) != 0 || pixelInfo.SubScreenHasSprite;
 
 			// Track pixel classification for diagnostics
 			if(spriteWon) {
@@ -293,30 +294,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						frameFallback++;
 					}
 
-					// Detect palette fallback: GetMatchingTile Stage 2 returned
-					// a tile whose pack palette differs from runtime palette
-					bool palFallback = (hdTile->Key.PaletteIndex != tileInfo->Key.PaletteIndex);
-					if(palFallback) {
-						framePalFallbackMatch++;
-					}
-
-					// DIAGNOSTIC: Log first 5 unique MATCHES + first 10 palette fallbacks
-					if(diagMatchCount < 5 || (palFallback && diagPalFallbackCount < 10)) {
+					// DIAGNOSTIC: Log first 5 unique MATCHES
+					if(diagMatchCount < 5) {
 						auto& key = tileInfo->Key;
 						if(key.ContentHash != 0 && diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
 							diagLoggedHashes.insert(key.ContentHash);
 							char buf[320];
-							if(palFallback) {
-								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] PAL_FALLBACK_MATCH hash=%016llX runtime_pal=%d "
-									"pack_pal=%d layer=%d vram=0x%04X%s",
-									(unsigned long long)key.ContentHash, key.PaletteIndex,
-									hdTile->Key.PaletteIndex, key.LayerIndex,
-									tileInfo->VramWordAddr,
-									usedFallbackLayer ? " (FALLBACK_LAYER)" : "");
-								DiagLog(buf);
-								diagPalFallbackCount++;
-							} else {
+							{
 								snprintf(buf, sizeof(buf),
 									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s",
 									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
@@ -531,12 +515,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u palFB=%u) miss=%u palMis=%u layerMis=%u notInPack=%u"
+			": total=%u bg=%u match=%u (fb=%u) miss=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount,
 			isLevel2 ? "LEVEL2" : "other",
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, framePalFallbackMatch,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback,
 			frameHdMiss,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,

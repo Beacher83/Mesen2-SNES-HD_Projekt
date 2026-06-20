@@ -135,6 +135,7 @@ struct SnesHdPpuPixelInfo
 	SnesHdPpuTileInfo BgTiles[4] = {};   // BG1-BG4 tile info at this pixel (indexed by layerIndex 0-3)
 	uint8_t BgLayerMask = 0;             // Bitmask: bit N set = BgTiles[N] has a non-transparent tile
 	uint8_t BgWinnerLayer = 0xFF;        // Which BG layer won compositing (0-3), or 0xFF = sprite/backdrop
+	bool SubScreenHasSprite = false;     // Sprite wins sub-screen at this pixel (set by RenderSprites)
 
 	SnesHdPpuTileInfo Sprites[4] = {};   // Up to 4 sprite tiles at this pixel
 	uint8_t SpriteCount = 0;
@@ -352,20 +353,12 @@ public:
 
 	// Look up an HD tile replacement.
 	// Content hash mode: direct lookup — the key's ContentHash uniquely identifies tile content.
-	//   Stage 1: exact match (hash + palette + layer)
-	//   Stage 2: palette fallback — same hash + layer, try all 8 palettes (M5.5f)
-	//            HD PNG tiles have correct colors baked in; the SNES palette index
-	//            in the key only matters if different palette selections produce
-	//            visually distinct tiles from the same VRAM data. For most exported
-	//            packs the palette was captured at export time and may differ from
-	//            runtime (e.g. viewer exports pal=0, runtime uses pal=2).
-	//   With fingerprints: only returns tiles from the active gfxset (prevents false positives).
-	//   Without fingerprints: returns any matching tile (original behavior).
-	// Legacy mode: when vram is provided, selects among multiple candidates by checksum.
+	// Exact match on (hash + palette + layer). No palette fallback — cross-palette matching
+	// causes worldmap contamination when Level 2 tile hashes coincide with worldmap tiles
+	// at different palette indices. palFB=0 in diagnostics confirmed it never helps Level 2 anyway.
 	SnesHdPackTileInfo* GetMatchingTile(const SnesHdTileKey& key, const uint16_t* vram = nullptr)
 	{
 		if(UseContentHash && key.ContentHash != 0) {
-			// Stage 1: Exact match (hash + palette + layer)
 			auto it = TileByKey.find(key);
 			if(it != TileByKey.end()) {
 				for(SnesHdPackTileInfo* tile : it->second) {
@@ -373,23 +366,6 @@ public:
 					return tile;
 				}
 			}
-
-			// Stage 2: Palette fallback — same hash + layer, any palette
-			for(uint8_t tryPal = 0; tryPal < 8; tryPal++) {
-				if(tryPal == key.PaletteIndex) continue;
-				SnesHdTileKey palKey;
-				palKey.ContentHash = key.ContentHash;
-				palKey.PaletteIndex = tryPal;
-				palKey.LayerIndex = key.LayerIndex;
-				auto it2 = TileByKey.find(palKey);
-				if(it2 != TileByKey.end()) {
-					for(SnesHdPackTileInfo* tile : it2->second) {
-						if(tile->IsFullyTransparent) continue;
-						return tile;
-					}
-				}
-			}
-
 			return nullptr;
 		}
 
