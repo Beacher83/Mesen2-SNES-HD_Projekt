@@ -9,7 +9,7 @@ Stand: 2026-06-22 | Mesen Build: M5.8 (pending build)
 | # | Issue | Status | Seit | Letzer Test |
 |---|-------|--------|------|-------------|
 | A | BG3 native tiles transparent in Level 1 (Regression) | FIX COMMITTED (M5.8) | ~M5.5b | Pending test |
-| B | BG1 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | ROOT CAUSE FOUND — Fix: Container-Refresh | M5.2 | Pending test |
+| B | BG1 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | FIX v2: Single-Best-ChrBase Detection | M5.2 | Pending test |
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
 
 ---
@@ -98,6 +98,10 @@ falschen VRAM-Bytes (BG2-Daten statt BG1-Daten) → 0% Match-Rate in Mesen.
 | ~06-20 | Sub-screen sprite guard + VramAddress fix | Build M5.6 (0b57bcbe) | M5.6 | Level 2 BG1 immer noch nicht da | Sprite-Guard war korrekt aber nicht die Ursache |
 | 2026-06-22 | ? | Neuer Mesen-Build M5.7 | M5.7 | BG1 Level 2 fehlt weiterhin | Nächster Schritt: Diag-Log auswerten |
 | 2026-06-22 | PPU-Register: bg1ChrBase=$6000, Container hat $2000 | ROM-Analyse + VRAM-Dump + Diag-Log | M5.7 + ROM | ROOT CAUSE: Container speichert falsche chrBase | Fix: Refresh oder VRAM-Import |
+| 2026-06-22 | Container-Refresh behebt chrBase? | SHA256 Vergleich: hashes.bin vor/nach Refresh byte-identisch | Viewer | NEIN — Refresh ändert chrBase NICHT | Refresh ist KEIN Fix-Pfad |
+| 2026-06-22 | Multi-chrBase: levels[0] hat andere ppuConfig als Level 2 | Viewer-Code-Analyse: buildCatalogByGfxSet nutzt levels[0] | Viewer | BESTÄTIGT: levels[0] gibt chrBase=$2000, Level 2 braucht $6000 | Fix: Multi-chrBase Export |
+| 2026-06-22 | Multi-chrBase Export → Cross-Layer Collision | User-Test: beide Levels visuell korrupt, BG2 verschwunden | Viewer + M5.8 | BESTÄTIGT: 5 chrBases exportiert, Hash-Kollisionen BG1↔BG2 | Fix: Single-Best Detection (nur 1 chrBase) |
+| 2026-06-22 | Single-Best v2a: bestCount → $3000 statt $6000 | Console: "overridden → $3000"; $3000=BG2-Region | Viewer | FALSCH: $3000 inside BG2 CHR, wrapping penalized $6000 | Fix v2b: density scoring, no wrapping, all indices |
 
 ### Definitiv Ausgeschlossen (Ruled Out)
 
@@ -108,6 +112,8 @@ falschen VRAM-Bytes (BG2-Daten statt BG1-Daten) → 0% Match-Rate in Mesen.
 | Byte-Ordering-Differenz Viewer↔Mesen | Verifiziert: beide little-endian, DMA Mode 1 → identische Reihenfolge | 06-12 |
 | FNV-1a Algorithmus-Unterschied | Identischer Code in C++ und JS bestätigt via manuelle Stichprobe | 06-12 |
 | Gfxset-Scoping (Fingerprint-System) | Deaktiviert seit M5.4 (32bd50b9), kein Effekt | 06-15 |
+| Container-Refresh als Fix | hashes.bin SHA256 vor/nach Refresh identisch — ppuConfig wird nicht aktualisiert | 06-22 |
+| Multi-chrBase Export (alle Bases >50%) | Verursacht Cross-Layer Hash-Kollisionen: BG2/BG3-Daten als BG1 exportiert → falsche HD-Tiles geladen | 06-22 |
 
 ### Root Cause (identifiziert 2026-06-22)
 
@@ -142,16 +148,108 @@ die `bg1ChrBase` falsch berechnet oder gar nicht gespeichert hat:
 5. → 0% Match weil BG2-Daten-Hashes ≠ BG1-Daten-Hashes
 
 **Fix-Pfad:**
-- Container-Refresh für gfxset_25 im Viewer → `readPpuConfig()` liest korrekte Werte aus ROM
-- Dann Hash-Export → korrekte Hashes basierend auf $6000
-- Alternativ: VRAM-Dump-Import (umgeht das Problem komplett)
+- ~~Container-Refresh für gfxset_25~~ → **FUNKTIONIERT NICHT** (hashes.bin identisch vor/nach)
+- ~~VRAM-Dump-Import (umgeht das Problem)~~ → Umgeht nur das VRAM-Problem, nicht das chrBase-Problem
+- **IMPLEMENTIERT: Multi-chrBase Export** → Viewer scannt alle Levels im Gfxset, sammelt alle
+  einzigartigen bg1ChrBase-Werte, generiert Hash-Einträge und PNGs für JEDE chrBase
+
+### Warum Refresh nicht funktioniert (22.06.2026)
+
+**Befund:** SHA256 der hashes.bin vor und nach Container-Refresh sind BYTE-IDENTISCH:
+`dc1ed5ee...cd20` (beide Packs).
+
+**Ursache:** `refreshContainerSetMetadata()` (Zeile 8112) aktualisiert ppuConfig nur wenn
+`currentBgData && currentBgData.ppu` wahr ist (Zeile 8153). Im Katalog-Modus ist
+`currentBgData` nicht gesetzt → ppuConfig bleibt auf dem gespeicherten Wert ($2000).
+Selbst wenn es aktualisiert würde: `buildCatalogByGfxSet()` nutzt `levels[0]` als Referenz,
+und `levels[0]` hat möglicherweise ppuConfig mit chrBase=$2000.
+
+### Warum levels[0] die falsche chrBase hat
+
+`scanGraphicsSets()` (Zeile 4099) iteriert alle 192 Level und gruppiert nach `style.graphics`.
+Für gfxset 37 (0x25) gibt es mehrere Level mit unterschiedlichen `ppuConfig`-Indizes.
+`levels[0]` (das erste gefundene Level) hat einen ppuConfig mit `BG12NBA` Low-Nibble = 2
+→ `bg1ChrBase = $2000`. Level 2 (Mainbrace Mayhem) hat `BG12NBA = $26`
+→ `bg1ChrBase = $6000`.
+
+### Multi-chrBase Fix (implementiert 22.06.2026)
+
+**Änderungen in `index.html` (Viewer `exportAsTexturePack`):**
+
+**1. ChrBase-Sammlung (nach Zeile 7181):**
+Für jeden Gfxset werden alle Level gescannt → `readPpuConfig()` für jedes Level →
+alle einzigartigen `bg1ChrBase`-Werte in `allBg1ChrBases` (Set) gesammelt.
+
+**2. PNG-Export (Zeile 7247ff):**
+Für jedes 8x8 Sub-Tile wird das PNG einmal erstellt, dann unter ALLEN chrBase-abgeleiteten
+VRAM-Adressen ins ZIP geschrieben. Content-Hash als Gatekeeper: falsche chrBase-PNGs
+matchen nie, da die VRAM-Inhalte an verschiedenen Adressen verschieden sind.
+
+**3. Palette-Varianten (Zeile 7303ff):**
+`collectBG1PaletteVariantsFromROM()` wird jetzt pro chrBase aufgerufen (statt einmal).
+Die Funktion überspringt intern Level mit nicht-matchender chrBase → korrekte Zuordnung.
+
+**4. Hash-Export (Zeile 7575ff):**
+`hashChrBases` (Set) sammelt alle chrBases. Für jede chrBase werden Hash-Einträge
+aus dem vramSnapshot generiert. Der FNV-1a Hash wird aus den echten VRAM-Bytes an der
+jeweiligen Adresse berechnet → nur korrekte Einträge matchen zur Runtime.
+
+**Warum das sicher ist:**
+- Für Level 2 (chrBase=$6000): Emulator hasht VRAM[$C020:$C03F] → findet Hash-Eintrag
+  bei vramAddr=$6010 → lädt PNG `6010_P06.png` → KORREKT
+- Für Bonus-Level (chrBase=$2000): Emulator hasht VRAM[$4020:$403F] → findet Hash-Eintrag
+  bei vramAddr=$2010 → lädt PNG `2010_P06.png` → Andere VRAM-Daten, anderer Hash →
+  Content-Hash matcht NICHT → PNG wird ignoriert (kein Schaden)
+
+**PROBLEM (erkannt 22.06.2026 Abend):** Multi-chrBase erzeugt Cross-Layer-Kollisionen!
+Das Scannen ALLER chrBases mit >50% non-zero Tiles führt dazu, dass BG2/BG3-Daten an
+$3000/$4000/$5000 fälschlicherweise als BG1-Tile-Daten interpretiert werden.
+Mesen's TileByKey nutzt {ContentHash, PaletteIndex, LayerIndex} — NICHT vramAddr.
+Wenn ein BG2-Tile-ContentHash zufällig einem (fälschlicherweise exportierten) BG1-Eintrag
+entspricht, wird das falsche HD-Bild geladen → visuelle Korruption in beiden Leveln.
+
+### Single-Best-ChrBase Fix v2 (implementiert 2026-06-22)
+
+**Änderung:** `detectChrBasesFromVRAM()` gibt NUR NOCH EINE chrBase zurück — die mit
+dem HÖCHSTEN non-zero Tile-Count (vorher: ALLE mit >50%).
+
+**PROBLEM v2a (22.06 Abend):** Erster Versuch mit "best count" wählte $3000 statt $6000!
+- $3000 (word) = byte $6000 = mitten in der BG2 CHR Region ($4000-$9FFF)
+- BG2-Grafik-Daten sind dicht belegt → hoher Score
+- $6000 (word) = byte $C000 = korrekte BG1 Region, aber:
+  - Hohe Tile-Indices (>256) wrappen via `& 0x7FFF` auf Adressen $0000-$2000 (leer/sparse)
+  - Das Boolean-Scoring ("has ANY non-zero word") war zu grob — auch Tilemap-Daten zählen
+
+**Fix v2b: Drei Verbesserungen:**
+1. **Kein Address-Wrapping:** `rawAddr > 0x7FFF` → skip (statt `& 0x7FFF`)
+   - Verhindert, dass hohe chrBases ($5000+) durch Wrap-Around benachteiligt werden
+2. **Density-Scoring:** Zählt ALLE non-zero Words pro Tile (nicht nur "mindestens 1")
+   - Echte Tile-Grafik: ~87% Word-Density (4 Bitplanes, dicht belegt)
+   - Tilemap-Daten an falscher Adresse: niedrigere Density
+3. **Alle Indices:** Kein 50-Sample-Limit mehr, nutzt ALLE unique Tile-Indices
+   - Repräsentativeres Scoring, kein Sampling-Bias
+
+**Diagnostic Logging hinzugefügt:** Zeigt Score für ALLE 8 chrBases im Console-Log.
+
+**Calling-Code geändert (PNG-Export + Hash-Export):**
+- Alte Logik: `allBg1ChrBases.add(stored); allBg1ChrBases.add(...detected); allBg1ChrBases.add(...romScan)`
+- Neue Logik: Wenn VRAM-Detection einen Treffer hat → NUR diesen verwenden (ersetzt stored).
+  Wenn Detection fehlschlägt → Fallback auf stored chrBase. ROM-Scan ENTFERNT (lieferte
+  für gfxset 37 immer $2000 weil alle Levels im ROM denselben ppuConfig-Index haben).
+
+**Erwartetes Ergebnis:**
+- Gfxset 7 (Level 1): Detection findet $2000 (korrekt, == stored) → 1 chrBase → KEINE Kollisionen
+- Gfxset 37 (Level 2): Detection findet $6000 (höchste Density) → 1 chrBase → BG1 korrekt,
+  BG2/BG3 nicht fälschlich als BG1 exportiert → KEINE Cross-Layer-Kollisionen
 
 ### Noch Offen / Nicht Abschliessend Getestet
 
 | Frage | Status | Nächster Schritt |
 |-------|--------|------------------|
-| Container-Refresh behebt bg1ChrBase? | READY TO TEST | Viewer: gfxset_25 refreshen → Export → Test in M5.8 |
-| VRAM-Dump-Import als Workaround | READY TO TEST | Import dump → Export → test in M5.8 |
+| Container-Refresh behebt bg1ChrBase? | **NEIN** — hashes.bin identisch vor/nach | Refresh ist kein Fix-Pfad |
+| Multi-chrBase Export behebt BG1 Level 2? | **NEIN** — verursacht Cross-Layer-Kollisionen | Ersetzt durch Single-Best Fix v2 |
+| Single-Best-ChrBase Fix v2 behebt Level 2? | READY TO TEST | Viewer: Export → Test in M5.8 |
+| Level 1 BG1 Anordnung korrekt nach Fix v2? | READY TO TEST | Prüfen ob keine falsch zugeordneten Tiles |
 | Sind alle BG1-Tiles betroffen oder nur bestimmte? | BEANTWORTET: ALLE | M5.7 Diag: BG1notInPack==BG1miss für 100% of BG1 tiles |
 
 ### VRAM Dump/Import System (IMPLEMENTED in Viewer)
