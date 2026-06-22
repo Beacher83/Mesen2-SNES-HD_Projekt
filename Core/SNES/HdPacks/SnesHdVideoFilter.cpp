@@ -11,7 +11,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.7"
+#define SNES_HD_BUILD_VERSION "M5.8"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -199,6 +199,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameBg1MissPixels = 0;       // BG1 miss pixel count
 	uint32_t frameBg1NotInPack = 0;        // BG1 unique hashes not in pack at all
 	uint32_t frameFallback = 0;
+	uint32_t frameBg3FogNative = 0;        // BG3 fog won → native pixel preserved (no fallback)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
 	uint32_t frameLayerBits[4] = {};       // Per-layer pixel counts (bit N set in mask)
@@ -264,13 +265,19 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 
 				// 2) Fallback: try other layers if winner has no HD tile
+				//    GATE: Skip fallback when BG3 (layer 2) wins compositing.
+				//    BG3 is the fog/effects overlay in DKC2.  The native composited
+				//    pixel already contains the correct blend of underlying layers +
+				//    BG3 fog.  Falling back to a lower layer's HD tile would render
+				//    it opaquely, completely erasing the fog effect (Issue A fix).
+				//
 				//    IMPORTANT: stop at the FIRST layer that has tile data
 				//    (BgLayerMask bit set), regardless of whether an HD tile
 				//    exists.  This prevents lower-priority layers (e.g. BG2
 				//    far-background) from replacing native composited pixels
 				//    that contain higher-priority content (BG1 level graphics
 				//    + BG3 fog blend + sprites).
-				if(!hdTile) {
+				if(!hdTile && winLayer != 2) {
 					for(int i = 0; i < 4; i++) {
 						if(i == (int)winLayer) continue;
 						if(pixelInfo.BgLayerMask & (1 << i)) {
@@ -313,6 +320,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							diagMatchCount++;
 						}
 					}
+				} else if(winLayer == 2) {
+					// BG3 fog won compositing — no HD tile for fog (expected).
+					// The native composited pixel is correct (contains underlying
+					// BG layers + BG3 fog blend).  Do NOT count as a miss.
+					frameBg3FogNative++;
 				} else {
 					frameHdMiss++;
 
@@ -522,13 +534,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u) miss=%u palMis=%u layerMis=%u notInPack=%u"
+			": total=%u bg=%u match=%u (fb=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount,
 			ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback,
-			frameHdMiss,
+			frameHdMiss, frameBg3FogNative,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
