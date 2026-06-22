@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-22 | Mesen Build: M5.8 (pending build)
+Stand: 2026-06-23 | Mesen Build: M5.8 (pending build)
 
 ---
 
@@ -9,7 +9,7 @@ Stand: 2026-06-22 | Mesen Build: M5.8 (pending build)
 | # | Issue | Status | Seit | Letzer Test |
 |---|-------|--------|------|-------------|
 | A | BG3 native tiles transparent in Level 1 (Regression) | FIX COMMITTED (M5.8) | ~M5.5b | Pending test |
-| B | BG1 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | FIX v2: Single-Best-ChrBase Detection | M5.2 | Pending test |
+| B | BG1 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | FIX v3: chrRawData Cross-Reference Detection | M5.2 | Pending test |
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
 
 ---
@@ -102,6 +102,8 @@ falschen VRAM-Bytes (BG2-Daten statt BG1-Daten) → 0% Match-Rate in Mesen.
 | 2026-06-22 | Multi-chrBase: levels[0] hat andere ppuConfig als Level 2 | Viewer-Code-Analyse: buildCatalogByGfxSet nutzt levels[0] | Viewer | BESTÄTIGT: levels[0] gibt chrBase=$2000, Level 2 braucht $6000 | Fix: Multi-chrBase Export |
 | 2026-06-22 | Multi-chrBase Export → Cross-Layer Collision | User-Test: beide Levels visuell korrupt, BG2 verschwunden | Viewer + M5.8 | BESTÄTIGT: 5 chrBases exportiert, Hash-Kollisionen BG1↔BG2 | Fix: Single-Best Detection (nur 1 chrBase) |
 | 2026-06-22 | Single-Best v2a: bestCount → $3000 statt $6000 | Console: "overridden → $3000"; $3000=BG2-Region | Viewer | FALSCH: $3000 inside BG2 CHR, wrapping penalized $6000 | Fix v2b: density scoring, no wrapping, all indices |
+| 2026-06-22 | Single-Best v2b: density scoring → $3000 (88.1%) | Console: $3000=88.1%, $6000=44.9% (511/760 valid) | Viewer | FALSCH: vramSnapshot ist Viewer-Simulation, hat BG1-Daten NICHT korrekt bei $6000 | Fix v3: chrRawData cross-reference |
+| 2026-06-23 | Fix v3: chrRawData byte-for-byte cross-reference | Committed `24d9df5`. Vergleicht decompressed chrRawData gegen vramSnapshot-Bytes an jedem chrBase-Kandidaten | Viewer | PENDING TEST | Nächster Schritt: Mesen VRAM-Dump importieren → Export → Console prüfen |
 
 ### Definitiv Ausgeschlossen (Ruled Out)
 
@@ -114,6 +116,7 @@ falschen VRAM-Bytes (BG2-Daten statt BG1-Daten) → 0% Match-Rate in Mesen.
 | Gfxset-Scoping (Fingerprint-System) | Deaktiviert seit M5.4 (32bd50b9), kein Effekt | 06-15 |
 | Container-Refresh als Fix | hashes.bin SHA256 vor/nach Refresh identisch — ppuConfig wird nicht aktualisiert | 06-22 |
 | Multi-chrBase Export (alle Bases >50%) | Verursacht Cross-Layer Hash-Kollisionen: BG2/BG3-Daten als BG1 exportiert → falsche HD-Tiles geladen | 06-22 |
+| Density-only chrBase Detection (ohne chrRawData) | vramSnapshot (Viewer-Sim) hat BG1-Daten NICHT bei $6000; $3000 (BG2-Region) gewinnt immer | 06-22 |
 
 ### Root Cause (identifiziert 2026-06-22)
 
@@ -210,6 +213,8 @@ entspricht, wird das falsche HD-Bild geladen → visuelle Korruption in beiden L
 
 ### Single-Best-ChrBase Fix v2 (implementiert 2026-06-22)
 
+**Status: SUPERSEDED by Fix v3 (chrRawData cross-reference)**
+
 **Änderung:** `detectChrBasesFromVRAM()` gibt NUR NOCH EINE chrBase zurück — die mit
 dem HÖCHSTEN non-zero Tile-Count (vorher: ALLE mit >50%).
 
@@ -248,9 +253,11 @@ dem HÖCHSTEN non-zero Tile-Count (vorher: ALLE mit >50%).
 |-------|--------|------------------|
 | Container-Refresh behebt bg1ChrBase? | **NEIN** — hashes.bin identisch vor/nach | Refresh ist kein Fix-Pfad |
 | Multi-chrBase Export behebt BG1 Level 2? | **NEIN** — verursacht Cross-Layer-Kollisionen | Ersetzt durch Single-Best Fix v2 |
-| Single-Best-ChrBase Fix v2 behebt Level 2? | READY TO TEST | Viewer: Export → Test in M5.8 |
-| Level 1 BG1 Anordnung korrekt nach Fix v2? | READY TO TEST | Prüfen ob keine falsch zugeordneten Tiles |
+| Single-Best v2b (density only) behebt Level 2? | **NEIN** — vramSnapshot hat BG1 nicht bei $6000 | Density-only kann $6000 NICHT finden |
+| Fix v3: chrRawData cross-ref behebt Level 2? | READY TO TEST | Import Mesen VRAM → Export → Console Log prüfen |
+| Level 1 BG1 Anordnung korrekt nach Fix v3? | READY TO TEST | Prüfen ob keine falsch zugeordneten Tiles |
 | Sind alle BG1-Tiles betroffen oder nur bestimmte? | BEANTWORTET: ALLE | M5.7 Diag: BG1notInPack==BG1miss für 100% of BG1 tiles |
+| vramSnapshot nach Refresh == Viewer-Simulation? | **JA** — Refresh überschreibt importierten Dump | WARNUNG: nicht Refreshen nach VRAM-Import! |
 
 ### VRAM Dump/Import System (IMPLEMENTED in Viewer)
 Das System umgeht die Viewer-VRAM-Simulation komplett:
@@ -262,10 +269,48 @@ Das System umgeht die Viewer-VRAM-Simulation komplett:
 User muss den vorhandenen 64KB VRAM-Dump für gfxset_25 importieren und dann neu exportieren.
 Verifiziert: VRAM-Dump Hashes == Mesen-Runtime Hashes (FNV-1a Vergleich am 22.06).
 
+**WARNUNG:** `refreshContainerSetMetadata()` (Zeile 8391-8397) ÜBERSCHREIBT importierte
+VRAM-Dumps mit der Viewer-Simulation! Nach VRAM-Import NICHT Refreshen vor dem Export!
+
 **Workflow für jeden neuen Gfxset:**
 1. Level in Mesen laden → Tools > Dump VRAM to File
 2. Viewer → Container Manager → VRAM-Button für den Set klicken → .bin auswählen
-3. "Texture Pack" exportieren → hashes.bin enthält korrekte Hashes
+3. **NICHT Refreshen!** (überschreibt den importierten Dump)
+4. "Texture Pack" exportieren → hashes.bin enthält korrekte Hashes
+
+### ChrRawData Cross-Reference Fix v3 (implementiert 2026-06-23)
+
+**Commit:** `24d9df5` (DKC2-HD-Tools, branch `main`)
+
+**Konzept:** Deterministische chrBase-Erkennung durch Byte-Vergleich.
+- `chrRawData` enthält die dekomprimierten Tile-Grafiken sequentiell (Tile N bei Byte N*32)
+- Für jeden chrBase-Kandidaten ($0000..$7000 in $1000-Schritten):
+  - Vergleiche chrRawData[N*32..N*32+31] mit vramSnapshot[(chrBase+N*16)*2..(chrBase+N*16)*2+31]
+  - Zähle byte-for-byte Matches
+- Der chrBase mit den meisten Matches ist definitiv korrekt (>50% Threshold)
+- Falls chrRawData unavailable oder inconclusive: Fallback auf Density-Scoring
+
+**Sampling-Strategie:**
+- 40 non-empty Tiles mit Index >= 30 (VBlank-DMA-Zone vermeiden)
+- "Non-empty" = mindestens 1 Byte != 0 in chrRawData
+
+**Kritischer Punkt:** Die Methode funktioniert NUR wenn vramSnapshot die chrRawData-Bytes
+tatsächlich an der richtigen Adresse enthält. Zwei Szenarien:
+
+| vramSnapshot Quelle | chrRawData gefunden bei | Korrekt? |
+|---------------------|------------------------|----------|
+| Viewer-Simulation   | $2000 (wo Viewer BG1 hinlegt) | FALSCH — Mesen nutzt $6000 |
+| Mesen VRAM-Dump     | $6000 (echte Runtime-Adresse) | KORREKT |
+
+**Deshalb:** Für gfxset_25 MUSS der Mesen-VRAM-Dump importiert sein (nicht Refresh-Simulation)!
+
+**Erwarteter Console Output (bei korrektem Dump):**
+```
+[detectChrBase] chrRawData cross-ref (40 tiles): $0=0/40, $1000=0/40, $2000=0/40,
+  $3000=0/40, $4000=0/40, $5000=0/40, $6000=38/40, $7000=0/40
+[detectChrBase] → best (chrRawData match): $6000 (38/40)
+[export] gfxset 25: stored chrBase $2000 overridden by VRAM detection → $6000
+```
 
 ---
 
