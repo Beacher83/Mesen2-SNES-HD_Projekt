@@ -11,7 +11,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.6"
+#define SNES_HD_BUILD_VERSION "M5.7"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -137,48 +137,48 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	bool isHiRes = (ppuWidth == 512);
 
 	// =====================================================================
-	// DIAGNOSTIC: Context-aware logging with VRAM-based level detection
-	// =====================================================================
-	// Problem: Mesen auto-loads last save state (could be worldmap).
-	// Static counters would log worldmap data and exhaust limits before
-	// the user enters Level 2. Solution: detect context changes via
-	// VRAM content hash at stable reference addresses (outside VBlank DMA).
-	//
-	// Reference tiles (from VramCompare2.cs):
+	// DIAGNOSTIC: Context-aware logging with VRAM-based level/worldmap detection
+	// =========================================================================
+	// Reference tiles (stable, outside VBlank DMA range 0x2000-0x21D0):
 	//   gfxset_37 (Level 2): VRAM 0x32E0 → hash 0x1585855B0633F405
 	//   gfxset_07 (Level 1): VRAM 0x2080 → hash 0xF33C58BA8611DF5D
-	// Both are outside VBlank DMA range (0x2000-0x21D0), so stable.
-	// =====================================================================
+	// Combined vramSig = sigA ^ (sigB << 1) — unique per screen context.
+	// Worldmap: stable sig 0xDBF342F9932FD251 (verified across multiple sessions).
+	// =========================================================================
 
 	static uint64_t diagPrevVramSig = 0;
-	static int diagFrameCount = 0;
+	static int diagFrameCount = 0;     // all frames (incl. loading, limit 10)
+	static int diagBgFrameCount = 0;   // gameplay frames only (bg>0, limit 60)
 	static int diagMissCount = 0;
 	static int diagPalMismatchCount = 0;
 	static int diagLayerMismatchCount = 0;
 	static int diagMatchCount = 0;
-	static int diagPalFallbackCount = 0;  // kept for potential future use
+	static int diagPalFallbackCount = 0;
 	static int diagDetailCount = 0;
 	static std::unordered_set<uint64_t> diagLoggedHashes;
 
 	// Compute VRAM context signature from two stable reference tiles
 	uint64_t sigA = 0, sigB = 0;
 	bool isLevel2 = false;
+	bool isWorldmap = false;
 	if(hdScreen->Vram) {
 		sigA = ComputeTileContentHash(hdScreen->Vram, 0x32E0);  // gfxset_37 ref tile
 		sigB = ComputeTileContentHash(hdScreen->Vram, 0x2080);  // gfxset_07 ref tile
-		isLevel2 = (sigA == 0x1585855B0633F405ULL);
+		isLevel2  = (sigA == 0x1585855B0633F405ULL);
 	}
-	uint64_t vramSig = sigA ^ (sigB << 1);  // simple combined signature
+	uint64_t vramSig = sigA ^ (sigB << 1);
+	isWorldmap = (vramSig == 0xDBF342F9932FD251ULL);
 
 	// Detect context change (level transition) → reset all diagnostic counters
 	if(vramSig != diagPrevVramSig && diagPrevVramSig != 0) {
+		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
 		char buf[256];
 		snprintf(buf, sizeof(buf),
-			"[SNES HD diag] CONTEXT CHANGE (build=" SNES_HD_BUILD_VERSION "): sig %016llX -> %016llX (isLevel2=%s)",
-			(unsigned long long)diagPrevVramSig, (unsigned long long)vramSig,
-			isLevel2 ? "YES" : "no");
+			"[SNES HD diag] CONTEXT CHANGE (build=" SNES_HD_BUILD_VERSION "): sig %016llX -> %016llX (%s)",
+			(unsigned long long)diagPrevVramSig, (unsigned long long)vramSig, ctxLabel);
 		DiagLog(buf);
 		diagFrameCount = 0;
+		diagBgFrameCount = 0;
 		diagMissCount = 0;
 		diagPalMismatchCount = 0;
 		diagLayerMismatchCount = 0;
@@ -230,8 +230,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			// Only attempt HD BG tile replacement when:
 			// 1) At least one BG layer has a non-transparent tile at this pixel
 			// 2) A sprite did NOT win compositing
-			// Two cases: sprite wins main screen (IsSpritePixel in MainScreenFlags),
-			// or sprite wins sub-screen only (SubScreenHasSprite). In DKC2 Level 2,
+			// 3) We are NOT on the Worldmap — Worldmap tiles are unique to that
+			//    context but share gfxset_7 CHR data with Level 1, causing false
+			//    matches. Gate off entirely so native rendering is always used there.
+			// Two cases for sprite: wins main screen (IsSpritePixel in MainScreenFlags),
+			// or wins sub-screen only (SubScreenHasSprite). In DKC2 Level 2,
 			// BG3 fog wins main screen while sprites contribute via color math from
 			// sub-screen — IsSpritePixel is never set there, but SubScreenHasSprite is.
 			bool spriteWon = (pixelInfo.MainScreenFlags & 0x40) != 0 || pixelInfo.SubScreenHasSprite;
@@ -243,7 +246,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				frameMaskZero++;
 			}
 
-			if(pixelInfo.BgLayerMask != 0 && !spriteWon) {
+			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
 				frameBgPixels++;
 
 				// Count which layers are present at BG pixels
@@ -509,17 +512,21 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		} // end for(x)
 	} // end for(y)
 
-	// DIAGNOSTIC: Log per-frame summary for first 10 frames
-	// Also log if frameBgPixels==0 (catches stale build where BgLayerMask is never set)
-	if(frameTotalPixels > 0 && diagFrameCount < 10) {
+	// DIAGNOSTIC: Log per-frame summary.
+	// Always log first 10 frames (loading screens included) — catches stale builds.
+	// Additionally log up to 60 gameplay frames (frameBgPixels > 0) per context.
+	bool logThisFrame = frameTotalPixels > 0 &&
+		(diagFrameCount < 10 || (frameBgPixels > 0 && diagBgFrameCount < 60));
+	if(logThisFrame) {
+		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
-			"[SNES HD diag] FRAME %d [%s] build=" SNES_HD_BUILD_VERSION
+			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u (fb=%u) miss=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
-			diagFrameCount,
-			isLevel2 ? "LEVEL2" : "other",
+			diagFrameCount, diagBgFrameCount,
+			ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback,
 			frameHdMiss,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
@@ -530,6 +537,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			(unsigned long long)vramSig);
 		DiagLog(buf);
 		diagFrameCount++;
+		if(frameBgPixels > 0) {
+			diagBgFrameCount++;
+		}
 	}
 
 	// Log build version once at startup
