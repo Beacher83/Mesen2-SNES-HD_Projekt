@@ -595,6 +595,62 @@ Pro Scanline oder pro Tile-Zeile den Hash-Lookup einmal durchführen und das Erg
 
 ---
 
+## Geplantes Projekt: VRAM-Dump-Pipeline für alle Gfxsets
+
+### Problem
+Der Viewer simuliert den VRAM-Inhalt pro Gfxset über `loadLevelBackground()`.
+Diese Simulation ist unzuverlässig — DKC2 nutzt komplexe DMA-Operationen (Type 7, 8, 13, 19)
+und level-spezifische CHR-Lade-Routinen die der Viewer nicht korrekt nachbildet.
+Ergebnis: gfxset_07 (Level 1) funktioniert zufällig, gfxset_25 (Level 2) hatte 0% Match.
+
+### Lösung: Lua-Script VRAM-Dump + Viewer-Integration
+
+**Phase 1: Savestates anlegen (einmalig, manuell)**
+- DKC2 Level-Select-Cheat nutzen um jedes Gfxset zu erreichen
+- Pro Gfxset einen Mesen-Savestate speichern
+- DKC2 hat ~40 Gfxsets, viele Levels teilen sich eins
+- Geschätzter Aufwand: ~30-60 Min mit Cheat
+
+**Phase 2: Lua-Script (einmalig entwickeln, beliebig oft ausführbar)**
+- Script lädt Savestates der Reihe nach
+- Wartet 1 Frame (VRAM vollständig befüllt nach VBlank-DMA)
+- Dumpt 64KB VRAM (`emu.memType.snesVideoRam`) + 512B CGRAM + PPU-Register
+- Speichert als binäre Datei pro Gfxset
+- Mesen2 API bestätigt (recherchiert 2026-06-23):
+  - `emu.read(addr, emu.memType.snesVideoRam)` — VRAM lesen ✓
+  - `emu.read(addr, emu.memType.snesCgRam)` — Paletten lesen ✓
+  - `emu.loadSavestate(state)` — Savestate laden ✓
+  - `io.open()` — Dateien schreiben ✓ (I/O-Zugriff in Settings aktivieren)
+  - `emu.getState()` — PPU-Register auslesen ✓
+
+**Phase 3: Viewer-Integration (einmalig)**
+- VRAM-Dumps als Ground-Truth-Datenquelle im Viewer hinterlegen
+- `loadLevelBackground()` / Hash-Berechnung nutzt Dump-Daten statt Simulation
+- Pro Gfxset: eine binäre Datei mit den korrekten CHR-Bytes
+- Ergebnis: **Korrekte Hashes für alle Gfxsets, ohne Simulation**
+
+### Workflow nach Integration
+
+```
+Neues HD-Grafikset erstellt → Viewer öffnen → Gfxset auswählen
+→ Viewer kennt korrekte VRAM-Daten (aus Dump, hardcoded)
+→ Hash-Berechnung stimmt automatisch
+→ HD Pack exportieren → in Mesen laden → funktioniert
+```
+
+Kein erneuter Dump nötig. Die VRAM-Daten sind ROM-determiniert und ändern sich nicht.
+Nur die HD-Grafiken (PNGs) ändern sich — die Hash-Seite bleibt stabil.
+
+### Warum nicht den Viewer-DMA-Simulator fixen?
+- Mesen emuliert DMA als Teil der CPU/PPU-Schleife (Register, Timing, VBlank-abhängig)
+- Den Simulator korrekt nachbauen = halben SNES emulieren
+- Auch nach Fix: keine 100% Garantie für alle Gfxsets
+- Dump-Ansatz ist einfacher, schneller, und garantiert korrekt
+
+**Status:** Geplant als nächstes größeres Projekt. Priorisiert vor weiteren Level-HD-Packs.
+
+---
+
 ## Prozess-Regeln
 
 ### Vor jedem neuen Fix/Test:
