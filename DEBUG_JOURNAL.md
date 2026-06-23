@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-23 | Mesen Build: M5.8 (pending build)
+Stand: 2026-06-23 | Mesen Build: M5.9 (pending build)
 
 ---
 
@@ -9,7 +9,7 @@ Stand: 2026-06-23 | Mesen Build: M5.8 (pending build)
 | # | Issue | Status | Seit | Letzer Test |
 |---|-------|--------|------|-------------|
 | A | BG3 native tiles transparent in Level 1 (Regression) | FIX COMMITTED (M5.8) | ~M5.5b | Pending test |
-| B | BG1 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | FIX v3: chrRawData Cross-Reference Detection | M5.2 | Pending test |
+| B | BG1 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | FIX M5.9: BG3 Fog-Blend (hash matching OK since v3) | M5.2 | Pending test |
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
 
 ---
@@ -67,10 +67,76 @@ if(!hdTile && winLayer != 2) { /* fallback loop */ }
 
 **Kompromiss:** An Pixeln wo BG3 aktiv ist, werden KEINE HD BG1 Tiles gerendert.
 Stattdessen wird das native PPU-Bild angezeigt (BG1 nativ + BG3 darüber).
-Für HD+BG3 gleichzeitig bräuchte man compositor-aware Alpha Blending (Zukunft).
+Für HD+BG3 gleichzeitig bräuchte man compositor-aware Alpha Blending → **M5.9 löst dies.**
 
 ### Ruled Out
 *(noch nichts definitiv ausgeschlossen)*
+
+---
+
+## Issue B — Sub-Problem: BG3 Fog blockiert HD BG1
+
+### Symptom (entdeckt nach M5.8 + chrRawData-Fix)
+Level 2 (Mainbrace Mayhem): Hash-Matching funktioniert (BG1miss=0, notInPack=0),
+aber HD BG1 Tiles werden nur angezeigt wo KEIN BG3-Fog vorhanden ist (~10% des Screens).
+Überall wo BG3-Fog aktiv ist (~90% = fogNat=51881), wird das native PPU-Bild gezeigt.
+Der Nebel ist dabei "komplett transparent" anstatt nebelartig.
+
+### Root Cause
+M5.8 Fix (Issue A) gated fallback auf `winLayer != 2` — blockiert ALLE HD-Rendering
+wenn BG3 gewinnt. Korrekt für opake BG3-Elemente (Level 1 Schiffstaue), aber
+FALSCH für semi-transparenten Fog (Level 2, Bienenstock-Honig, Unterwasser-Effekte).
+
+### Fix (M5.9) — Implemented 2026-06-23
+
+**Erkenntnis:** `AllowColorMath` Flag (0x80 in MainScreenFlags) unterscheidet zuverlässig:
+- Opakes BG3 (Level 1: Taue/Masten): `AllowColorMath = 0` → skip fallback (M5.8 behavior)
+- Semi-transparentes BG3 (Level 2: Fog): `AllowColorMath = 0x80` → fog-blend path
+
+**DKC2 Effekte die alle BG3 + Color Math nutzen:**
+- Fog (Rigging-Levels wie Mainbrace Mayhem)
+- Honig (Bienenstock-Levels)
+- Wasser-Effekte (Unterwasser-Levels)
+
+Alle diese Effekte nutzen SNES Color Math (Register $2131 CGADSUB, Bit 2 = BG3 enabled).
+Die AllowColorMath-Erkennung behandelt sie alle korrekt.
+
+**Changes (2 Dateien):**
+
+1. **`Core/SNES/SnesPpu.cpp`** (PPU-Seite):
+   - Speichert `_mainScreenBuffer[x]` in `px.MainScreenColor` VOR `ApplyColorMath()`
+   - Gibt dem HD-Filter den rohen BG3-Fog-Farbwert (pre-math, pre-brightness)
+
+2. **`Core/SNES/HdPacks/SnesHdVideoFilter.cpp`** (HD-Filter):
+   - Neuer Pfad (Zeile ~303): `if(!hdTile && winLayer == 2 && (MainScreenFlags & 0x80))`
+     → Versuche BG1 HD-Tile zu finden (layer 0 unter dem Fog)
+   - Neues Flag `bg3FogBlend` markiert diese Pixel für spezielle Rendering
+   - Pixel-Output: Repliziert PPU's Half-Addition Color Math mit HD-Tile:
+     `output = (BG3_fog_color + HD_BG1_pixel) / 2` pro Kanal (8-bit)
+   - Neuer Diagnose-Counter `fogB=` (fog-blend matches) im Frame-Summary
+
+```cpp
+// Fog-Blend Rendering (half-addition):
+uint8_t outR = (fogR + hdR) >> 1;
+uint8_t outG = (fogG + hdG) >> 1;
+uint8_t outB = (fogB + hdB) >> 1;
+```
+
+**Erwartetes Verhalten (Level 2, M5.9):**
+- HD BG1 Tiles ÜBERALL sichtbar (auch unter Fog)
+- Fog-Effekt als halbtransparente Überlagerung auf HD-Tiles
+- Diag: `fogB=` zeigt Anzahl fog-blend Pixel (erwartet: ~50k statt fogNat)
+- `fogNat=` nur noch für BG3 pixels wo KEIN BG1 content darunter ist
+
+**Erwartetes Verhalten (Level 1, M5.9 = M5.8 unchanged):**
+- BG3-Elemente weiterhin sichtbar (AllowColorMath nicht gesetzt → opaker Pfad)
+- Kein Fog-Blend angewendet
+
+**Mögliche Einschränkungen:**
+- Hardcoded Half-Addition (`>> 1`). Falls ein Level Full-Addition oder Subtraction
+  nutzt, wäre das Ergebnis leicht falsch. Für DKC2 Fog ist Half-Addition Standard.
+- Brightness < 15 (Fade-Effekte): MainScreenColor ist pre-brightness, HD-Tile ist
+  full-brightness → leichte Diskrepanz während Fades (akzeptabel, kurz).
 
 ---
 

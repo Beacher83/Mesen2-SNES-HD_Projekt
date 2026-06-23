@@ -914,12 +914,23 @@ void SnesPpu::RenderScanline()
 			RenderBgColor();
 		}
 
+		// Compute HD scanline offset (shared by pre- and post-math blocks)
+		uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
+
+		// Save pre-color-math main screen color for HD fog blending.
+		// After ApplyColorMath(), _mainScreenBuffer is overwritten with the math
+		// result, so we must capture the raw layer color (e.g. BG3 fog) here.
+		if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight) {
+			for(int x = _drawStartX; x <= _drawEndX && x < SnesHdScreenInfo::ScreenWidth; x++) {
+				_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].MainScreenColor = _mainScreenBuffer[x];
+			}
+		}
+
 		ApplyColorMath();
 		ApplyBrightness<true>();
 		ApplyHiResMode();
 
-		// Copy final screen info to HD pixel info (using same row offset as ApplyHiResMode)
-		uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
+		// Copy remaining screen info to HD pixel info
 		if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight) {
 			for(int x = _drawStartX; x <= _drawEndX && x < SnesHdScreenInfo::ScreenWidth; x++) {
 				SnesHdPpuPixelInfo& px = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];

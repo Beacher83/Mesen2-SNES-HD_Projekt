@@ -11,7 +11,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.8"
+#define SNES_HD_BUILD_VERSION "M5.9"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -199,6 +199,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameBg1MissPixels = 0;       // BG1 miss pixel count
 	uint32_t frameBg1NotInPack = 0;        // BG1 unique hashes not in pack at all
 	uint32_t frameFallback = 0;
+	uint32_t frameBg3FogBlend = 0;         // BG3 fog + color math → HD BG1 rendered with fog blend
 	uint32_t frameBg3FogNative = 0;        // BG3 fog won → native pixel preserved (no fallback)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
@@ -226,6 +227,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPackTileInfo* hdTile = nullptr;
 			SnesHdPpuTileInfo* tileInfo = nullptr;
 			bool usedFallbackLayer = false;
+			bool bg3FogBlend = false;  // true when rendering HD BG1 under semi-transparent BG3 fog
 			int fallbackStopLayer = -1;  // Which layer stopped the fallback loop (for miss diagnostics)
 
 			// Only attempt HD BG tile replacement when:
@@ -265,11 +267,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 
 				// 2) Fallback: try other layers if winner has no HD tile
-				//    GATE: Skip fallback when BG3 (layer 2) wins compositing.
-				//    BG3 is the fog/effects overlay in DKC2.  The native composited
-				//    pixel already contains the correct blend of underlying layers +
-				//    BG3 fog.  Falling back to a lower layer's HD tile would render
-				//    it opaquely, completely erasing the fog effect (Issue A fix).
+				//    GATE: Skip fallback when BG3 (layer 2) wins compositing
+				//    WITHOUT color math (opaque foreground — Issue A fix).
+				//    When BG3 wins WITH color math (AllowColorMath set), it's a
+				//    semi-transparent effect (fog, honey, water) — fall through
+				//    to the fog-blend path below instead.
 				//
 				//    IMPORTANT: stop at the FIRST layer that has tile data
 				//    (BgLayerMask bit set), regardless of whether an HD tile
@@ -298,10 +300,28 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					}
 				}
 
+				// 3) BG3 fog-blend path: BG3 won compositing WITH color math
+				//    (semi-transparent effect like fog/honey/water in DKC2).
+				//    Try to find an HD tile on BG1 underneath and render it
+				//    with the BG3 color blended on top (replicating color math).
+				if(!hdTile && winLayer == 2 && (pixelInfo.MainScreenFlags & 0x80)) {
+					// Look for HD BG1 tile (layer 0) underneath the fog
+					if(pixelInfo.BgLayerMask & 0x01) {
+						hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
+						if(hdTile) {
+							tileInfo = &pixelInfo.BgTiles[0];
+							bg3FogBlend = true;
+						}
+					}
+				}
+
 				if(hdTile) {
 					frameHdMatch++;
 					if(usedFallbackLayer) {
 						frameFallback++;
+					}
+					if(bg3FogBlend) {
+						frameBg3FogBlend++;
 					}
 
 					// DIAGNOSTIC: Log first 5 unique MATCHES
@@ -312,9 +332,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							char buf[320];
 							{
 								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s",
+									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s%s",
 									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
-									usedFallbackLayer ? " (FALLBACK)" : "");
+									usedFallbackLayer ? " (FALLBACK)" : "",
+									bg3FogBlend ? " (FOG-BLEND)" : "");
 								DiagLog(buf);
 							}
 							diagMatchCount++;
@@ -474,6 +495,18 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				uint8_t srcTileX = hFlip ? (7 - rawX) : rawX;
 				uint8_t srcTileY = vFlip ? (7 - rawY) : rawY;
 
+				// Pre-compute fog color if this pixel uses BG3 fog blending.
+				// MainScreenColor holds the raw BG3 layer color captured before
+				// the PPU applied color math (half-addition: (fog + sub) >> 1).
+				uint32_t fogColorRGB = 0;
+				uint8_t fogR = 0, fogG = 0, fogB = 0;
+				if(bg3FogBlend) {
+					fogColorRGB = _calculatedPalette[pixelInfo.MainScreenColor & 0x7FFF];
+					fogR = (fogColorRGB >> 16) & 0xFF;
+					fogG = (fogColorRGB >> 8) & 0xFF;
+					fogB = fogColorRGB & 0xFF;
+				}
+
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
 					for(uint32_t dx = 0; dx < hdScale; dx++) {
 						uint32_t hdPixelX = srcTileX * hdScale + (hFlip ? (hdScale - 1 - dx) : dx);
@@ -486,7 +519,21 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							if(outIndex < frameInfo.Width * frameInfo.Height) {
 								uint8_t alpha = (hdColor >> 24) & 0xFF;
 								if(alpha == 0xFF) {
-									outputBuffer[outIndex] = hdColor;
+									if(bg3FogBlend) {
+										// BG3 fog-blend: replicate the PPU's color math
+										// (half-addition) using the HD BG1 tile pixel
+										// instead of the native BG1 pixel.
+										// Formula: output = (BG3_fog + HD_BG1) / 2
+										uint8_t hdR = (hdColor >> 16) & 0xFF;
+										uint8_t hdG = (hdColor >> 8) & 0xFF;
+										uint8_t hdB = hdColor & 0xFF;
+										uint8_t outR = (fogR + hdR) >> 1;
+										uint8_t outG = (fogG + hdG) >> 1;
+										uint8_t outB = (fogB + hdB) >> 1;
+										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+									} else {
+										outputBuffer[outIndex] = hdColor;
+									}
 								} else if(alpha > 0) {
 									// Alpha blend with sub-screen (BG2/backdrop) as background.
 									// Using main-screen would blend HD tile with native BG1 itself,
@@ -498,10 +545,16 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									uint8_t hdR = (hdColor >> 16) & 0xFF;
 									uint8_t hdG = (hdColor >> 8) & 0xFF;
 									uint8_t hdB = hdColor & 0xFF;
-									uint8_t outR = hdR + ((srcR * (255 - alpha)) / 255);
-									uint8_t outG = hdG + ((srcG * (255 - alpha)) / 255);
-									uint8_t outB = hdB + ((srcB * (255 - alpha)) / 255);
-									outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+									uint8_t blendR = hdR + ((srcR * (255 - alpha)) / 255);
+									uint8_t blendG = hdG + ((srcG * (255 - alpha)) / 255);
+									uint8_t blendB = hdB + ((srcB * (255 - alpha)) / 255);
+									if(bg3FogBlend) {
+										// Apply fog on top of the alpha-blended result
+										blendR = (fogR + blendR) >> 1;
+										blendG = (fogG + blendG) >> 1;
+										blendB = (fogB + blendB) >> 1;
+									}
+									outputBuffer[outIndex] = 0xFF000000 | (blendR << 16) | (blendG << 8) | blendB;
 								} else {
 									outputBuffer[outIndex] = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
 								}
@@ -534,12 +587,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
+			": total=%u bg=%u match=%u (fb=%u fogB=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount,
 			ctxLabel,
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend,
 			frameHdMiss, frameBg3FogNative,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,
