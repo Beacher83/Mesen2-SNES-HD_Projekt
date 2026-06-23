@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-23 | Mesen Build: M5.10 (pending build)
+Stand: 2026-06-23 | Mesen Build: M5.10 (tested)
 
 ---
 
@@ -8,9 +8,10 @@ Stand: 2026-06-23 | Mesen Build: M5.10 (pending build)
 
 | # | Issue | Status | Seit | Letzer Test |
 |---|-------|--------|------|-------------|
-| A | BG3 native tiles transparent in Level 1 (Regression) | FIXED (M5.8) — verified M5.9 | ~M5.5b | M5.9 OK |
-| B | BG1/BG2 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | M5.10: fog-blend + BG2 + lighter weight | M5.2 | M5.9: BG1 OK, BG2 missing, fog too dark |
+| A | BG3 native tiles transparent in Level 1 (Regression) | FIXED (M5.8) — verified M5.9+M5.10 | ~M5.5b | M5.10 OK |
+| B | BG1/BG2 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | M5.10: BG1+BG2 OK, fog etwas zu dunkel | M5.2 | M5.10: BG1+BG2 sichtbar, fog 75/25 noch zu dunkel |
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
+| D | Performance Level 1 leicht schlechter | OFFEN — Optimierung geplant | M5.10 | M5.10: spielbar aber spürbar |
 
 ---
 
@@ -534,6 +535,63 @@ Gleiches Muster für alpha-blend + fog Pfad.
   (nur für Pixel wo BG1 transparent UND BG3 aktiv = ~34k px/frame = ~6% von 240*256*scale)
 - 75/25 Gewichtung könnte zu hell sein (Fog kaum sichtbar) → ggf. auf 2/3+1/3 anpassen
 - BG2-Tiles könnten höhere miss-rate haben (ungetestet) → Diagnostik prüfen
+
+### Test-Ergebnis (2026-06-23 abends, Log: snes_hd_diag2306abends.txt)
+
+**Level 2 (Mainbrace Mayhem) — ERFOLG:**
+
+| Metrik | M5.9 | M5.10 | Bewertung |
+|--------|------|-------|-----------|
+| `fogB` | ~15.000 | **~50.300** | BG1+BG2 unter Fog jetzt alle HD |
+| `fogNat` | ~34.000 | **0** | ELIMINIERT — kein native fallback unter Fog |
+| `BG2` | n/a | **~55.700** | BG2 vollständig populiert |
+| `miss` | 0 | **0** | Perfekte Hash-Rate beibehalten |
+| `BG1miss` | 0 | **0** | Perfekt |
+| `fb` | ~3.200 | **~3.300** | Fallback (non-fog) stabil |
+| `mask0` | 0 | **0** | Kein Pixel ohne Layer |
+
+- BG1 HD Tiles sichtbar unter Fog ✓
+- BG2 HD Tiles sichtbar unter Fog ✓ (NEU in M5.10)
+- Fog-Helligkeit deutlich besser als M5.9, **aber noch etwas zu dunkel**
+  → Nächster Schritt: Gewichtung von 75/25 auf ~80/20 oder 5/6+1/6 anpassen
+- Performance Level 2: gut, kein spürbarer Unterschied zu M5.9
+
+**Level 1 (Pirate Panic) — OK mit Performance-Regression:**
+- BG1 + BG2 HD korrekt ✓
+- BG3 Taue/Masten sichtbar ✓ (keine Regression)
+- **Performance etwas schlechter als früher** (war mal flüssiger)
+  → Vermutlich kumulativer Effekt der zusätzlichen per-pixel checks
+  → Tile-Level Caching als Optimierung geplant (siehe unten)
+
+**Worldmap — OK:** Sauber, keine Regression ✓
+
+### Offene Punkte nach M5.10
+
+1. **Fog noch etwas zu dunkel** — Gewichtung anpassen (80/20 oder 5:1)
+2. **Performance Level 1** — Tile-Level Caching implementieren (siehe Optimierungs-Sektion)
+
+---
+
+## Geplante Optimierung: Tile-Level Caching
+
+### Motivation
+Aktuell wird `GetMatchingTile()` für JEDEN Pixel aufgerufen. Innerhalb eines 8x8 nativen
+Tiles ist der Hash-Key identisch — die selbe Suche wird 64× wiederholt pro Tile.
+
+### Idee
+Pro Scanline oder pro Tile-Zeile den Hash-Lookup einmal durchführen und das Ergebnis
+(`HdPackTileInfo*`) für alle 8 Pixel der Tile-Zeile cachen.
+
+**Erwarteter Gewinn:**
+- Hash-Lookups reduziert um Faktor ~8 (pro Zeile) bis ~64 (pro ganzes Tile)
+- Betrifft ALLE HD-Rendering-Pfade (nicht nur Fog), also globale Verbesserung
+- Besonders wirksam in Fog-Levels wo zusätzliche BG2-Lookups stattfinden
+
+**Risiken:**
+- Cache-Invalidierung muss korrekt sein (VRAM-Änderungen mid-frame sind selten aber möglich)
+- Implementierungs-Aufwand: mittel (lokaler Cache pro Scanline reicht)
+
+**Status:** Geplant, nicht priorisiert. Wird relevant wenn mehr Levels HD-Packs haben.
 
 ---
 
