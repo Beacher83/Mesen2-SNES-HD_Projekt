@@ -11,7 +11,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.9"
+#define SNES_HD_BUILD_VERSION "M5.10"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -302,14 +302,22 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 				// 3) BG3 fog-blend path: BG3 won compositing WITH color math
 				//    (semi-transparent effect like fog/honey/water in DKC2).
-				//    Try to find an HD tile on BG1 underneath and render it
-				//    with the BG3 color blended on top (replicating color math).
+				//    Try to find an HD tile on BG1 or BG2 underneath and render
+				//    it with the BG3 color blended on top (replicating color math).
 				if(!hdTile && winLayer == 2 && (pixelInfo.MainScreenFlags & 0x80)) {
-					// Look for HD BG1 tile (layer 0) underneath the fog
+					// Try BG1 (layer 0) first — highest priority background
 					if(pixelInfo.BgLayerMask & 0x01) {
 						hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
 						if(hdTile) {
 							tileInfo = &pixelInfo.BgTiles[0];
+							bg3FogBlend = true;
+						}
+					}
+					// If no BG1 HD tile, try BG2 (layer 1) — parallax background
+					if(!hdTile && (pixelInfo.BgLayerMask & 0x02)) {
+						hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[1].Key, hdScreen->Vram);
+						if(hdTile) {
+							tileInfo = &pixelInfo.BgTiles[1];
 							bg3FogBlend = true;
 						}
 					}
@@ -497,7 +505,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 				// Pre-compute fog color if this pixel uses BG3 fog blending.
 				// MainScreenColor holds the raw BG3 layer color captured before
-				// the PPU applied color math (half-addition: (fog + sub) >> 1).
+				// the PPU applied color math.
+				// Blend weight: 75% HD tile + 25% fog color.  The original PPU
+				// uses 50/50 half-addition, but HD tiles are painted brighter than
+				// native tiles, so a lighter fog weight preserves art quality while
+				// still conveying the atmospheric effect.
 				uint32_t fogColorRGB = 0;
 				uint8_t fogR = 0, fogG = 0, fogB = 0;
 				if(bg3FogBlend) {
@@ -520,16 +532,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 								uint8_t alpha = (hdColor >> 24) & 0xFF;
 								if(alpha == 0xFF) {
 									if(bg3FogBlend) {
-										// BG3 fog-blend: replicate the PPU's color math
-										// (half-addition) using the HD BG1 tile pixel
-										// instead of the native BG1 pixel.
-										// Formula: output = (BG3_fog + HD_BG1) / 2
+										// BG3 fog-blend: render HD tile with atmospheric
+										// fog tint.  75% HD + 25% fog keeps art visible
+										// while conveying the fog effect.
 										uint8_t hdR = (hdColor >> 16) & 0xFF;
 										uint8_t hdG = (hdColor >> 8) & 0xFF;
 										uint8_t hdB = hdColor & 0xFF;
-										uint8_t outR = (fogR + hdR) >> 1;
-										uint8_t outG = (fogG + hdG) >> 1;
-										uint8_t outB = (fogB + hdB) >> 1;
+										uint8_t outR = (uint8_t)((hdR * 3 + fogR) >> 2);
+										uint8_t outG = (uint8_t)((hdG * 3 + fogG) >> 2);
+										uint8_t outB = (uint8_t)((hdB * 3 + fogB) >> 2);
 										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
 									} else {
 										outputBuffer[outIndex] = hdColor;
@@ -549,10 +560,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									uint8_t blendG = hdG + ((srcG * (255 - alpha)) / 255);
 									uint8_t blendB = hdB + ((srcB * (255 - alpha)) / 255);
 									if(bg3FogBlend) {
-										// Apply fog on top of the alpha-blended result
-										blendR = (fogR + blendR) >> 1;
-										blendG = (fogG + blendG) >> 1;
-										blendB = (fogB + blendB) >> 1;
+										// Apply fog on top of the alpha-blended result (75/25)
+										blendR = (uint8_t)((blendR * 3 + fogR) >> 2);
+										blendG = (uint8_t)((blendG * 3 + fogG) >> 2);
+										blendB = (uint8_t)((blendB * 3 + fogB) >> 2);
 									}
 									outputBuffer[outIndex] = 0xFF000000 | (blendR << 16) | (blendG << 8) | blendB;
 								} else {

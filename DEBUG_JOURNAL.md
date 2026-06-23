@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-23 | Mesen Build: M5.9 (pending build)
+Stand: 2026-06-23 | Mesen Build: M5.10 (pending build)
 
 ---
 
@@ -8,8 +8,8 @@ Stand: 2026-06-23 | Mesen Build: M5.9 (pending build)
 
 | # | Issue | Status | Seit | Letzer Test |
 |---|-------|--------|------|-------------|
-| A | BG3 native tiles transparent in Level 1 (Regression) | FIX COMMITTED (M5.8) | ~M5.5b | Pending test |
-| B | BG1 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | FIX M5.9: BG3 Fog-Blend (hash matching OK since v3) | M5.2 | Pending test |
+| A | BG3 native tiles transparent in Level 1 (Regression) | FIXED (M5.8) — verified M5.9 | ~M5.5b | M5.9 OK |
+| B | BG1/BG2 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | M5.10: fog-blend + BG2 + lighter weight | M5.2 | M5.9: BG1 OK, BG2 missing, fog too dark |
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
 
 ---
@@ -448,6 +448,92 @@ CHR-Lade-Routinen die der Viewer nicht alle korrekt nachbildet.
 **Lösung:** VRAM-Dumps als Ground Truth verwenden statt Simulation. Das Import-System
 im Viewer existiert bereits und ist getestet. Pro Gfxset einmal den VRAM dumpen,
 importieren, und alle zukünftigen Exports basieren auf echten Daten.
+
+---
+
+## Fix M5.10 — BG2 Fog-Blend + Lighter Blend Weight (2026-06-23)
+
+### Problem (aus M5.9 Test-Log)
+
+M5.9 hat BG1-Tiles unter BG3-Fog zum ersten Mal sichtbar gemacht ✓  
+Aber zwei Probleme blieben:
+
+1. **BG2 fehlt:** In Level 2 besteht ~100% des Screens aus BG2 (Parallax-Hintergrund, ~55760 px/frame).
+   Wenn BG1 transparent ist (~38000 px/frame = 69% des Screens), sieht man KEINEN HD-Tile, weil
+   der Fog-Blend-Pfad nur `BgLayerMask & 0x01` (BG1) prüfte.
+2. **Fog zu dunkel:** Die 50/50 Formel `(fog + hd) >> 1` ist zu aggressiv. HD-Tiles sind heller
+   gestaltet als native SNES-Pixel, daher sieht die 1:1 Mischung unnatürlich dunkel aus.
+
+### Analyse (M5.9 Diagnostik `snes_hd_diag 2306.txt`)
+
+```
+Pixel-Budget pro Frame (Level 2):
+  BG1   ~17.449 px  (31% des Screens — Vordergrund-Elemente)
+  BG2   ~55.760 px  (≈100% — Parallax Hintergrund)
+  fogB  ~15.000 px  (BG1 unter Fog → fog-blend in M5.9)
+  fogNat ~34.000 px (BG2 unter Fog → NOT blended → blieb native)
+```
+
+**Root Cause BG2:** Der fog-blend Pfad (Schritt 3) versuchte nur Layer 0 (BG1).
+Für ~34000 px pro Frame, wo BG2 existiert aber BG1 transparent ist, wurde kein HD-Tile gesucht.
+
+**Root Cause Fog-Helligkeit:** Original PPU nutzt half-addition `(a+b)>>1` auf **native** 
+Pixel-Farben. HD-Tiles haben hellere, detailreichere Farben → gleiches 50/50 ergibt sichtbar
+dunkleres Ergebnis als intended.
+
+### Fix (M5.10) — Implemented 2026-06-23
+
+**Datei:** `Core/SNES/HdPacks/SnesHdVideoFilter.cpp`
+
+**Änderung 1: BG2 Fallback im Fog-Blend-Pfad (Zeile ~303-322)**
+
+```cpp
+// Try BG1 (layer 0) first — highest priority background
+if(pixelInfo.BgLayerMask & 0x01) {
+    hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
+    if(hdTile) {
+        tileInfo = &pixelInfo.BgTiles[0];
+        bg3FogBlend = true;
+    }
+}
+// If no BG1 HD tile, try BG2 (layer 1) — parallax background
+if(!hdTile && (pixelInfo.BgLayerMask & 0x02)) {
+    hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[1].Key, hdScreen->Vram);
+    if(hdTile) {
+        tileInfo = &pixelInfo.BgTiles[1];
+        bg3FogBlend = true;
+    }
+}
+```
+
+**Änderung 2: Blend-Gewichtung 75% HD / 25% Fog (Zeile ~532+560)**
+
+```cpp
+// Vorher (M5.9): 50/50
+uint8_t outR = (fogR + hdR) >> 1;
+
+// Nachher (M5.10): 75/25
+uint8_t outR = (uint8_t)((hdR * 3 + fogR) >> 2);
+```
+
+Gleiches Muster für alpha-blend + fog Pfad.
+
+### Erwartetes Ergebnis
+
+| Test | Erwartung |
+|------|-----------|
+| Level 2 BG1 unter Fog | Weiterhin sichtbar (wie M5.9) |
+| Level 2 BG2 unter Fog | **NEU: HD-Tiles sichtbar** (Parallax-Hintergrund) |
+| Level 2 Fog-Helligkeit | Leichter/natürlicher als M5.9 |
+| Level 1 (BG3 Taue) | Keine Regression (winLayer==2 Gate bleibt) |
+| Worldmap | Keine Regression (kein BG3-fog dort) |
+
+### Risiko-Analyse
+
+- BG2-Lookup kostet zusätzliche Hash-Suche pro Pixel → Performance-Impact möglich
+  (nur für Pixel wo BG1 transparent UND BG3 aktiv = ~34k px/frame = ~6% von 240*256*scale)
+- 75/25 Gewichtung könnte zu hell sein (Fog kaum sichtbar) → ggf. auf 2/3+1/3 anpassen
+- BG2-Tiles könnten höhere miss-rate haben (ungetestet) → Diagnostik prüfen
 
 ---
 
