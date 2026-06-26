@@ -647,7 +647,49 @@ Nur die HD-Grafiken (PNGs) ändern sich — die Hash-Seite bleibt stabil.
 - Auch nach Fix: keine 100% Garantie für alle Gfxsets
 - Dump-Ansatz ist einfacher, schneller, und garantiert korrekt
 
-**Status:** Geplant als nächstes größeres Projekt. Priorisiert vor weiteren Level-HD-Packs.
+**Status:** ~~Geplant als nächstes größeres Projekt.~~ → **Phase 2 implementiert (26.06.2026).**
+
+### Implementierung: dkc2_vram_dump.lua (26.06.2026)
+
+**Lua-Script gebaut** (`dkc2_vram_dump.lua` im Projekt-Root), implementiert Phase 2 der Pipeline:
+
+**ROM-Analyse beim Start (kein Gameplay nötig):**
+- Scannt alle 192 Level-IDs über ROM-Pointer-Chain:
+  `$3D:0000` → Property-Table → Style-Pointer → `graphics`-Byte (Offset 13)
+- Findet alle unique Gfxsets und zeigt "Einkaufsliste" im Log
+  (welches Level pro Gfxset besucht werden muss)
+- NPC-Shops (Cranky 0x08, Funky 0x09, Wrinkly 0x0A, Swanky 0x0B, Klubba 0x0C)
+  als Hardcoded-Override (Property-Type 0x0004/0x0005 hat keine Style-Daten)
+
+**Interaktiver Dump-Modus:**
+- HUD-Overlay: aktuelles Level, erkanntes Gfxset, Fortschritt (X/N)
+- `[F2]` = Dump VRAM (64KB) + CGRAM (512B) + PPU-State + Savestate
+- `[F3]` = Zeigt verbleibende Gfxsets im Log
+- Duplikat-Erkennung (bereits gedumpte Gfxsets werden übersprungen)
+- Savestate-Capture über NMI-Exec-Callback (Constraint: `emu.createSavestate()`
+  funktioniert nur in Exec-Callbacks)
+
+**Level-ID-Erkennung:**
+- WRAM-Adresse `$003E` (`!RAM_DKC2_Global_CurrentLevelLo` aus p4plus2 Disassembly)
+- **NOCH NICHT VERIFIZIERT** — muss in-game getestet werden
+- Falls falsch: Adresse im Script anpassen (Zeile `readCurrentLevelId()`)
+
+**Output pro Gfxset (im Script Data Folder):**
+- `gfxset_XX_vram.bin` — Viewer-Import-kompatibel
+- `gfxset_XX_cgram.bin` — Paletten-Daten
+- `gfxset_XX_state.txt` — PPU-Register + Metadaten
+- `gfxset_XX.savestate` — für zukünftiges Batch-Re-Dumping
+
+**Voraussetzungen:**
+- Mesen Script Settings: "Allow I/O" aktivieren
+- 102% Save-File (.srm) für Level-Zugang (oder Level-Select-Cheat)
+
+**Offene Punkte nach erstem Test:**
+- [ ] WRAM $003E verifizieren (zeigt HUD korrekte Level-ID?)
+- [ ] ROM-Analyse: wie viele unique Gfxsets werden gefunden?
+- [ ] Dump-Output prüfen: stimmt VRAM-Größe, sind Dateien valide?
+- [ ] NMI-Adresse verifizieren (Savestate-Capture funktioniert?)
+- [ ] Performance: Ist der Byte-für-Byte-Dump schnell genug?
 
 ---
 

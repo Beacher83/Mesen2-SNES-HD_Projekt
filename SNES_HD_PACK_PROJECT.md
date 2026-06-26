@@ -784,32 +784,43 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 
 ---
 
-## Session-Status (17. Juni 2025)
+## Session-Status (26. Juni 2026)
 
-### Erledigt heute
+### Erledigt — VRAM-Dump-Pipeline Phase 2
 
-1. **GitHub Push erfolgreich** — 3 Commits auf `origin/main` gepusht:
-   - `885c867` — VBlank DMA frame 0 Injection in VRAM-Snapshot
-   - `a831c5d` — Auto-Injection bei Export (kein manuelles Refresh nötig)
-   - `c3e3045` — CHANGELOG.md hinzugefügt
-   - (+ `85c0b29` war bereits vorher gepusht: generisches DMA-Loading)
+1. **Lua-Script implementiert** (`dkc2_vram_dump.lua`):
+   - ROM-Analyse: scannt alle 192 Level-IDs → findet unique Gfxsets automatisch
+   - Interaktiver Dump: HUD-Overlay + F2-Tastendruck = VRAM/CGRAM/PPU/Savestate
+   - Level-ID-Erkennung aus WRAM $003E (auto-detect per ROM Pointer-Chain)
+   - NPC-Shop-Gfxsets als Hardcoded-Override
+   - Output-Dateien Viewer-Import-kompatibel
 
-2. **Analyse abgeschlossen** — VramCompare2 bestätigt:
-   - Level 2 VRAM-Dump matcht alle 5 LOADED-Hashes (statische Tiles 31+)
-   - MISS-Hashes stammen aus VBlank-Animations-State (Tiles 1-30)
-   - ROM frame 0 (0x3A5FC1) ≠ initialer Dump → bestätigt Timing-Unterschied
+2. **Architektur-Entscheidungen:**
+   - Kein Batch-Modus (zu komplex wegen `loadSavestate` Exec-Callback-Constraint)
+   - Stattdessen interaktiver Capture: User navigiert + F2 drückt
+   - ROM-Analyse ersetzt Hardcoded-Tabelle: Pointer-Chain-Lookup wie Viewer
+   - Savestate-Capture über NMI-Vector-Exec-Callback
 
-3. **Dokumentation auf aktuellem Stand** — alle hex/decimal-Korrekturen, Phase 4 vollständig
+### Nächste Schritte
 
-### Nächste Schritte (morgen)
+1. **Test auf Mesen-PC:**
+   - `git pull` → `dkc2_vram_dump.lua` laden
+   - Script Settings: "Allow I/O" aktivieren
+   - DKC2 ROM laden (mit 102% .srm Save für Level-Zugang)
+   - Verifizieren:
+     - [ ] ROM-Analyse: Gfxset-Count im Log prüfen
+     - [ ] WRAM $003E: zeigt HUD korrekte Level-ID/Name?
+     - [ ] F2-Dump: werden alle 4 Dateien korrekt geschrieben?
+     - [ ] Savestate: wird `gfxset_XX.savestate` gespeichert?
+   - Falls WRAM-Adresse falsch: `DisplayState.lua` nutzen um alle State-Keys
+     zu inspizieren und richtige Adresse finden
 
-1. **Test auf zweitem PC:**
-   - `git pull` im DKC2-HD-Tools Repo
-   - Viewer öffnen → bestehenden Container (Level 1 + Level 2) laden
-   - HD Pack exportieren → in Mesen laden → Level 2 (Mainbrace Mayhem) starten
-   - **Erwartetes Ergebnis:** HD-Tiles werden angezeigt (zumindest statische Tiles 31+)
-   - Pirate-Flag-Tiles (1-30) matchen nur während VBlank frame 0 → teilweises Flackern möglich
+2. **Nach erfolgreichem Test:**
+   - Alle Gfxsets durchdumpen (1x pro Gfxset navigieren + F2)
+   - VRAM-Dumps in Viewer importieren (Phase 3)
+   - Hash-Korrektheit für weitere Level verifizieren
 
-2. **Bei Erfolg:** Multi-Frame-Animation planen (alle N Frames der Pirate-Flag exportieren)
-
-3. **Bei Misserfolg:** Exported hashes.bin mit Mesen-Runtime-Hashes vergleichen (Debugger-Breakpoint in `ComputeTileContentHash`)
+3. **Spätere Erweiterungen:**
+   - Batch-Re-Dump-Modus (alle Savestates automatisch laden + dumpen)
+   - Tile-Level Hash-Caching (Performance-Optimierung, M5.11)
+   - Fog-Blend Feintuning (80/20 statt 75/25)
