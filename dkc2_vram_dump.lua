@@ -485,22 +485,32 @@ emu.addMemoryCallback(function(addr, val)
 end, emu.callbackType.exec, nmiAddr, nmiAddr, emu.cpuType.snes)
 
 ------------------------------------------------------------------------
--- Read current level from WRAM
+-- Read current GfxSet directly from WRAM $0539
+-- Verified 2026-06-29: $0539 = 0x07 in Pirate Panic, 0x25 in Mainbrace Mayhem
+-- ($003E was wrong — stores a different internal counter)
 ------------------------------------------------------------------------
-function readCurrentLevelId()
-  -- DKC2 stores current level ID at WRAM $003E
-  -- (variable: !RAM_DKC2_Global_CurrentLevelLo)
-  return emu.read(0x003E, emu.memType.snesWorkRam)
+function readCurrentGfxset()
+  local gfxId = emu.read(0x0539, emu.memType.snesWorkRam)
+  if gfxId == 0 or not allGfxsets[gfxId] then
+    return nil  -- title screen, menu, or unknown gfxset
+  end
+  return gfxId
 end
 
 ------------------------------------------------------------------------
 -- Perform the actual dump for a gfxset
 ------------------------------------------------------------------------
-function performDump(levelId, gfxset, ppuConfig, mapId)
+function performDump(gfxset)
   local prefix = string.format("%s\\gfxset_%02X", outputFolder, gfxset)
 
-  emu.log(string.format("--- Dumping GfxSet 0x%02X (Level: %s) ---",
-    gfxset, LEVEL_NAMES[levelId] or "?"))
+  -- Get ppuConfig/mapId via representative level from ROM scan
+  local info = allGfxsets[gfxset]
+  local repLevelId = info and info.representative or 0
+  local _, ppuConfig, mapId = lookupGfxsetFromRom(repLevelId)
+  local repName = LEVEL_NAMES[repLevelId] or "?"
+
+  emu.log(string.format("--- Dumping GfxSet 0x%02X (rep: %s) ---",
+    gfxset, repName))
 
   -- Dump VRAM (64KB)
   local vramOk = dumpMemoryToFile(prefix .. "_vram.bin", emu.memType.snesVideoRam)
@@ -519,7 +529,7 @@ function performDump(levelId, gfxset, ppuConfig, mapId)
   end
 
   -- Dump PPU state
-  local stateOk = dumpStateToFile(prefix .. "_state.txt", levelId, gfxset, ppuConfig, mapId)
+  local stateOk = dumpStateToFile(prefix .. "_state.txt", repLevelId, gfxset, ppuConfig, mapId)
   if stateOk then
     emu.log("  State: written -> gfxset_" .. string.format("%02X", gfxset) .. "_state.txt")
   end
@@ -565,15 +575,14 @@ end
 -- Main frame callback: HUD + key handling + dump logic
 ------------------------------------------------------------------------
 emu.addEventCallback(function()
-  -- Read current level
-  local levelId = readCurrentLevelId()
-  local gfxset, ppuConfig, mapId = lookupGfxsetFromRom(levelId)
-  local levelName = LEVEL_NAMES[levelId] or "?"
+  -- Read current gfxset directly from WRAM $0539
+  local gfxset = readCurrentGfxset()
+  local info = gfxset and allGfxsets[gfxset]
+  local repName = info and (LEVEL_NAMES[info.representative] or "?") or "N/A"
 
   -- Key edge detection (dump key)
   local keyDown = emu.isKeyPressed(DUMP_KEY)
   if keyDown and not keyWasDown then
-    -- Rising edge: trigger dump
     if gfxset then
       if dumpedGfxsets[gfxset] then
         lastMsg = string.format("GfxSet 0x%02X already dumped!", gfxset)
@@ -584,7 +593,7 @@ emu.addEventCallback(function()
         waitCounter = 0
       end
     else
-      lastMsg = "No gfxset detected (overworld?)"
+      lastMsg = "No gfxset detected (title/menu?)"
       lastMsgTimer = 180
       emu.displayMessage("DKC2", lastMsg)
     end
@@ -604,10 +613,9 @@ emu.addEventCallback(function()
     if waitCounter >= FRAMES_WAIT then
       dumpPending = false
       -- Re-read in case level changed during wait
-      levelId = readCurrentLevelId()
-      gfxset, ppuConfig, mapId = lookupGfxsetFromRom(levelId)
+      gfxset = readCurrentGfxset()
       if gfxset and not dumpedGfxsets[gfxset] then
-        performDump(levelId, gfxset, ppuConfig, mapId)
+        performDump(gfxset)
       end
     end
   end
@@ -627,19 +635,14 @@ emu.addEventCallback(function()
   emu.drawString(x, y, "DKC2 VRAM Dump", white, bgColor, 0, 1)
   y = y + 11
 
-  -- Current level
-  local lvlStr = string.format("Lvl: 0x%02X %s", levelId, levelName)
-  emu.drawString(x, y, lvlStr, yellow, bgColor, 0, 1)
-  y = y + 11
-
-  -- Current gfxset
+  -- Current gfxset + representative level name
   if gfxset then
     local gfxColor = dumpedGfxsets[gfxset] and green or orange
     local marker = dumpedGfxsets[gfxset] and " [DONE]" or ""
-    local gfxStr = string.format("Gfx: 0x%02X (%d)%s", gfxset, gfxset, marker)
+    local gfxStr = string.format("Gfx: 0x%02X — %s%s", gfxset, repName, marker)
     emu.drawString(x, y, gfxStr, gfxColor, bgColor, 0, 1)
   else
-    emu.drawString(x, y, "Gfx: N/A (overworld/menu)", gray, bgColor, 0, 1)
+    emu.drawString(x, y, "Gfx: N/A (title/menu/unknown)", gray, bgColor, 0, 1)
   end
   y = y + 11
 
