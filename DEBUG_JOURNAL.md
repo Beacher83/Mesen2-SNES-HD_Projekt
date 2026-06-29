@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-23 | Mesen Build: M5.10 (tested)
+Stand: 2026-06-29 | Mesen Build: M5.10 (tested) | VRAM-Dump-Pipeline: COMPLETE
 
 ---
 
@@ -670,26 +670,115 @@ Nur die HD-Grafiken (PNGs) ändern sich — die Hash-Seite bleibt stabil.
   funktioniert nur in Exec-Callbacks)
 
 **Level-ID-Erkennung:**
-- WRAM-Adresse `$003E` (`!RAM_DKC2_Global_CurrentLevelLo` aus p4plus2 Disassembly)
-- **NOCH NICHT VERIFIZIERT** — muss in-game getestet werden
-- Falls falsch: Adresse im Script anpassen (Zeile `readCurrentLevelId()`)
+- WRAM-Adresse `$003E` war **FALSCH** (zeigte 0x28 in Pirate Panic, 0x48 in Mainbrace Mayhem)
+- Korrekte Adresse: **`$0539`** — verifiziert 2026-06-29 per `dkc2_find_level_addr.lua`
+  - Pirate Panic (gfxset_07): `$0539 = 0x07` ✓
+  - Mainbrace Mayhem (gfxset_25): `$0539 = 0x25` ✓
+- Script wurde korrigiert: `readCurrentGfxset()` liest `$0539` direkt
+  (Commit `84eb8b66`)
 
 **Output pro Gfxset (im Script Data Folder):**
-- `gfxset_XX_vram.bin` — Viewer-Import-kompatibel
-- `gfxset_XX_cgram.bin` — Paletten-Daten
+- `gfxset_XX_vram.bin` — 65536 Bytes, Viewer-Import-kompatibel
+- `gfxset_XX_cgram.bin` — 512 Bytes Paletten-Daten
 - `gfxset_XX_state.txt` — PPU-Register + Metadaten
 - `gfxset_XX.savestate` — für zukünftiges Batch-Re-Dumping
 
 **Voraussetzungen:**
 - Mesen Script Settings: "Allow I/O" aktivieren
-- 102% Save-File (.srm) für Level-Zugang (oder Level-Select-Cheat)
+- Completionist SRM für Level-Zugang (siehe SRM/RGD-Fix unten)
 
-**Offene Punkte nach erstem Test:**
-- [ ] WRAM $003E verifizieren (zeigt HUD korrekte Level-ID?)
-- [ ] ROM-Analyse: wie viele unique Gfxsets werden gefunden?
-- [ ] Dump-Output prüfen: stimmt VRAM-Größe, sind Dateien valide?
-- [ ] NMI-Adresse verifizieren (Savestate-Capture funktioniert?)
-- [ ] Performance: Ist der Byte-für-Byte-Dump schnell genug?
+---
+
+### Phase 2 Ergebnis: 25 Gfxsets gedumpt (2026-06-29)
+
+**Dump-Ordner:** `C:\Users\beach\OneDrive\Dokumente\Mesen2\LuaScriptData\dkc2_vram_dump`
+
+**Alle 25 gedumpten Gfxsets:**
+
+| GfxSet | Level-Beispiel |
+|--------|----------------|
+| gfxset_02 | Worldmap (Krok) |
+| gfxset_03 | Worldmap (Krem Quay) |
+| gfxset_04 | Worldmap (Krazy Kremland) |
+| gfxset_07 | Pirate Panic |
+| gfxset_1D | Gusty Glade |
+| gfxset_1E | Castle Crush |
+| gfxset_20 | Krazy Kremland (Roller Coaster) |
+| gfxset_21 | Topsail Trouble |
+| gfxset_22 | Web Woods |
+| gfxset_24 | Lava Lagoon |
+| gfxset_25 | Mainbrace Mayhem |
+| gfxset_26 | Barrel Bayou |
+| gfxset_27 | Krow's Nest |
+| gfxset_28 | Hot Head Hop / Red Hot Ride |
+| gfxset_29 | Slime Climb (Note: Palette differs from gfxset_25, gleiche CHR) |
+| gfxset_2A | Rambi Rumble |
+| gfxset_2B | Bramble Scramble |
+| gfxset_2C | Snakey Chantey Bonus |
+| gfxset_2D | Slime Climb |
+| gfxset_2E | Hornet Hole |
+| gfxset_2F | Target Terror |
+| gfxset_30 | Klobber Karnage / Ghoul Galley |
+| gfxset_31 | Animal Barrel (Enguarde/Squawks) |
+| gfxset_33 | K. Rool's Keep Snowfields |
+| gfxset_34 | Krocodile Kore Boss |
+
+**Nicht dumpbar — NPC-Shops (kein Gfxset-Register):**
+- gfxset_08 Cranky's Hut, gfxset_09 Funky's, gfxset_0A Wrinkly's,
+  gfxset_0B Swanky's, gfxset_0C Klubba's Toll
+- `$0539 = 0` in diesen Screens — statische VRAM-Hintergründe, kein DMA-Gfxset
+
+**ROM-Phantom-Gfxsets (in ROM-Pointer-Tabelle, nie zur Laufzeit aktiv):**
+- `0x23`, `0x32` — erscheinen in ROM-Scan, `$0539` zeigt sie nie
+
+---
+
+### SRM/RGD-Fix (2026-06-28)
+
+**Problem:** Completionist-SRM wurde von Mesen ignoriert — Mesen lud stattdessen
+seinen eingebetteten Savestate aus der `.rgd`-Datei (`RecentGames/*.rgd`, ~1.8MB).
+
+**Root Cause:** `RecentGames\Donkey Kong Country 2 - Diddy's Kong Quest.rgd` enthielt
+einen eingebetteten Auto-Savestate, der bei jedem Start geladen wurde — überschrieb SRM.
+
+**Fix:**
+1. `.rgd` → `.rgd.bak` umbenannt (nicht löschen — Mesen erstellt neue .rgd nach erstem Start)
+2. Completionist-SRM nach `Mesen2\Saves\` kopiert
+3. Mesen neu starten → SRM wird geladen → alle Levels zugänglich
+
+**WICHTIG:** Wenn Mesen per Reset (statt Fenster-X) beendet wird, flusht es den
+In-Memory-SRAM auf die Disk und überschreibt die SRM. Immer Fenster schließen.
+
+---
+
+### Phase 3: Ground-Truth-Integration im Viewer (2026-06-29)
+
+**Ansatz:** Statt manuellem VRAM-Import pro Session, werden alle 25 Dumps direkt
+im Viewer hardecodiert als JavaScript-Konstante.
+
+**Dateien:**
+- `C:\DEV Claude\DKC2-HD-Tools\generate_vram_groundtruth.py`
+  - Liest alle `gfxset_XX_vram.bin` (je 65536B) aus dem Dump-Ordner
+  - Base64-kodiert jeden Dump, schreibt `vram_groundtruth.js`
+  - Re-run nötig wenn neue Dumps hinzukommen: `python generate_vram_groundtruth.py`
+- `C:\DEV Claude\DKC2-HD-Tools\dkc2-viewer\vram_groundtruth.js` (auto-generiert)
+  - `const VRAM_GROUND_TRUTH = { "gfxset_07": "<base64>", ... };`
+  - 25 Gfxsets × 64KB = ~2.1MB base64
+  - **Nicht manuell bearbeiten** — immer per Python neu generieren
+
+**Viewer-Integration (Commit `882f23a`):**
+- `index.html`: `<script src="vram_groundtruth.js"></script>` eingebunden
+- `_b64ToUint8Array(b64)` — Hilfsfunktion (Base64 → Uint8Array, file://-kompatibel)
+- `applyGroundTruthVram(sets)` — iteriert alle Container-Sets, setzt `vramSnapshot`
+  aus VRAM_GROUND_TRUTH wenn kein manueller Snapshot vorhanden
+- Hook in `loadContainerToHDPack()` → `applyGroundTruthVram(sets)` nach `hdGetContainerSets()`
+- Safety-Fallback in `exportAsTexturePack()` vor `if (set.vramSnapshot)` Block
+
+**Workflow jetzt:**
+```
+Viewer öffnen → Container laden → vramSnapshot auto-apply aus Ground-Truth
+→ "Texture Pack" exportieren → Hashes stimmen ohne manuelle VRAM-Dumps
+```
 
 ---
 

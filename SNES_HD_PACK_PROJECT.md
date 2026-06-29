@@ -6,8 +6,33 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Stand: 2026-06-15**  
-**VRAM Dump/Import System implementiert — bereit zum Testen.**
+**Stand: 2026-06-29**  
+**VRAM-Dump-Pipeline COMPLETE. 25 Gfxsets in Viewer als Ground-Truth eingebettet.**
+
+### VRAM-Dump-Pipeline Zusammenfassung (abgeschlossen 2026-06-29)
+
+Alle 3 Phasen abgeschlossen:
+
+**Phase 1 (Savestates für Level-Zugang):** Ersetzt durch SRM/RGD-Fix.
+- Completionist-SRM importiert; `.rgd`-Auto-Savestate-Datei deaktiviert (→ `.rgd.bak`)
+- Alle 25 spielbaren Gfxsets damit zugänglich
+
+**Phase 2 (Lua-Script Dumps):** COMPLETE — Commit `84eb8b66`
+- `dkc2_vram_dump.lua`: interaktiver Dump-Modus, F2=Dump, F3=Status
+- Korrekte WRAM-Adresse gefunden: `$0539` (nicht `$003E`)
+  — via `dkc2_find_level_addr.lua` WRAM-Scanner
+- 25 Gfxsets erfolgreich gedumpt (je 65536 Bytes)
+- 5 NPC-Shops (0x08–0x0C) nicht dumpbar (kein Gfxset-Register, statische Hintergründe)
+
+**Phase 3 (Viewer Ground-Truth-Integration):** COMPLETE — Commit `882f23a`
+- `generate_vram_groundtruth.py` → `vram_groundtruth.js` (25 Dumps base64-eingebettet)
+- Viewer wendet Snapshots automatisch an (`applyGroundTruthVram()`)
+- Kein manueller VRAM-Import mehr nötig
+
+**Nächste Schritte:**
+1. User generiert neues HD Pack aus Viewer (Level 1+2 Tiles aus Container)
+2. Verify: PNG-Dateinamen + Hashes sehen korrekt aus (chrBase, VRAM-Adressen)
+3. Neue HD Level-Grafiken in Container einfügen → Test in Mesen
 
 ### VRAM Dump/Import Feature (2026-06-15)
 
