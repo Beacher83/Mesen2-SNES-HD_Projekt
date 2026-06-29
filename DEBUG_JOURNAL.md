@@ -12,6 +12,9 @@ Stand: 2026-06-29 | Mesen Build: M5.10 (tested) | VRAM-Dump-Pipeline: COMPLETE
 | B | BG1/BG2 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | M5.10: BG1+BG2 OK, fog etwas zu dunkel | M5.2 | M5.10: BG1+BG2 sichtbar, fog 75/25 noch zu dunkel |
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
 | D | Performance Level 1 leicht schlechter | OFFEN — Optimierung geplant | M5.10 | M5.10: spielbar aber spürbar |
+| E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | NEU — kein Fix | 2026-06-29 | Erste Beobachtung |
+| F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | NEU — Known Limitation (wie Piratenflagge) | 2026-06-29 | Erste Beobachtung |
+| G | Lockjaw's Locker: BG2 Sub-Screen + HDMA-Scroll-Effekt | NEU — Viewer-Limitation, Laufzeit OK | 2026-06-29 | Erste Beobachtung |
 
 ---
 
@@ -779,6 +782,112 @@ im Viewer hardecodiert als JavaScript-Konstante.
 Viewer öffnen → Container laden → vramSnapshot auto-apply aus Ground-Truth
 → "Texture Pack" exportieren → Hashes stimmen ohne manuelle VRAM-Dumps
 ```
+
+---
+
+## Issue E: Hot-Head Hop — Lava-Glow Color Math (2026-06-29)
+
+### Symptom
+- Ca. 1/5 des Bildschirms: kein HD tile angezeigt, nur nativer Pixel
+- Die anderen 4/5: HD BG1 tiles korrekt — aber OHNE den Lava-Glow-Effekt (falsch)
+- Der Effekt betrifft im Original alle BG1 tiles im Level
+
+### PPU-Konfiguration (aus gfxset_20_state.txt)
+```
+bgMode = 1
+colorMathEnabled    = 6     → Bit1+Bit2 → BG2+BG3 Color Math aktiv
+colorMathSubtractMode = true → SUBTRACT (nicht ADD wie Level 2 Nebel!)
+colorMathAddSubscreen = false → Fixed Color (kein Sub-Screen)
+fixedColor          = 4228  → RGB(4,4,4) ≈ sehr dunkel
+subScreenLayers     = 0     → kein Sub-Screen
+mainScreenLayers    = 23    → BG1+BG2+BG3+OBJ alle auf Main Screen
+```
+
+### Ursache
+DKC2 Hot-Head Hop simuliert das Lava-Glühen über:
+1. **BG3** auf Main Screen als animierter Heat-Haze-Overlay (ca. 1/5 Bildschirm)
+2. **Color Math subtract** mit dunkel-fixedColor auf BG3 (leichtes Dimming)
+3. **HDMA** ändert `fixedColor` pro Scanline → erstellt den animierten Pulseffekt
+
+Mesen HD-Filter-Verhalten:
+- Wo BG3 den Pixel "gewinnt": kein BG3 im Pack (user-deleted) → native Pixel (kein HD)
+- Wo BG1 gewinnt: BG1 HD tile angezeigt, aber ohne BG3 subtract-Blend → zu hell/unverändert
+
+### Unterschied zu Level 2 Nebel (M5.9/M5.10)
+| | Level 2 Nebel | Hot-Head Hop Lava-Glow |
+|--|---------------|------------------------|
+| Modus | addSubscreen (BG3 + Sub) | fixedColor subtract |
+| Sub-Screen | BG1 auf Sub | kein Sub-Screen |
+| HDMA | keiner (statischer Nebel) | fixedColor per Scanline animiert |
+| Fix | M5.9: fog-blend Fallback | noch kein Fix |
+
+### Fix-Ansatz
+Ähnlich M5.9 aber für subtract-Modus:
+1. Wenn BG3-Pixel gewinnt und kein BG3-HD-Tile: Fallback auf BG1-HD-Tile
+2. Subtract-Color-Math auf HD-Tile anwenden: `HD_color - fixedColor`
+3. HDMA-Problem: fixedColor ändert sich per Scanline → bei Render-Zeit lesen
+
+Komplexität: HDMA-Werte müssten per Scanline gespeichert und beim HD-Blend angewendet werden.
+**Status: OFFEN / geparkt**
+
+---
+
+## Issue F: Hot-Head Hop — Bubble-Animation Frame-Mismatch (2026-06-29)
+
+### Symptom
+- Animierte Blasen (Luftblasen, aufsteigend) erscheinen nur wenn Animation-Frame = Dump-Frame
+- Andere Frames: native Pixel (falsche/keine Bubbles)
+- Außerdem: dunklerer Rahmen um das HD-Tile (visueller Mismatch zur native Version)
+
+### Ursache
+Identisch mit Level 2 Piratenflagge:
+- VBlank-DMA schreibt Bubble-Tiles in VRAM jeden Frame neu
+- VRAM-Dump erfasst nur einen Frame → nur dieser Frame matched
+- Darker border: vermutlich ein Zeichenfehler im HD-Asset (kein System-Bug)
+
+### Status
+Known Limitation — gleicher Root Cause wie Piratenflagge (Multi-Frame-Animation).
+Mögliche Langzeitlösung: Alle Animations-Frames dumpen und als separate HD-Tiles einbinden.
+
+---
+
+## Issue G: Lockjaw's Locker — Sub-Screen BG2 + HDMA-Parallax (2026-06-29)
+
+### Symptom
+- BG2 (Hintergrund) zeigt "Fill-Tiles" (Kacheln wirken zu flach/falsch)
+- Kein echter 3D-Tiefeneffekt wie im Original
+- Fehler auch im Viewer sichtbar (kein Laufzeit-spezifisches Problem)
+
+### PPU-Konfiguration (aus gfxset_28_state.txt)
+```
+bgMode              = 1
+mainScreenLayers    = 4  → nur BG3 auf Main Screen
+subScreenLayers     = 19 → BG1, BG2, OBJ auf Sub Screen
+colorMathEnabled    = 36 → Bit2+Bit5 → BG3 + Backdrop Color Math aktiv
+colorMathSubtractMode = true → subtract
+colorMathAddSubscreen = true → Sub-Screen-Mischung (nicht fixedColor)
+fixedColor          = 0
+window[0].activeLayers[2] = true, invertedLayers[2] = true → BG3 nur außerhalb Window 0
+```
+
+### Architektur
+- BG3 = Unterwasser-Tint-Overlay (Main Screen, mit Window geclippt)
+- BG1 = Spielfiguren / Vordergrund (Sub Screen)
+- BG2 = Hintergrund-Tiles (Sub Screen, chrBase=$4000, Tilemap $7000)
+- Color Math: BG3 - Sub(BG1/BG2/OBJ) pro Pixel
+
+### Warum Fill-Tiles
+1. **Viewer zeigt kein HDMA**: BG2 nutzt HDMA-Scroll (Scroll ändert sich pro Scanline → Parallax/Wellen-Effekt). Viewer zeigt statischen Flat-Tilestrip.
+2. **Viele identische Tiles**: Unterwasser-Hintergrund besteht aus vielen gleichen Tiles (gleiches VRAM-Byte-Pattern → gleicher Hash → ein PNG). Im Viewer: wiederholtes Kacheln.
+3. **Laufzeit**: Mesen wendet HDMA korrekt an → echte Parallax-Optik vorhanden.
+
+### HD-Tile-Darstellung in Mesen
+- Sub-Screen support (`b41b1697`: `drawMain || drawSub`) müsste BG2 HD tiles ermöglichen
+- Color Math: BG3_color - BG2_HD_color → BG2 HD tile beeinflusst Endfarbe korrekt
+- **Laufzeit-Test ausstehend**: Ob Fill-Tiles auch in Mesen sichtbar sind oder nur im Viewer
+
+### Status
+OFFEN — Viewer-Limitation wahrscheinlich. Laufzeit-Verhalten unklar bis getestet.
 
 ---
 
