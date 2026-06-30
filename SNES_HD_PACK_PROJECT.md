@@ -855,28 +855,23 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 - Phase 2 (`84eb8b66`): `dkc2_vram_dump.lua` — 25 Gfxsets gedumpt (WRAM `$0539`)
 - Phase 3 (`882f23a`): Ground-Truth direkt im Viewer eingebettet — kein manueller Import mehr
 
-**M5.11 — Color Math Delta + Fog-Blend 80/20 (2026-06-30, `8f7769fb`)**
-- `SnesHdVideoFilter.cpp`: Winner Color Math Delta (pre/post-math PPU-Delta → HD-Pixel)
-  — erfasst HDMA-animierte Lava-Glow-Effekte (Hot-Head Hop) automatisch für add+subtract
-- Fog-Blend-Gewichtung: 75/25 → **80/20** (Level 2 Nebel war zu dunkel)
-- Neuer Diagnostic Counter: `cmDelta`
-- Issue G (Lockjaw's Locker): Laufzeit OK, nur 3D-Parallax fehlt (Viewer-Export-Limitation)
+**M5.11 — Color Math Delta + Fog-Blend 80/20 (`8f7769fb`) — VERIFIED ✓**
+- Winner Color Math Delta: PPU pre/post-math Delta auf HD-Pixel → Lava-Glow sichtbar ✓
+- Fog-Blend: 75/25 → 80/20; `cmDelta` Counter
+
+**M5.12 — Issue H Fix: BG3 Background Fallback (`c0ccaa7e`) — Test ausstehend**
+- Neues Frame-Flag `frameHasBg1ColorMath`: true wenn BG1 jemals mit AllowColorMath gewinnt
+- Neuer Fallback-Pfad (4): BG3 gewinnt OHNE Color Math + Flag true → BG1/BG2 HD Tile plain
+- Sicher: Pirate Panic + Level-2-Fog haben BG1 color math nie → Flag bleibt false
+- ROM-Recherche: alle 44 DKC2 ppuConfig-Einträge analysiert und validiert
+- `bgFb` Diagnostic Counter
 
 ### Nächste Schritte
 
-1. **M5.11 testen** — Build + DKC2 Hot-Head Hop laden
-   - `cmDelta` Counter im Diag-Log: sollte > 0 sein (Color-Math-Pixel erkannt)
-   - Obere 4/5 des Screens: HD-Tiles mit Lava-Glow-Effekt (subtract delta sichtbar)?
-   - Level 2 Fog-Helligkeit: 80/20 besser als 75/25?
+1. **M5.12 testen** — Hot-Head Hop: `bgFb > 0`? Unteres Fünftel mit HD-Tiles?
+   - Regression-Check: Pirate Panic BG3-Taue sichtbar? Level-2-Fog 80/20 OK?
 
-2. **Issue H analysieren** — Unteres ~1/5 Hot-Head Hop ohne HD-Tiles
-   - HDMA-Tabellen für `$2131` (ColorMathSelectAndEnable) per Scanline auswerten
-   - Unterscheidungskriterium finden: BG3 Vordergrund (Pirate Panic) vs Hintergrund (Hot-Head Hop)
-   - Fix: Fog-Blend-Gate `winLayer == 2` um Level-Typ-Erkennung erweitern
+2. **Erste echte HD-Grafiken** — Container im Viewer befüllen → Export → Test in Mesen
 
-3. **Erste echte HD-Grafiken** — Container im Viewer befüllen + exportieren
-   - Level 1 (gfxset_07): gfxset_07 Ground-Truth bereits im Viewer → Export testen
-   - Verify: PNG-Dateinamen, Hashes, chrBase-Adressen korrekt?
-
-4. **Performance Level 1 (Issue D)** — Tile-Level Caching (M5.12)
+3. **Performance Level 1 (Issue D, M5.13)** — Tile-Level Caching
    - `GetMatchingTile()` wird 64× pro Tile aufgerufen → 1× cachen und 8px verwenden
