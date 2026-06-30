@@ -868,7 +868,7 @@ HD_output = HD_pixel + delta  (clamped 0-255)
 
 Hot-Head Hop: kein BG2 exportiert im Viewer, BG3 = Hintergrund-Lava.
 
-### Hypothese
+### Initiale Hypothese (WIDERLEGT durch M5.12 Test — siehe unten)
 SNES Mode 1 Tile-Prioritäten:
 ```
 BG1 Priority 1 (hoch)  →  über BG3  → Stalaktiten → HD ✓
@@ -908,7 +908,7 @@ BG3 BACKGROUND: BG3_on_main && BG1_on_main   (19 Konfigurationen)
 **Aber:** $212C allein reicht nicht! Pirate Panic und Hot-Head Hop haben identischen
 $212C=$17. Unterscheidung gelingt über **BG1 Color Math Detection:**
 
-### Fix: M5.12 — `frameHasBg1ColorMath` Progressive Detection
+### Fix: M5.12 — `frameHasBg1ColorMath` Progressive Detection (hat Issue H NICHT gelöst)
 
 **Ansatz:** Frame-Level Flag das prüft ob BG1 jemals `AllowColorMath` hatte.
 

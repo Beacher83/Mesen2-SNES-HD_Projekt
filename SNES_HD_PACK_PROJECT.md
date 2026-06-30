@@ -56,11 +56,10 @@ den Subtract-Effekt korrekt. Issue E obere 4/5: GELÖST.
   zu dunkel bei 75/25).
 - **Diagnostik:** `cmDelta` Counter in Frame-Summary für Color-Math-Delta-Tracking.
 
-**Offene Issues:**
-- **Issue H (NEU):** Unteres ~1/5 von Hot-Head Hop zeigt keine HD-Tiles. Ursache:
-  BG3 gewinnt Compositing für BG1-Priority-0-Tiles, HDMA schaltet BG3 Color Math
-  dort ab → Fog-Blend-Gate blockiert Fallback. Braucht Level-Typ-Unterscheidung
-  (BG3 Vordergrund vs Hintergrund).
+**Offene Issues (Stand M5.11 — teilweise durch M5.12/M5.13 überholt):**
+- **Issue H (NEU):** Unteres ~1/5 von Hot-Head Hop zeigt keine HD-Tiles.
+  ~~Ursache: BG3 gewinnt Compositing~~ → Wahre Ursache: Layer Index Mismatch
+  (BG2 runtime ≠ BG1 in pack). Fix: M5.13 Layer-Agnostic Retry.
 - **Issue G Update:** Lockjaw's Locker Laufzeit grundsätzlich OK, nur 3D-Parallax-
   Hintergrund fehlt (Viewer-Export-Limitation, kein Code-Fix nötig).
 
@@ -873,28 +872,33 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 - Phase 2 (`84eb8b66`): `dkc2_vram_dump.lua` — 25 Gfxsets gedumpt (WRAM `$0539`)
 - Phase 3 (`882f23a`): Ground-Truth direkt im Viewer eingebettet — kein manueller Import mehr
 
-**M5.11 — Color Math Delta + Fog-Blend 80/20 (`8f7769fb`) — VERIFIED ✓**
+**M5.11 — Color Math Delta + Fog-Blend 80/20 (2026-06-30, `8f7769fb`) — VERIFIED ✓**
 - Winner Color Math Delta: PPU pre/post-math Delta auf HD-Pixel → Lava-Glow sichtbar ✓
 - Fog-Blend: 75/25 → 80/20; `cmDelta` Counter
+- Issue E (Lava-Glow): GELÖST
 
-**M5.12 — BG3 Background Fallback (`c0ccaa7e`) — Test-Ergebnis: bgFb=0**
-- Hypothese (BG3 gewinnt Compositing) war falsch
-- Echter Root Cause: `layerMis=13573` — Layer Index Mismatch (BG2 runtime, BG1 im Pack)
-- Positive Seiteneffekte: Pirate Panic Wasser blau-grün ✓, Hot-Head Hop Bubble-Rahmen weg ✓
+**M5.12 — BG3 Background Fallback (2026-06-30, `c0ccaa7e`) — GETESTET**
+- `frameHasBg1ColorMath` Flag + BG3-Background-Fallback-Pfad (4)
+- ROM-Recherche: alle 44 DKC2 ppuConfig-Einträge analysiert und validiert
+- **Test-Ergebnis:** `bgFb=0` — Hypothese war falsch (BG3 gewinnt nicht im unteren Bereich)
+- Wahre Root Cause entdeckt: **Layer Index Mismatch** (BG2 runtime ≠ BG1 in Pack)
+- Positive Seiteneffekte: Pirate Panic BG2 Wasser blau-grün, Bubbles-Rahmen weg
 
-**M5.13 — Layer-Agnostic Retry BG1↔BG2 (`48c2d957`) — Test ausstehend**
-- Fix: Nach jedem fehlgeschlagenen BG1/BG2-Lookup → Retry mit anderem Layer-Index
-- BG1↔BG2 beide 4bpp in Mode 1 → visuell identisch; BG3 (2bpp) ausgeschlossen
-- Retry in allen 4 Lookup-Pfaden: Winner, Fallback-Loop, Fog-Blend, BG3-BG-Fallback
+**M5.13 — Layer-Agnostic Retry BG1↔BG2 (2026-06-30, `48c2d957`) — Test ausstehend**
+- Bei fehlgeschlagenem Lookup für BG1/BG2: Retry mit anderem Layer-Index
+- In allen 4 Lookup-Pfaden: Winner, Fallback-Loop, Fog-Blend, BG3-Bg-Fallback
 - `lRetry` Diagnostic Counter
-- Erwartung: `layerMis → 0`, `lRetry → ~13573`, unteres Fünftel HD-Tiles sichtbar
+- Erwartet: `layerMis` → ~0, `lRetry` → ~13573, unteres Fünftel HD ✓
 
 ### Nächste Schritte
 
-1. **M5.13 testen** — Hot-Head Hop: `lRetry ≈ 13573`? `layerMis ≈ 0`? Unteres Fünftel OK?
-   - Regression-Check: Pirate Panic BG3-Taue sichtbar? Level-2-Fog 80/20 OK?
+1. **M5.13 testen** — Build + DKC2 Hot-Head Hop laden
+   - `lRetry` Counter im Diag-Log: sollte ~13573 sein (Layer-Retry-Pixel)
+   - `layerMis` Counter: sollte ~0 sein (alle Mismatches aufgelöst)
+   - Unteres Fünftel: HD-Tiles sichtbar?
+   - Pirate Panic + Level 2: unverändert (Regression-Check)?
 
 2. **Erste echte HD-Grafiken** — Container im Viewer befüllen → Export → Test in Mesen
 
-3. **Performance Level 1 (Issue D, M5.14)** — Tile-Level Caching
+3. **Performance Level 1 (Issue D)** — Tile-Level Caching
    - `GetMatchingTile()` wird 64× pro Tile aufgerufen → 1× cachen und 8px verwenden
