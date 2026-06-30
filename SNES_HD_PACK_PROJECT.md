@@ -877,31 +877,24 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 - Winner Color Math Delta: PPU pre/post-math Delta auf HD-Pixel → Lava-Glow sichtbar ✓
 - Fog-Blend: 75/25 → 80/20; `cmDelta` Counter
 
-**M5.12 — Issue H Fix: BG3 Background Fallback (`c0ccaa7e`) — Test ausstehend**
-- Neues Frame-Flag `frameHasBg1ColorMath`: true wenn BG1 jemals mit AllowColorMath gewinnt
-- Neuer Fallback-Pfad (4): BG3 gewinnt OHNE Color Math + Flag true → BG1/BG2 HD Tile plain
-- Sicher: Pirate Panic + Level-2-Fog haben BG1 color math nie → Flag bleibt false
-- ROM-Recherche: alle 44 DKC2 ppuConfig-Einträge analysiert und validiert
-- `bgFb` Diagnostic Counter
+**M5.12 — BG3 Background Fallback (`c0ccaa7e`) — Test-Ergebnis: bgFb=0**
+- Hypothese (BG3 gewinnt Compositing) war falsch
+- Echter Root Cause: `layerMis=13573` — Layer Index Mismatch (BG2 runtime, BG1 im Pack)
+- Positive Seiteneffekte: Pirate Panic Wasser blau-grün ✓, Hot-Head Hop Bubble-Rahmen weg ✓
 
-**M5.12 — BG3 Background Fallback (2026-06-30, `c0ccaa7e`)**
-- `frameHasBg1ColorMath` Flag + BG3-Background-Fallback-Pfad
-- Test-Ergebnis: bgFb=0 (falsche Hypothese), aber positive Seiteneffekte
-- Pirate Panic BG2 Wasser blau-grün (Color Math Delta wirkt auf BG2)
-- Hot-Head Hop Bubbles: Dunkler Rahmen weg
+**M5.13 — Layer-Agnostic Retry BG1↔BG2 (`48c2d957`) — Test ausstehend**
+- Fix: Nach jedem fehlgeschlagenen BG1/BG2-Lookup → Retry mit anderem Layer-Index
+- BG1↔BG2 beide 4bpp in Mode 1 → visuell identisch; BG3 (2bpp) ausgeschlossen
+- Retry in allen 4 Lookup-Pfaden: Winner, Fallback-Loop, Fog-Blend, BG3-BG-Fallback
+- `lRetry` Diagnostic Counter
+- Erwartung: `layerMis → 0`, `lRetry → ~13573`, unteres Fünftel HD-Tiles sichtbar
 
 ### Nächste Schritte
 
-1. **M5.13 testen** — Build + DKC2 Hot-Head Hop laden
-   - `lRetry` Counter im Diag-Log: sollte ~13573 sein (Layer-Retry-Pixel)
-   - `layerMis` Counter: sollte ~0 sein (alle Mismatches aufgelöst)
-   - Unteres Fünftel: HD-Tiles sichtbar?
-   - Pirate Panic + Level 2: unverändert?
+1. **M5.13 testen** — Hot-Head Hop: `lRetry ≈ 13573`? `layerMis ≈ 0`? Unteres Fünftel OK?
+   - Regression-Check: Pirate Panic BG3-Taue sichtbar? Level-2-Fog 80/20 OK?
 
-2. **Fog-Blend-Gewichtung** — 80/20 macht Übergang sichtbarer
-   - Ggf. zurück zu 75/25 oder Zwischenwert testen
+2. **Erste echte HD-Grafiken** — Container im Viewer befüllen → Export → Test in Mesen
 
-3. **Erste echte HD-Grafiken** — Container im Viewer befüllen → Export → Test in Mesen
-
-3. **Performance Level 1 (Issue D, M5.13)** — Tile-Level Caching
+3. **Performance Level 1 (Issue D, M5.14)** — Tile-Level Caching
    - `GetMatchingTile()` wird 64× pro Tile aufgerufen → 1× cachen und 8px verwenden
