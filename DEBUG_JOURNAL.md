@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-30 | Mesen Build: M5.13 (untested) | VRAM-Dump-Pipeline: COMPLETE
+Stand: 2026-07-01 | Mesen Build: M5.14 (untested) | VRAM-Dump-Pipeline: COMPLETE
 
 ---
 
@@ -15,7 +15,7 @@ Stand: 2026-06-30 | Mesen Build: M5.13 (untested) | VRAM-Dump-Pipeline: COMPLETE
 | E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | M5.11: VERIFIED ✓ — Lava-Glow auf HD Tiles sichtbar | 2026-06-29 | M5.11 OK |
 | F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | Known Limitation (wie Piratenflagge) | 2026-06-29 | Erste Beobachtung |
 | G | Lockjaw's Locker: BG2 Sub-Screen + HDMA-Scroll-Effekt | Viewer-Limitation, Laufzeit teilweise OK (3D-Hintergrund fehlt) | 2026-06-29 | Erste Beobachtung |
-| H | Hot-Head Hop: Unteres Fünftel — Layer Index Mismatch (BG2 runtime, BG1 in pack) | M5.13: Layer-agnostic retry BG1↔BG2 — Test ausstehend | 2026-06-30 | M5.12: frameHasBg1ColorMath allein reicht nicht (bgFb=0) |
+| H | Hot-Head Hop: Unteres Fünftel — Layer Index Mismatch (BG2 runtime, BG1 in pack) | M5.13: Layer-agnostic retry — M5.14: Fallback-Retry entfernt (Bubble-Regression) | 2026-06-30 | M5.13: unteres 1/5 HD ✓, aber Blasen-Löcher im oberen Bereich |
 
 ---
 
@@ -1012,6 +1012,67 @@ hdTile = GetMatchingTile(altKey, Vram)
 
 **Erwartung:** `layerMis` Zähler sinkt auf ~0, `lRetry` steigt auf ~13573.
 Unteres Fünftel zeigt HD Tiles. Pirate Panic + Level 2 unverändert.
+
+### M5.13 Test-Ergebnis (2026-07-01)
+
+**Ergebnis:** Unteres 1/5 zeigt HD-Tiles ✓ — Layer-Retry hat funktioniert.
+```
+layerMis=0  lRetry≈26600  notInPack≈666  BG1miss=0  BG1notInPack=0
+```
+
+**ABER: Neue Regression entdeckt — Lava-Blasen im oberen Bereich als "Löcher"**
+
+- Oberer Bereich: Blasen-Positionen zeigen Level-Hintergrund statt Blasen-Animation
+- Unterer 1/5 Bereich: Blasen rendern korrekt als native Pixels
+- Gelegentlich ein HD-Frame sichtbar (der dem statischen Export entspricht)
+- Identisches Phänomen wie Issue F (Piratenflagge in Level 2)
+
+**Root Cause Analyse:**
+
+M5.13 hat Layer-Retry auch im Fallback-Loop (Schritt 2, Zeilen 322-327) eingebaut.
+Ablauf bei DMA-Blasen-Pixel im oberen Bereich:
+
+1. BG2 DMA-Blase gewinnt → Hash einzigartig (DMA) → kein Match
+2. Layer-Retry auf Winner → gleicher Hash, anderer Layer → kein Match
+3. Fallback-Loop: versucht BG1 (i=0) → BG1 hat Tile-Daten an Lava-Position
+4. BG1 direkt → z.B. mit layer=0 exportiert → kein Match
+5. **Fallback Layer-Retry: BG1 mit layer=1 → MATCH!** (BG1-Tile war als BG2 exportiert)
+6. Rendert BG1s statisches HD-Tile an Blasen-Position → "Loch" im Lava-Bereich
+
+**Warum unteres 1/5 nicht betroffen:**
+Dort gewinnt BG3 → Pfade 3/4 (Fog-Blend / BG3-Bg-Fallback). Diese haben keinen
+generischen Fallback-Loop. BG1 hat dort keine Tile-Daten (mask bit not set).
+
+**Warum M5.12 nicht betroffen war:**
+M5.12 hatte keinen Layer-Retry im Fallback-Loop. BG1 an Lava-Positionen matchte
+nicht direkt (layer=0 ≠ layer=1 im Pack) → native Rendering → Blasen sichtbar.
+
+### Fix: M5.14 — Layer-Retry aus Fallback-Loop entfernt
+
+**Änderung:** 6 Zeilen Layer-Retry im Fallback-Loop (Schritt 2) auskommentiert.
+Layer-Retry bleibt NUR im Winner-Lookup (Schritt 1b) und in den BG3-Pfaden (3/4).
+
+**Rationale:**
+- Fallback-Loop versucht ANDERE Layer als den Winner
+- Layer-Retry im Fallback erzeugt doppelte Indirektion: falscher Layer + falscher Index
+- Dies matched vollständig unrelated Tiles (BG1-Hintergrund statt BG2-DMA-Blase)
+- Ohne Retry: Fallback nur bei exaktem Layer-Index-Match (selten, weniger schädlich)
+
+**Code (`SnesHdVideoFilter.cpp` Zeilen ~322-335):**
+```cpp
+// REMOVED (M5.14): Layer retry was here but caused bubble regression.
+// The commented-out code can be restored if needed. See comment in source.
+```
+
+**Erwartung:**
+- Blasen im oberen Bereich: native Rendering (wie M5.12) ✓
+- Unteres 1/5: weiterhin HD (Layer-Retry in Schritt 1b unverändert) ✓
+- Level 2 Fog: unverändert ✓
+- Pirate Panic: unverändert ✓
+- `lRetry` Counter sinkt leicht (nur noch Winner + Pfade 3/4 zählen)
+
+**Revert-Anleitung:** Kommentierte Zeilen in Schritt 2 wieder einkommentieren
+(4 Zeilen ab "if(!hdTile && (i == 0 || i == 1))").
 
 ---
 

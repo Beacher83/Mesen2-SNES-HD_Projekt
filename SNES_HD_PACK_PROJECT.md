@@ -6,8 +6,27 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Stand: 2026-06-30**  
-**Build M5.13 — Issue H Fix (Layer-Agnostic Retry BG1↔BG2). Test ausstehend.**
+**Stand: 2026-07-01**  
+**Build M5.14 — Bubble-Regression Fix (Fallback-Loop Layer-Retry entfernt). Test ausstehend.**
+
+### M5.14 Session (2026-07-01)
+
+**M5.13 Test-Ergebnis:** Layer-Retry hat unteres 1/5 HD-Tiles erfolgreich repariert
+(`layerMis=0`, `lRetry≈26600`). ABER neue Regression: Lava-Blasen im oberen Bereich
+zeigen "Löcher" (Level-Hintergrund sichtbar statt DMA-Blasen-Animation).
+
+**Root Cause:** Layer-Retry im Fallback-Loop (Schritt 2) fand BG1-HD-Tiles an
+Blasen-Positionen, wo BG2-DMA-Blasen hätten nativ gerendert werden sollen.
+Doppelte Indirektion (falscher Layer + falscher Index) matchte unrelated Tiles.
+
+**M5.14 Fix:** Layer-Retry aus Fallback-Loop entfernt (6 Zeilen auskommentiert).
+Retry bleibt im Winner-Lookup (Schritt 1b) und BG3-Pfaden (3/4).
+Code enthält kommentierte Revert-Zeilen für schnelle Wiederherstellung.
+
+**Bekannte Limitation bestätigt:** DMA-animierte Bubbles sind identisch zu
+Piratenflagge (Issue F) — nur der eine Frame, der dem Export entspricht, zeigt HD.
+Alle anderen Frames: native Rendering. Kein Code-Bug, sondern fundamentale
+Limitation von statischen HD-Packs bei DMA-animierten Inhalten.
 
 ### M5.13 Session (2026-06-30)
 

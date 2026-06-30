@@ -12,7 +12,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.13"
+#define SNES_HD_BUILD_VERSION "M5.14"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -317,14 +317,22 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				for(int i = 0; i < 4; i++) {
 					if(i == (int)winLayer) continue;
 					if(pixelInfo.BgLayerMask & (1 << i)) {
-						hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[i].Key, hdScreen->Vram);
-						// Layer retry for 4bpp fallback layers (M5.13)
-						if(!hdTile && (i == 0 || i == 1)) {
-							SnesHdTileKey altKey = pixelInfo.BgTiles[i].Key;
-							altKey.LayerIndex = (i == 0) ? 1 : 0;
-							hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-							if(hdTile) frameLayerRetry++;
-						}
+			hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[i].Key, hdScreen->Vram);
+						// NOTE (M5.14): Layer retry REMOVED from fallback loop.
+						// M5.13 added BG1↔BG2 retry here, but this caused a
+						// regression: when BG2's DMA-animated bubble tile had no
+						// match, the fallback tried BG1 with layer retry and found
+						// BG1's static HD tile — rendering BG1 content instead of
+						// native DMA bubbles. This created visible "holes" in the
+						// lava where the level background showed through.
+						// Layer retry remains in step 1b (winner tile only).
+						// To restore: uncomment the 4 lines below.
+						// if(!hdTile && (i == 0 || i == 1)) {
+						// 	SnesHdTileKey altKey = pixelInfo.BgTiles[i].Key;
+						// 	altKey.LayerIndex = (i == 0) ? 1 : 0;
+						// 	hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+						// 	if(hdTile) frameLayerRetry++;
+						// }
 						if(hdTile) {
 								tileInfo = &pixelInfo.BgTiles[i];
 								usedFallbackLayer = true;
