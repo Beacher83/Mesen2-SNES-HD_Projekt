@@ -12,7 +12,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.11"
+#define SNES_HD_BUILD_VERSION "M5.12"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -203,6 +203,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameBg3FogBlend = 0;         // BG3 fog + color math → HD BG1 rendered with fog blend
 	uint32_t frameBg3FogNative = 0;        // BG3 fog won → native pixel preserved (no fallback)
 	uint32_t frameColorMathDelta = 0;      // HD pixels with color math delta applied (M5.11)
+	uint32_t frameBg3BgFallback = 0;       // BG3 bg won w/o colorMath → BG1 HD rendered plain (M5.12 Issue H)
+	bool frameHasBg1ColorMath = false;     // Any BG1-winning pixel had AllowColorMath this frame (M5.12)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
 	uint32_t frameLayerBits[4] = {};       // Per-layer pixel counts (bit N set in mask)
@@ -259,8 +261,17 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					if(pixelInfo.BgLayerMask & (1 << li)) frameLayerBits[li]++;
 				}
 
-				// 1) Try the compositing winner first
+			// 1) Try the compositing winner first
 				uint8_t winLayer = pixelInfo.BgWinnerLayer;
+
+				// Track if BG1 ever wins with color math this frame (M5.12 Issue H).
+				// In HDMA-animated levels (Hot-Head Hop), BG1 has AllowColorMath on
+				// upper scanlines. This flag enables the BG3-background fallback
+				// path on lower scanlines where BG3 wins without color math.
+				if(winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)) {
+					frameHasBg1ColorMath = true;
+				}
+
 				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
 					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
 					if(hdTile) {
@@ -321,6 +332,36 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						if(hdTile) {
 							tileInfo = &pixelInfo.BgTiles[1];
 							bg3FogBlend = true;
+						}
+					}
+				}
+
+				// 4) BG3 background fallback (Issue H, M5.12):
+				//    BG3 won compositing WITHOUT color math on this scanline, but
+				//    earlier scanlines showed BG1 WITH color math — indicating
+				//    HDMA-animated color math (e.g. Hot-Head Hop lava glow).
+				//    BG3 here is a background layer, not meaningful foreground.
+				//    Fall back to BG1/BG2 HD tile and render plain (no fog tint).
+				//    Safety: frameHasBg1ColorMath is only true when BG1 actually
+				//    won compositing with AllowColorMath set. Levels where BG1
+				//    never has color math (Pirate Panic $2131=02, Level 2 fog
+				//    $2131=44) are completely unaffected.
+				if(!hdTile && winLayer == 2 && !(pixelInfo.MainScreenFlags & 0x80)
+				   && frameHasBg1ColorMath) {
+					// Try BG1 (layer 0) first
+					if(pixelInfo.BgLayerMask & 0x01) {
+						hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
+						if(hdTile) {
+							tileInfo = &pixelInfo.BgTiles[0];
+							frameBg3BgFallback++;
+						}
+					}
+					// If no BG1, try BG2 (layer 1)
+					if(!hdTile && (pixelInfo.BgLayerMask & 0x02)) {
+						hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[1].Key, hdScreen->Vram);
+						if(hdTile) {
+							tileInfo = &pixelInfo.BgTiles[1];
+							frameBg3BgFallback++;
 						}
 					}
 				}
@@ -650,12 +691,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u fogB=%u cmDelta=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
+			": total=%u bg=%u match=%u (fb=%u fogB=%u bgFb=%u cmDelta=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount,
 			ctxLabel,
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend, frameColorMathDelta,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend, frameBg3BgFallback, frameColorMathDelta,
 			frameHdMiss, frameBg3FogNative,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,

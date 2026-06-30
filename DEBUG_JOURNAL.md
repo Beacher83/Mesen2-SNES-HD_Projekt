@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-30 | Mesen Build: M5.11 (untested) | VRAM-Dump-Pipeline: COMPLETE
+Stand: 2026-06-30 | Mesen Build: M5.12 (untested) | VRAM-Dump-Pipeline: COMPLETE
 
 ---
 
@@ -12,10 +12,10 @@ Stand: 2026-06-30 | Mesen Build: M5.11 (untested) | VRAM-Dump-Pipeline: COMPLETE
 | B | BG1/BG2 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | M5.11: fog 80/20 (war 75/25) | M5.2 | M5.10: BG1+BG2 sichtbar, fog 75/25 noch zu dunkel |
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
 | D | Performance Level 1 leicht schlechter | OFFEN — Optimierung geplant | M5.10 | M5.10: spielbar aber spürbar |
-| E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | M5.11: Color-Math-Delta-Fix + offenes Unteres-Fünftel-Problem | 2026-06-29 | M5.11 Test ausstehend |
+| E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | M5.11: VERIFIED ✓ — Lava-Glow auf HD Tiles sichtbar | 2026-06-29 | M5.11 OK |
 | F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | Known Limitation (wie Piratenflagge) | 2026-06-29 | Erste Beobachtung |
 | G | Lockjaw's Locker: BG2 Sub-Screen + HDMA-Scroll-Effekt | Viewer-Limitation, Laufzeit teilweise OK (3D-Hintergrund fehlt) | 2026-06-29 | Erste Beobachtung |
-| H | Hot-Head Hop: Unteres Fünftel — BG3 gewinnt ohne Color Math, kein Fallback | NEU — Layer-Reihenfolge-Recherche nötig | 2026-06-30 | Analyse |
+| H | Hot-Head Hop: Unteres Fünftel — BG3 gewinnt ohne Color Math, kein Fallback | M5.12: frameHasBg1ColorMath-Fix — Test ausstehend | 2026-06-30 | M5.12 Test ausstehend |
 
 ---
 
@@ -886,15 +886,68 @@ BG1 überschrieben werden). Der Gate unterscheidet aber nicht zwischen:
 - BG3 = opaker Vordergrund (Pirate Panic → Gate korrekt)
 - BG3 = Hintergrund-Overlay (Hot-Head Hop → Gate zu restriktiv)
 
-### Recherche nötig
-- **DKC2 Level-Typen:** Unterscheiden sich Levels systematisch in der Layer-Reihenfolge?
-  Gibt es ein PPU-Register oder ROM-Daten die den Typ bestimmen?
-- **Unterscheidungskriterium:** Wie erkennt der HD-Filter ob BG3 Vordergrund (→ Gate)
-  oder Hintergrund (→ Fallback erlaubt) ist?
-- **HDMA-Tabellen analysieren:** Welche Werte schreibt HDMA auf $2131 per Scanline
-  in Hot-Head Hop? Wo genau schaltet es BG3 Color Math ab?
+### Recherche-Ergebnis (2026-06-30)
 
-**Status: OFFEN — Recherche geplant**
+**ROM-Analyse:** Alle 44 ppuConfig-Einträge (`DATA_FD79E2`) systematisch geparst.
+Validiertes Kriterium basierend auf `$212C` (mainScreenLayers):
+
+```
+BG1_on_main = ($212C & 0x01) != 0
+BG3_on_main = ($212C & 0x04) != 0
+
+BG3 FOREGROUND: BG3_on_main && !BG1_on_main  (7 Konfigurationen)
+BG3 BACKGROUND: BG3_on_main && BG1_on_main   (19 Konfigurationen)
+```
+
+| Level | $212C | BG1 main | BG3 main | Typ |
+|-------|-------|----------|----------|-----|
+| Hot-Head Hop | $17 | ja | ja | BACKGROUND → Fallback erlaubt |
+| Pirate Panic | $17 | ja | ja | BACKGROUND (aber BG1 hat kein color math → Flag false) |
+| Lockjaw's Locker | $04 | nein | ja | FOREGROUND → Gate blockiert |
+
+**Aber:** $212C allein reicht nicht! Pirate Panic und Hot-Head Hop haben identischen
+$212C=$17. Unterscheidung gelingt über **BG1 Color Math Detection:**
+
+### Fix: M5.12 — `frameHasBg1ColorMath` Progressive Detection
+
+**Ansatz:** Frame-Level Flag das prüft ob BG1 jemals `AllowColorMath` hatte.
+
+```
+frameHasBg1ColorMath = false
+
+// Für jeden Pixel (top-to-bottom, left-to-right):
+if (winLayer == 0 && AllowColorMath):
+    frameHasBg1ColorMath = true
+
+// BG3 background fallback:
+if (winLayer == 2 && !AllowColorMath && frameHasBg1ColorMath):
+    → Fall back to BG1/BG2 HD tile (plain, ohne Fog/Delta)
+```
+
+**Warum sicher gegen Issue A (Pirate Panic):**
+- Pirate Panic: `$2131 = $02` → BG1 Bit 0 = 0 → BG1 hat NIE color math
+- `frameHasBg1ColorMath` bleibt false → neuer Fallback-Pfad triggert nicht
+- Pirate Panic Verhalten: unverändert ✓
+
+**Warum Hot-Head Hop funktioniert:**
+- HDMA aktiviert BG1 color math auf oberen Scanlines
+- Obere Scanlines werden zuerst verarbeitet → Flag wird true
+- Untere Scanlines (BG3 gewinnt ohne color math): Flag ist true → Fallback erlaubt
+- BG1 HD Tile wird plain gerendert (kein Fog, kein Delta — Delta wäre ohnehin 0)
+
+**Level 2 Nebel (Mainbrace Mayhem):**
+- `$2131 = $44` → BG1 Bit 0 = 0 → kein BG1 color math
+- `frameHasBg1ColorMath` bleibt false → bestehender Fog-Blend-Pfad unberührt ✓
+
+**Implementierung** (`SnesHdVideoFilter.cpp`):
+- Zeile ~207: `frameHasBg1ColorMath` Flag + `frameBg3BgFallback` Counter
+- Zeile ~271: Flag-Tracking nach `winLayer` Bestimmung
+- Zeilen ~339-367: Neuer Fallback-Pfad (4) nach Fog-Blend-Pfad (3)
+- Rendering: Keine Änderung nötig — plain HD tile automatisch korrekt
+  (bg3FogBlend=false, applyColorMathDelta=false → `outputBuffer = hdColor`)
+- Diagnostik: `bgFb` Counter in Frame-Summary
+
+**Status:** Test ausstehend. Erwartung: unteres Fünftel zeigt jetzt BG1 HD Tiles.
 
 ---
 

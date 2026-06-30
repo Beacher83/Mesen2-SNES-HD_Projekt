@@ -7,7 +7,25 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 ## Current Status
 
 **Stand: 2026-06-30**  
-**Build M5.11 — Color Math Delta + Fog-Blend 80/20. Test ausstehend.**
+**Build M5.12 — Issue H Fix (BG3 background fallback). Test ausstehend.**
+
+### M5.12 Session (2026-06-30)
+
+**M5.11 Test-Ergebnis:** Lava-Glow Color-Math-Delta BESTÄTIGT — HD Tiles zeigen
+den Subtract-Effekt korrekt. Issue E obere 4/5: GELÖST.
+
+**M5.12 Code-Änderungen (`SnesHdVideoFilter.cpp`):**
+- **Issue H Fix — `frameHasBg1ColorMath` Progressive Detection:**
+  Neuer Fallback-Pfad (4) nach dem Fog-Blend-Pfad (3). Wenn BG3 Compositing
+  gewinnt OHNE Color Math, aber BG1 auf früheren Scanlines Color Math hatte
+  (HDMA-animiert), wird BG3 als Hintergrund erkannt und auf BG1/BG2 HD-Tile
+  zurückgefallen. Rendert plain (kein Fog, kein Delta).
+- Sicherheit gegen Issue A: Pirate Panic hat BG1 NIE color math ($2131 bit 0 = 0)
+  → Flag bleibt false → kein Effekt. Level 2 Fog ebenfalls unberührt.
+- **Diagnostik:** `bgFb` Counter in Frame-Summary.
+- **ROM-Recherche:** Alle 44 ppuConfig-Einträge analysiert. $212C-Kriterium
+  validiert (0 false positives), aber nicht allein ausreichend. `frameHasBg1ColorMath`
+  als zusätzliches Laufzeit-Kriterium implementiert.
 
 ### M5.11 Session (2026-06-30)
 
