@@ -828,43 +828,37 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 
 ---
 
-## Session-Status (26. Juni 2026)
+## Session-Status (30. Juni 2026)
 
-### Erledigt — VRAM-Dump-Pipeline Phase 2
+### Abgeschlossen
 
-1. **Lua-Script implementiert** (`dkc2_vram_dump.lua`):
-   - ROM-Analyse: scannt alle 192 Level-IDs → findet unique Gfxsets automatisch
-   - Interaktiver Dump: HUD-Overlay + F2-Tastendruck = VRAM/CGRAM/PPU/Savestate
-   - Level-ID-Erkennung aus WRAM $003E (auto-detect per ROM Pointer-Chain)
-   - NPC-Shop-Gfxsets als Hardcoded-Override
-   - Output-Dateien Viewer-Import-kompatibel
+**VRAM-Dump-Pipeline — COMPLETE (2026-06-29)**
+- Phase 1: Completionist-SRM + `.rgd.bak`-Fix → alle 25 spielbaren Gfxsets zugänglich
+- Phase 2 (`84eb8b66`): `dkc2_vram_dump.lua` — 25 Gfxsets gedumpt (WRAM `$0539`)
+- Phase 3 (`882f23a`): Ground-Truth direkt im Viewer eingebettet — kein manueller Import mehr
 
-2. **Architektur-Entscheidungen:**
-   - Kein Batch-Modus (zu komplex wegen `loadSavestate` Exec-Callback-Constraint)
-   - Stattdessen interaktiver Capture: User navigiert + F2 drückt
-   - ROM-Analyse ersetzt Hardcoded-Tabelle: Pointer-Chain-Lookup wie Viewer
-   - Savestate-Capture über NMI-Vector-Exec-Callback
+**M5.11 — Color Math Delta + Fog-Blend 80/20 (2026-06-30, `8f7769fb`)**
+- `SnesHdVideoFilter.cpp`: Winner Color Math Delta (pre/post-math PPU-Delta → HD-Pixel)
+  — erfasst HDMA-animierte Lava-Glow-Effekte (Hot-Head Hop) automatisch für add+subtract
+- Fog-Blend-Gewichtung: 75/25 → **80/20** (Level 2 Nebel war zu dunkel)
+- Neuer Diagnostic Counter: `cmDelta`
+- Issue G (Lockjaw's Locker): Laufzeit OK, nur 3D-Parallax fehlt (Viewer-Export-Limitation)
 
 ### Nächste Schritte
 
-1. **Test auf Mesen-PC:**
-   - `git pull` → `dkc2_vram_dump.lua` laden
-   - Script Settings: "Allow I/O" aktivieren
-   - DKC2 ROM laden (mit 102% .srm Save für Level-Zugang)
-   - Verifizieren:
-     - [ ] ROM-Analyse: Gfxset-Count im Log prüfen
-     - [ ] WRAM $003E: zeigt HUD korrekte Level-ID/Name?
-     - [ ] F2-Dump: werden alle 4 Dateien korrekt geschrieben?
-     - [ ] Savestate: wird `gfxset_XX.savestate` gespeichert?
-   - Falls WRAM-Adresse falsch: `DisplayState.lua` nutzen um alle State-Keys
-     zu inspizieren und richtige Adresse finden
+1. **M5.11 testen** — Build + DKC2 Hot-Head Hop laden
+   - `cmDelta` Counter im Diag-Log: sollte > 0 sein (Color-Math-Pixel erkannt)
+   - Obere 4/5 des Screens: HD-Tiles mit Lava-Glow-Effekt (subtract delta sichtbar)?
+   - Level 2 Fog-Helligkeit: 80/20 besser als 75/25?
 
-2. **Nach erfolgreichem Test:**
-   - Alle Gfxsets durchdumpen (1x pro Gfxset navigieren + F2)
-   - VRAM-Dumps in Viewer importieren (Phase 3)
-   - Hash-Korrektheit für weitere Level verifizieren
+2. **Issue H analysieren** — Unteres ~1/5 Hot-Head Hop ohne HD-Tiles
+   - HDMA-Tabellen für `$2131` (ColorMathSelectAndEnable) per Scanline auswerten
+   - Unterscheidungskriterium finden: BG3 Vordergrund (Pirate Panic) vs Hintergrund (Hot-Head Hop)
+   - Fix: Fog-Blend-Gate `winLayer == 2` um Level-Typ-Erkennung erweitern
 
-3. **Spätere Erweiterungen:**
-   - Batch-Re-Dump-Modus (alle Savestates automatisch laden + dumpen)
-   - Tile-Level Hash-Caching (Performance-Optimierung, M5.11)
-   - Fog-Blend Feintuning (80/20 statt 75/25)
+3. **Erste echte HD-Grafiken** — Container im Viewer befüllen + exportieren
+   - Level 1 (gfxset_07): gfxset_07 Ground-Truth bereits im Viewer → Export testen
+   - Verify: PNG-Dateinamen, Hashes, chrBase-Adressen korrekt?
+
+4. **Performance Level 1 (Issue D)** — Tile-Level Caching (M5.12)
+   - `GetMatchingTile()` wird 64× pro Tile aufgerufen → 1× cachen und 8px verwenden
