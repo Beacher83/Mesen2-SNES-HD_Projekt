@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-30 | Mesen Build: M5.12 (untested) | VRAM-Dump-Pipeline: COMPLETE
+Stand: 2026-06-30 | Mesen Build: M5.13 (untested) | VRAM-Dump-Pipeline: COMPLETE
 
 ---
 
@@ -15,7 +15,7 @@ Stand: 2026-06-30 | Mesen Build: M5.12 (untested) | VRAM-Dump-Pipeline: COMPLETE
 | E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | M5.11: VERIFIED ✓ — Lava-Glow auf HD Tiles sichtbar | 2026-06-29 | M5.11 OK |
 | F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | Known Limitation (wie Piratenflagge) | 2026-06-29 | Erste Beobachtung |
 | G | Lockjaw's Locker: BG2 Sub-Screen + HDMA-Scroll-Effekt | Viewer-Limitation, Laufzeit teilweise OK (3D-Hintergrund fehlt) | 2026-06-29 | Erste Beobachtung |
-| H | Hot-Head Hop: Unteres Fünftel — BG3 gewinnt ohne Color Math, kein Fallback | M5.12: frameHasBg1ColorMath-Fix — Test ausstehend | 2026-06-30 | M5.12 Test ausstehend |
+| H | Hot-Head Hop: Unteres Fünftel — Layer Index Mismatch (BG2 runtime, BG1 in pack) | M5.13: Layer-agnostic retry BG1↔BG2 — Test ausstehend | 2026-06-30 | M5.12: frameHasBg1ColorMath allein reicht nicht (bgFb=0) |
 
 ---
 
@@ -948,6 +948,70 @@ if (winLayer == 2 && !AllowColorMath && frameHasBg1ColorMath):
 - Diagnostik: `bgFb` Counter in Frame-Summary
 
 **Status:** Test ausstehend. Erwartung: unteres Fünftel zeigt jetzt BG1 HD Tiles.
+
+### M5.12 Test-Ergebnis (2026-06-30)
+
+**Ergebnis:** `bgFb=0` — der frameHasBg1ColorMath-Fallback hat NICHT getriggert.
+Hypothese war falsch: BG3 gewinnt im unteren Bereich NICHT das Compositing.
+
+**Diagnostik-Log-Analyse (snes_hd_diag 3006.txt):**
+```
+match=28395  bgFb=0  fogNat=1312  layerMis=13573  BG1=28779 BG2=50957 BG3=25823
+BG1miss=0  BG1notInPack=0
+```
+
+**Entscheidende Erkenntnisse:**
+- `BG1miss=0`: Jeder BG1-Tile matched perfekt — BG1 Lookup funktioniert 100%
+- `layerMis=13573`: 13.573 Pixel haben Layer-Mismatch — dominanter Fehler-Modus
+- `BG2=50957`: BG2 hat die MEISTEN Pixel (nicht BG3 wie vermutet)
+- `bgFb=0`: Der M5.12 bg3BgFallback-Pfad hat nie getriggert
+- MISS-Einträge: `mask=0x06` (BG2+BG3, kein BG1) im unteren Bereich
+
+**LAYER_MISMATCH Log-Einträge:**
+```
+hash=455B87A7E14411BE pal=5 runtime_layer=1 pack_layer=0
+                            (BG2 runtime)    (BG1 in HD pack)
+```
+
+**Root Cause:** Identischer Tile-Content (gleicher Hash, gleiche Palette) erscheint
+auf BG1 im oberen Bereich (matched) und auf BG2 im unteren Bereich (Layer-Index-
+Mismatch → kein Match). Der TileByKey-Lookup erfordert ContentHash + PaletteIndex +
+LayerIndex — alle drei müssen übereinstimmen.
+
+**Positive Seiteneffekte von M5.12:**
+- Pirate Panic BG2 Wasser: Jetzt korrekt blau-grün (Color Math Delta auf BG2)
+- Hot-Head Hop Bubbles: Dunkler Rahmen weg, Animation flüssiger
+
+### Fix: M5.13 — Layer-Agnostic Retry für BG1↔BG2 (4bpp)
+
+**Ansatz:** Nach jedem fehlgeschlagenen HD-Tile-Lookup für BG1 oder BG2 wird
+ein Retry mit dem jeweils anderen Layer-Index durchgeführt.
+
+```
+// Wenn Winner BG2 ist und kein HD Tile gefunden:
+altKey = winner.Key
+altKey.LayerIndex = 0  // versuche mit BG1-Index
+hdTile = GetMatchingTile(altKey, Vram)
+// (und umgekehrt für BG1 → BG2)
+```
+
+**Sicherheit:**
+- BG1 und BG2 sind beide 4bpp in Mode 1 — identische Tile-Daten mit gleicher
+  Palette erzeugen identische Pixel. Layer-Index-Austausch ist visuell korrekt.
+- BG3 (2bpp) ist ausgeschlossen — kein Interchange mit 4bpp-Layern.
+- Retry wird in ALLEN 4 Lookup-Pfaden angewendet: Winner, Fallback-Loop,
+  Fog-Blend, BG3-Background-Fallback.
+
+**Implementierung** (`SnesHdVideoFilter.cpp`):
+- `frameLayerRetry` Counter für Diagnostik
+- Nach Schritt 1 (Winner Lookup): Retry mit alternativem LayerIndex
+- In Schritt 2 (Fallback Loop): Retry für 4bpp-Fallback-Layer
+- In Schritt 3 (Fog-Blend): Retry bei BG1/BG2-Lookup unter BG3
+- In Schritt 4 (BG3 Bg Fallback): Retry bei BG1/BG2-Lookup unter BG3
+- Diagnostik: `lRetry` Counter in Frame-Summary
+
+**Erwartung:** `layerMis` Zähler sinkt auf ~0, `lRetry` steigt auf ~13573.
+Unteres Fünftel zeigt HD Tiles. Pirate Panic + Level 2 unverändert.
 
 ---
 

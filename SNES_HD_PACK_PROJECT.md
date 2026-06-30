@@ -7,7 +7,25 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 ## Current Status
 
 **Stand: 2026-06-30**  
-**Build M5.12 — Issue H Fix (BG3 background fallback). Test ausstehend.**
+**Build M5.13 — Issue H Fix (Layer-Agnostic Retry BG1↔BG2). Test ausstehend.**
+
+### M5.13 Session (2026-06-30)
+
+**M5.12 Test-Ergebnis:** `bgFb=0` — frameHasBg1ColorMath-Fallback hat NICHT getriggert.
+Root Cause war NICHT BG3-Compositing, sondern **Layer Index Mismatch**: identische
+Tile-Inhalte erscheinen auf BG1 (oberer Bereich, matched) und BG2 (unterer Bereich,
+LayerIndex=1 ≠ 0 in Pack → kein Match). 13.573 Pixel betroffen.
+
+**M5.13 Code-Änderungen (`SnesHdVideoFilter.cpp`):**
+- **Issue H Fix — Layer-Agnostic Retry:** Bei fehlgeschlagenem HD-Tile-Lookup für
+  BG1 oder BG2 wird der Lookup mit dem jeweils anderen Layer-Index wiederholt.
+  BG1↔BG2 sind beide 4bpp in Mode 1, daher visuell identisch. BG3 (2bpp) ausgeschlossen.
+- Retry in allen 4 Lookup-Pfaden: Winner, Fallback-Loop, Fog-Blend, BG3-Bg-Fallback.
+- **Diagnostik:** `lRetry` Counter in Frame-Summary.
+
+**Positive Seiteneffekte von M5.12 (bestätigt im Test):**
+- Pirate Panic BG2 Wasser: Jetzt korrekt blau-grün (Color Math Delta auf BG2 wirkt)
+- Hot-Head Hop Bubbles: Dunkler Rahmen weg
 
 ### M5.12 Session (2026-06-30)
 
@@ -866,12 +884,24 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 - ROM-Recherche: alle 44 DKC2 ppuConfig-Einträge analysiert und validiert
 - `bgFb` Diagnostic Counter
 
+**M5.12 — BG3 Background Fallback (2026-06-30, `c0ccaa7e`)**
+- `frameHasBg1ColorMath` Flag + BG3-Background-Fallback-Pfad
+- Test-Ergebnis: bgFb=0 (falsche Hypothese), aber positive Seiteneffekte
+- Pirate Panic BG2 Wasser blau-grün (Color Math Delta wirkt auf BG2)
+- Hot-Head Hop Bubbles: Dunkler Rahmen weg
+
 ### Nächste Schritte
 
-1. **M5.12 testen** — Hot-Head Hop: `bgFb > 0`? Unteres Fünftel mit HD-Tiles?
-   - Regression-Check: Pirate Panic BG3-Taue sichtbar? Level-2-Fog 80/20 OK?
+1. **M5.13 testen** — Build + DKC2 Hot-Head Hop laden
+   - `lRetry` Counter im Diag-Log: sollte ~13573 sein (Layer-Retry-Pixel)
+   - `layerMis` Counter: sollte ~0 sein (alle Mismatches aufgelöst)
+   - Unteres Fünftel: HD-Tiles sichtbar?
+   - Pirate Panic + Level 2: unverändert?
 
-2. **Erste echte HD-Grafiken** — Container im Viewer befüllen → Export → Test in Mesen
+2. **Fog-Blend-Gewichtung** — 80/20 macht Übergang sichtbarer
+   - Ggf. zurück zu 75/25 oder Zwischenwert testen
+
+3. **Erste echte HD-Grafiken** — Container im Viewer befüllen → Export → Test in Mesen
 
 3. **Performance Level 1 (Issue D, M5.13)** — Tile-Level Caching
    - `GetMatchingTile()` wird 64× pro Tile aufgerufen → 1× cachen und 8px verwenden
