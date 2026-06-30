@@ -6,8 +6,27 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Stand: 2026-06-29**  
-**VRAM-Dump-Pipeline COMPLETE. 25 Gfxsets in Viewer als Ground-Truth eingebettet.**
+**Stand: 2026-06-30**  
+**Build M5.11 — Color Math Delta + Fog-Blend 80/20. Test ausstehend.**
+
+### M5.11 Session (2026-06-30)
+
+**Code-Änderungen (`SnesHdVideoFilter.cpp`):**
+- **Winner Color Math Delta:** Neuer Render-Pfad der HDMA-animierte Color-Math-Effekte
+  (z.B. Lava-Glow in Hot-Head Hop) auf HD-Tiles überträgt. Berechnet Delta aus
+  PPU pre-math vs post-math Farben und wendet es auf HD-Pixel an. Funktioniert
+  automatisch für add/subtract, erfasst HDMA pro-Scanline.
+- **Fog-Blend 80/20:** Gewicht von 75/25 auf 80/20 angepasst (Level 2 Nebel war
+  zu dunkel bei 75/25).
+- **Diagnostik:** `cmDelta` Counter in Frame-Summary für Color-Math-Delta-Tracking.
+
+**Offene Issues:**
+- **Issue H (NEU):** Unteres ~1/5 von Hot-Head Hop zeigt keine HD-Tiles. Ursache:
+  BG3 gewinnt Compositing für BG1-Priority-0-Tiles, HDMA schaltet BG3 Color Math
+  dort ab → Fog-Blend-Gate blockiert Fallback. Braucht Level-Typ-Unterscheidung
+  (BG3 Vordergrund vs Hintergrund).
+- **Issue G Update:** Lockjaw's Locker Laufzeit grundsätzlich OK, nur 3D-Parallax-
+  Hintergrund fehlt (Viewer-Export-Limitation, kein Code-Fix nötig).
 
 ### VRAM-Dump-Pipeline Zusammenfassung (abgeschlossen 2026-06-29)
 

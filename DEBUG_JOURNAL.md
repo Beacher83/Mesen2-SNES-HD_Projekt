@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-06-29 | Mesen Build: M5.10 (tested) | VRAM-Dump-Pipeline: COMPLETE
+Stand: 2026-06-30 | Mesen Build: M5.11 (untested) | VRAM-Dump-Pipeline: COMPLETE
 
 ---
 
@@ -9,12 +9,13 @@ Stand: 2026-06-29 | Mesen Build: M5.10 (tested) | VRAM-Dump-Pipeline: COMPLETE
 | # | Issue | Status | Seit | Letzer Test |
 |---|-------|--------|------|-------------|
 | A | BG3 native tiles transparent in Level 1 (Regression) | FIXED (M5.8) — verified M5.9+M5.10 | ~M5.5b | M5.10 OK |
-| B | BG1/BG2 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | M5.10: BG1+BG2 OK, fog etwas zu dunkel | M5.2 | M5.10: BG1+BG2 sichtbar, fog 75/25 noch zu dunkel |
+| B | BG1/BG2 HD tiles fehlen in Level 2 (gfxset_25/0x37dez) | M5.11: fog 80/20 (war 75/25) | M5.2 | M5.10: BG1+BG2 sichtbar, fog 75/25 noch zu dunkel |
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
 | D | Performance Level 1 leicht schlechter | OFFEN — Optimierung geplant | M5.10 | M5.10: spielbar aber spürbar |
-| E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | NEU — kein Fix | 2026-06-29 | Erste Beobachtung |
-| F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | NEU — Known Limitation (wie Piratenflagge) | 2026-06-29 | Erste Beobachtung |
-| G | Lockjaw's Locker: BG2 Sub-Screen + HDMA-Scroll-Effekt | NEU — Viewer-Limitation, Laufzeit OK | 2026-06-29 | Erste Beobachtung |
+| E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | M5.11: Color-Math-Delta-Fix + offenes Unteres-Fünftel-Problem | 2026-06-29 | M5.11 Test ausstehend |
+| F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | Known Limitation (wie Piratenflagge) | 2026-06-29 | Erste Beobachtung |
+| G | Lockjaw's Locker: BG2 Sub-Screen + HDMA-Scroll-Effekt | Viewer-Limitation, Laufzeit teilweise OK (3D-Hintergrund fehlt) | 2026-06-29 | Erste Beobachtung |
+| H | Hot-Head Hop: Unteres Fünftel — BG3 gewinnt ohne Color Math, kein Fallback | NEU — Layer-Reihenfolge-Recherche nötig | 2026-06-30 | Analyse |
 
 ---
 
@@ -788,8 +789,8 @@ Viewer öffnen → Container laden → vramSnapshot auto-apply aus Ground-Truth
 ## Issue E: Hot-Head Hop — Lava-Glow Color Math (2026-06-29)
 
 ### Symptom
-- Ca. 1/5 des Bildschirms: kein HD tile angezeigt, nur nativer Pixel
-- Die anderen 4/5: HD BG1 tiles korrekt — aber OHNE den Lava-Glow-Effekt (falsch)
+- Ca. 1/5 des Bildschirms (unten): kein HD tile angezeigt, nur nativer Pixel
+- Die anderen 4/5 (oben): HD BG1 tiles korrekt — aber OHNE den Lava-Glow-Effekt (falsch)
 - Der Effekt betrifft im Original alle BG1 tiles im Level
 
 ### PPU-Konfiguration (aus gfxset_20_state.txt)
@@ -803,32 +804,97 @@ subScreenLayers     = 0     → kein Sub-Screen
 mainScreenLayers    = 23    → BG1+BG2+BG3+OBJ alle auf Main Screen
 ```
 
-### Ursache
-DKC2 Hot-Head Hop simuliert das Lava-Glühen über:
-1. **BG3** auf Main Screen als animierter Heat-Haze-Overlay (ca. 1/5 Bildschirm)
-2. **Color Math subtract** mit dunkel-fixedColor auf BG3 (leichtes Dimming)
-3. **HDMA** ändert `fixedColor` pro Scanline → erstellt den animierten Pulseffekt
+### Ursache (revidiert 2026-06-30)
+DKC2 Hot-Head Hop nutzt **DREI separate Effekt-Mechanismen** gleichzeitig:
 
-Mesen HD-Filter-Verhalten:
-- Wo BG3 den Pixel "gewinnt": kein BG3 im Pack (user-deleted) → native Pixel (kein HD)
-- Wo BG1 gewinnt: BG1 HD tile angezeigt, aber ohne BG3 subtract-Blend → zu hell/unverändert
+1. **HDMA auf $2131 (ColorMathSelectAndEnable) pro Scanline:**
+   - Ändert welche Layer Color Math haben — per Scanline!
+   - In ASM: HDMA Channel 3 schreibt $2131 kontinuierlich
+   - Auf bestimmten Scanlines wird BG1 (Bit 0) in Color Math eingeschlossen
+   - → PPU subtrahiert fixedColor von BG1 Pixeln auf diesen Scanlines
+   - → HD-Filter zeigte bisher HD-Tile OHNE diesen Subtract → "kein Glow"
 
-### Unterschied zu Level 2 Nebel (M5.9/M5.10)
-| | Level 2 Nebel | Hot-Head Hop Lava-Glow |
-|--|---------------|------------------------|
-| Modus | addSubscreen (BG3 + Sub) | fixedColor subtract |
-| Sub-Screen | BG1 auf Sub | kein Sub-Screen |
-| HDMA | keiner (statischer Nebel) | fixedColor per Scanline animiert |
-| Fix | M5.9: fog-blend Fallback | noch kein Fix |
+2. **HDMA auf $2132 (FixedColorData) pro Scanline:**
+   - Animiert fixedColor-Wert → Lava-Pulseffekt über den ganzen Bildschirm
+   - Verschiedene Scanlines haben verschiedene Abdunkelungsstärken
 
-### Fix-Ansatz
-Ähnlich M5.9 aber für subtract-Modus:
-1. Wenn BG3-Pixel gewinnt und kein BG3-HD-Tile: Fallback auf BG1-HD-Tile
-2. Subtract-Color-Math auf HD-Tile anwenden: `HD_color - fixedColor`
-3. HDMA-Problem: fixedColor ändert sich per Scanline → bei Render-Zeit lesen
+3. **Palette-Cycling (VBlank):**
+   - 8-Phasen Lava-Palette (CGRAM 5/6/7) via DATA_80BA51
+   - Tiles mit diesen Palette-Rows → Farben animiert (im Viewer als "animated" markiert)
+   - HD-Tiles sind statische PNGs → Palette-Cycling nicht sichtbar
+   - Separates Problem (nicht in M5.11 adressiert)
 
-Komplexität: HDMA-Werte müssten per Scanline gespeichert und beim HD-Blend angewendet werden.
-**Status: OFFEN / geparkt**
+### Fix: M5.11 — Winner Color Math Delta
+
+**Ansatz:** Delta-Berechnung aus PPU pre-math vs post-math Farben.
+
+```
+MainScreenColor = rohe BG1-Farbe (vor Color Math, BGR555)
+ppuOutputBuffer = finale Farbe (nach Color Math, BGR555)
+delta = postMath - preMath  (pro 5-bit Komponente, ×8 → 8-bit)
+HD_output = HD_pixel + delta  (clamped 0-255)
+```
+
+**Implementierung** (`SnesHdVideoFilter.cpp`):
+- Zeilen 532-556: Delta pre-computation (nur wenn `!bg3FogBlend && AllowColorMath`)
+- Zeilen 581-591: Delta-Anwendung auf opake HD-Pixel
+- Zeilen 614-618: Delta-Anwendung auf alpha-geblendete Pixel
+- Diagnostik: `cmDelta` Counter in Frame-Summary
+
+**Vorteile:**
+- Automatisch korrekt für add UND subtract Modi
+- Erfasst HDMA pro-Scanline Änderungen (ppuOutput hat bereits HDMA-beeinflussten Wert)
+- Kein Struct-Umbau nötig — nutzt bestehende MainScreenColor + ppuOutputBuffer
+- Bestehender Fog-Blend (Level 2 Nebel) bleibt unberührt
+
+**Gleichzeitig:** Fog-Blend von 75/25 auf 80/20 angepasst (Issue B).
+
+**Status:** Test ausstehend. Erwartung: obere 4/5 mit Lava-Glow-Effekt, unteres 1/5 unverändert (siehe Issue H).
+
+---
+
+## Issue H: Hot-Head Hop — Unteres Fünftel ohne HD-Tiles (2026-06-30)
+
+### Symptom
+- Unteres ~1/5 des Bildschirms zeigt nur native Tiles (kein HD)
+- Stalaktiten (BG1 Vordergrund) WERDEN als HD angezeigt, auch im unteren Bereich
+- Andere BG1-Tiles auf gleicher Höhe werden NICHT als HD angezeigt
+
+### Beobachtete Layer-Reihenfolge (Viewer + Mesen)
+| Level | Vorne → Hinten | BG3 Rolle |
+|-------|----------------|-----------|
+| Pirate Panic | BG3, BG1, BG2 | Vordergrund (Taue, Masten) |
+| Hot-Head Hop | BG1, BG1, BG3 | Hintergrund (Lava-Flüsse, Berge) |
+
+Hot-Head Hop: kein BG2 exportiert im Viewer, BG3 = Hintergrund-Lava.
+
+### Hypothese
+SNES Mode 1 Tile-Prioritäten:
+```
+BG1 Priority 1 (hoch)  →  über BG3  → Stalaktiten → HD ✓
+BG3                     →  dazwischen → Lava-Hintergrund
+BG1 Priority 0 (niedrig) →  unter BG3  → Terrain → BG3 gewinnt
+```
+
+Wenn BG3 im unteren Bereich Compositing gewinnt UND HDMA dort `colorMathEnabled`
+BG3-Bit abschaltet → AllowColorMath = false → Fog-Blend-Gate blockiert →
+kein Fallback auf BG1 → native Pixel.
+
+Der bisherige Fog-Blend-Gate (`winLayer == 2 && AllowColorMath`) wurde in M5.8
+eingeführt um Issue A zu verhindern (Pirate Panic: BG3-Taue sollen nicht von
+BG1 überschrieben werden). Der Gate unterscheidet aber nicht zwischen:
+- BG3 = opaker Vordergrund (Pirate Panic → Gate korrekt)
+- BG3 = Hintergrund-Overlay (Hot-Head Hop → Gate zu restriktiv)
+
+### Recherche nötig
+- **DKC2 Level-Typen:** Unterscheiden sich Levels systematisch in der Layer-Reihenfolge?
+  Gibt es ein PPU-Register oder ROM-Daten die den Typ bestimmen?
+- **Unterscheidungskriterium:** Wie erkennt der HD-Filter ob BG3 Vordergrund (→ Gate)
+  oder Hintergrund (→ Fallback erlaubt) ist?
+- **HDMA-Tabellen analysieren:** Welche Werte schreibt HDMA auf $2131 per Scanline
+  in Hot-Head Hop? Wo genau schaltet es BG3 Color Math ab?
+
+**Status: OFFEN — Recherche geplant**
 
 ---
 
@@ -881,13 +947,17 @@ window[0].activeLayers[2] = true, invertedLayers[2] = true → BG3 nur außerhal
 2. **Viele identische Tiles**: Unterwasser-Hintergrund besteht aus vielen gleichen Tiles (gleiches VRAM-Byte-Pattern → gleicher Hash → ein PNG). Im Viewer: wiederholtes Kacheln.
 3. **Laufzeit**: Mesen wendet HDMA korrekt an → echte Parallax-Optik vorhanden.
 
-### HD-Tile-Darstellung in Mesen
-- Sub-Screen support (`b41b1697`: `drawMain || drawSub`) müsste BG2 HD tiles ermöglichen
-- Color Math: BG3_color - BG2_HD_color → BG2 HD tile beeinflusst Endfarbe korrekt
-- **Laufzeit-Test ausstehend**: Ob Fill-Tiles auch in Mesen sichtbar sind oder nur im Viewer
+### HD-Tile-Darstellung in Mesen (User-Feedback 2026-06-30)
+- **Laufzeit grundsätzlich OK:** BG1 und BG2 HD tiles werden korrekt angezeigt
+- **3D-Parallax-Hintergrund fehlt:** Der HDMA-animierte Hintergrund (Tiefeneffekt)
+  wird im Mesen-Runtime nicht als HD dargestellt — vermutlich weil der Viewer diesen
+  Hintergrund nicht vollständig exportiert (HDMA-Scroll wird nicht simuliert)
+- **Viewer-Export-Limitation:** Viewer exportiert nicht alle Hintergrund-Elemente;
+  nur die statisch sichtbaren Tiles werden in den Container aufgenommen
 
 ### Status
-OFFEN — Viewer-Limitation wahrscheinlich. Laufzeit-Verhalten unklar bis getestet.
+Viewer-Limitation bestätigt. Laufzeit funktioniert bis auf 3D-Hintergrund.
+Kein Code-Fix im HD-Filter nötig — Problem liegt im Viewer-Export.
 
 ---
 

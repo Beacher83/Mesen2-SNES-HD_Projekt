@@ -7,11 +7,12 @@
 #include "Shared/ColorUtilities.h"
 #include "Shared/MessageManager.h"
 #include <unordered_set>
+#include <algorithm>  // std::clamp (for color math delta clamping)
 #include <cstdlib>    // getenv (for DiagLog file path)
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.10"
+#define SNES_HD_BUILD_VERSION "M5.11"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -201,6 +202,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameFallback = 0;
 	uint32_t frameBg3FogBlend = 0;         // BG3 fog + color math → HD BG1 rendered with fog blend
 	uint32_t frameBg3FogNative = 0;        // BG3 fog won → native pixel preserved (no fallback)
+	uint32_t frameColorMathDelta = 0;      // HD pixels with color math delta applied (M5.11)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
 	uint32_t frameLayerBits[4] = {};       // Per-layer pixel counts (bit N set in mask)
@@ -330,6 +332,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					}
 					if(bg3FogBlend) {
 						frameBg3FogBlend++;
+					}
+					// Track color math delta application (M5.11)
+					if(!bg3FogBlend && (pixelInfo.MainScreenFlags & 0x80)) {
+						uint16_t pre = pixelInfo.MainScreenColor & 0x7FFF;
+						uint16_t post = ppuOutputBuffer[ppuIndex] & 0x7FFF;
+						if(pre != post) {
+							frameColorMathDelta++;
+						}
 					}
 
 					// DIAGNOSTIC: Log first 5 unique MATCHES
@@ -506,7 +516,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// Pre-compute fog color if this pixel uses BG3 fog blending.
 				// MainScreenColor holds the raw BG3 layer color captured before
 				// the PPU applied color math.
-				// Blend weight: 75% HD tile + 25% fog color.  The original PPU
+				// Blend weight: 80% HD tile + 20% fog color.  The original PPU
 				// uses 50/50 half-addition, but HD tiles are painted brighter than
 				// native tiles, so a lighter fog weight preserves art quality while
 				// still conveying the atmospheric effect.
@@ -517,6 +527,32 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					fogR = (fogColorRGB >> 16) & 0xFF;
 					fogG = (fogColorRGB >> 8) & 0xFF;
 					fogB = fogColorRGB & 0xFF;
+				}
+
+				// Pre-compute color math delta for winner pixels where the PPU
+				// applied color math (subtract/add via fixedColor or sub-screen).
+				// This captures HDMA-animated effects like lava glow in DKC2
+				// Hot-Head Hop where $2131 enables BG1 color math per-scanline
+				// and $2132 (fixedColor) is animated via HDMA.
+				// Delta is computed from the PPU's pre-math vs post-math colors
+				// (both BGR555), then scaled to 8-bit for HD tile application.
+				int cmDeltaR = 0, cmDeltaG = 0, cmDeltaB = 0;
+				bool applyColorMathDelta = false;
+				if(!bg3FogBlend && (pixelInfo.MainScreenFlags & 0x80)) {
+					uint16_t preMath = pixelInfo.MainScreenColor & 0x7FFF;
+					uint16_t postMath = ppuOutputBuffer[ppuIndex] & 0x7FFF;
+					int preR = preMath & 0x1F;
+					int preG = (preMath >> 5) & 0x1F;
+					int preB = (preMath >> 10) & 0x1F;
+					int postR = postMath & 0x1F;
+					int postG = (postMath >> 5) & 0x1F;
+					int postB = (postMath >> 10) & 0x1F;
+					cmDeltaR = (postR - preR) * 8;
+					cmDeltaG = (postG - preG) * 8;
+					cmDeltaB = (postB - preB) * 8;
+					if(cmDeltaR != 0 || cmDeltaG != 0 || cmDeltaB != 0) {
+						applyColorMathDelta = true;
+					}
 				}
 
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
@@ -533,14 +569,25 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 								if(alpha == 0xFF) {
 									if(bg3FogBlend) {
 										// BG3 fog-blend: render HD tile with atmospheric
-										// fog tint.  75% HD + 25% fog keeps art visible
+										// fog tint.  80% HD + 20% fog keeps art visible
 										// while conveying the fog effect.
 										uint8_t hdR = (hdColor >> 16) & 0xFF;
 										uint8_t hdG = (hdColor >> 8) & 0xFF;
 										uint8_t hdB = hdColor & 0xFF;
-										uint8_t outR = (uint8_t)((hdR * 3 + fogR) >> 2);
-										uint8_t outG = (uint8_t)((hdG * 3 + fogG) >> 2);
-										uint8_t outB = (uint8_t)((hdB * 3 + fogB) >> 2);
+										uint8_t outR = (uint8_t)((hdR * 4 + fogR) / 5);
+										uint8_t outG = (uint8_t)((hdG * 4 + fogG) / 5);
+										uint8_t outB = (uint8_t)((hdB * 4 + fogB) / 5);
+										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+									} else if(applyColorMathDelta) {
+										// Winner pixel had color math applied by PPU
+										// (e.g. HDMA subtract-fixedColor for lava glow).
+										// Replicate the same delta on the HD tile.
+										uint8_t hdR = (hdColor >> 16) & 0xFF;
+										uint8_t hdG = (hdColor >> 8) & 0xFF;
+										uint8_t hdB = hdColor & 0xFF;
+										uint8_t outR = (uint8_t)std::clamp((int)hdR + cmDeltaR, 0, 255);
+										uint8_t outG = (uint8_t)std::clamp((int)hdG + cmDeltaG, 0, 255);
+										uint8_t outB = (uint8_t)std::clamp((int)hdB + cmDeltaB, 0, 255);
 										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
 									} else {
 										outputBuffer[outIndex] = hdColor;
@@ -560,10 +607,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									uint8_t blendG = hdG + ((srcG * (255 - alpha)) / 255);
 									uint8_t blendB = hdB + ((srcB * (255 - alpha)) / 255);
 									if(bg3FogBlend) {
-										// Apply fog on top of the alpha-blended result (75/25)
-										blendR = (uint8_t)((blendR * 3 + fogR) >> 2);
-										blendG = (uint8_t)((blendG * 3 + fogG) >> 2);
-										blendB = (uint8_t)((blendB * 3 + fogB) >> 2);
+										// Apply fog on top of the alpha-blended result (80/20)
+										blendR = (uint8_t)((blendR * 4 + fogR) / 5);
+										blendG = (uint8_t)((blendG * 4 + fogG) / 5);
+										blendB = (uint8_t)((blendB * 4 + fogB) / 5);
+									} else if(applyColorMathDelta) {
+										// Apply color math delta on alpha-blended result
+										blendR = (uint8_t)std::clamp((int)blendR + cmDeltaR, 0, 255);
+										blendG = (uint8_t)std::clamp((int)blendG + cmDeltaG, 0, 255);
+										blendB = (uint8_t)std::clamp((int)blendB + cmDeltaB, 0, 255);
 									}
 									outputBuffer[outIndex] = 0xFF000000 | (blendR << 16) | (blendG << 8) | blendB;
 								} else {
@@ -598,12 +650,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u fogB=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
+			": total=%u bg=%u match=%u (fb=%u fogB=%u cmDelta=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount,
 			ctxLabel,
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend, frameColorMathDelta,
 			frameHdMiss, frameBg3FogNative,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,
