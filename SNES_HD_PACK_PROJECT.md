@@ -6,8 +6,131 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 
 ## Current Status
 
-**Stand: 2026-07-01**  
-**Build M5.14 — Bubble-Regression Fix (Fallback-Loop Layer-Retry entfernt). Test ausstehend.**
+**Stand: 2026-07-03**  
+**Issue I (Sub-Screen-Blend) v3 BESTÄTIGT. Feintuning (Alpha, Catalog-View) nächste Session.**
+
+### Issue I: Sub-Screen-Blend Fix v3 — BESTÄTIGT (2026-07-03)
+
+**Problem:** Rambi Rumble (ppuConfig 0x03) — BG3 Honig-Overlay wurde voll-opak als
+Foreground gerendert und verdeckte den BG1-Bienenstock-Hintergrund komplett. Root Cause:
+`loadLevelBackground()` erkannte Sub-Screen-Blend-Muster nicht (BG3 auf Sub-Screen statt
+Main-Screen) und renderte BG3 Priority-1 Tiles immer als opakes Overlay.
+
+**Fix (3 Änderungen in `loadLevelBackground()`):**
+1. **`isSubScreenBlend` Flag** (Zeile ~1720): Erkennt 6 ppuConfig-Muster generisch
+2. **BG3 als Hintergrund** (Zeile ~1811): SSB → BG3 alle Priorities als imgData (Hintergrund)
+3. **BG1 als Foreground-Overlay** (Zeile ~1851): SSB → BG1 als fgData mit alpha=0.7
+
+**User-Test v3:** Layer-Reihenfolge korrekt — Waben (BG3) im Hintergrund, Honig (BG1)
+als Overlay vorne. Betrifft 35 Levels mit 6 verschiedenen ppuConfig-Werten.
+
+**Verbleibende Issues (nächste Session):**
+- Honig-Overlay zu dunkel (Alpha reduzieren oder echtes additives Blending)
+- Catalog-View zeigt kein Foreground-Element (fehlendes Canvas)
+- Andere ppuConfig-Werte visuell prüfen (besonders 0x29 half-intensity)
+- Regressions-Check bei Nicht-SSB-Leveln
+
+### ShipDeck BG3 Virtual Tilemap (2026-07-02)
+
+**Problem:** ShipDeck levels (mapId=3, z.B. Pirate Panic, Gangplank Galley) verwenden für BG3
+ein zweistufiges Metatile-Scroll-System statt einer statischen VRAM-Tilemap. Die VRAM-Tilemap
+bei $7800 bleibt leer (alle Nullen) → die bestehende HD-Pack Export-Pipeline (per-tile PNG,
+hashes.bin, Dedup) produziert nur leere BG3-Daten.
+
+**Lösung: "Virtual Tilemap" Ansatz**
+
+Neue Funktion `expandShipDeckMetatilesToTilemap(rom)` expandiert alle 49 Metatile-Definitionen
+(DATA_F52087) + 40×16 Metatile-Map (DATA_F526A7) in eine flache 160×64 Tilemap (20.480 Bytes).
+Diese virtuelle Tilemap ersetzt die leere VRAM-Tilemap, sodass die gesamte bestehende
+Export-Pipeline unverändert funktioniert.
+
+**Neue Funktionen/Änderungen (index.html):**
+- `expandShipDeckMetatilesToTilemap(rom)` (~Zeile 1568-1650): Neue Helper-Funktion
+  - Liest Metatile-Definitionen + Map aus ROM (identische ROM-Adressen wie `loadBg3ShipDeckMap`)
+  - Expandiert 40×16 Metatiles → 160×64 Tiles mit korrekten Flip-Bits (XOR)
+  - Gibt `{ tilemapData: Array, tilesW: 160, tilesH: 64 }` zurück
+- `saveCurrentHDToContainer()` (~Zeile 7256-7271): ShipDeck-Override nach BG3-Tilemap-Extraktion
+  - Erkennung via `currentStyle?.mapId === 3`
+  - Ersetzt leere bg3TilemapData + überschreibt ppuConfig.bg3TilesW/H
+- `buildCatalogByGfxSet()` (~Zeile 4661-4673): Gleicher Override für Katalog-Tilemap-Caching
+  - Erkennung via `style.mapId === 3`
+- `refreshContainerSetMetadata()` (~Zeile 9010-9022): Gleicher Override für Metadata-Refresh
+  - Erkennung via `currentStyle?.mapId === 3`
+
+**Tilemap-Layout:** Flach, row-major: `tilemapData[(tileY * 160 + tileX) * 2 ...]` = LE tile word
+  - tileX = row*4 + mx (0..159), tileY = col*4 + my (0..63)
+  - Passt zum 1280×512px bg3.png: srcTileSize = width/tilesW = 1280/160 = 8
+
+**Kompatibilität mit Export-Pipeline:**
+  - Per-tile PNG: `srcTileSize = Math.round(bg3Bitmap.width / tilesW)` → 8px (1x) oder 32px (4x HD)
+  - Hash: `vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF` → CHR-Daten in VRAM sind korrekt geladen
+  - Dedup: `fileKey = "${addrHex}_${palStr}"` → identische Tile/Palette-Kombis dedupliziert
+  - Un-flip: `flipH/flipV` aus tileWord → kanonische Orientierung für HD-Ersatz
+
+### GfxSet-Katalog Palette-Fix (2026-07-02)
+
+**Bug:** Beim Wechsel von Level-Ansicht zu "Per Graphics Set"-Ansicht zeigte der Viewer
+für gfxSet 0x03 immer Lava Lagoons rötlichen Farbfilter, auch wenn Lockjaw's Locker
+geladen war. Beide Level teilen gfxSet 0x03, haben aber unterschiedliche Paletten.
+
+**Root Cause:** `buildCatalogByGfxSet()` (Zeile 4257) nahm immer `levels[0]` als
+Referenz-Level. Für gfxSet 0x03 war das Lava Lagoon (Level-ID 0x14 < 0x15), dessen
+`routine1=0x14` eine komplette Palette-Ersetzung aus ROM 0x3D1610 auslöst.
+
+**Fixes:**
+- `buildCatalogByGfxSet()`: Wenn `currentLevelId` im selben gfxSet enthalten ist,
+  wird dessen Style (Palette, routine1, ppuConfig, vblankType) als Referenz benutzt
+  statt blind `levels[0]`. Fallback bleibt `levels[0]` wenn kein Level geladen.
+- `toggleCatalogView()`: Cache-Invalidierung erweitert — prüft jetzt auch
+  `catalogData.refLevelId !== currentLevelId`, nicht nur gfxSetIndex.
+- `refLevelId` als neues Feld im catalogData Return-Objekt.
+
+**Status:** Vom User im Browser getestet und bestätigt — Lockjaw zeigt saubere Tiles.
+
+### Wall Pipeline-Integration (2026-07-02)
+
+Die Schiffswand-Tiles fließen jetzt durch die gesamte Daten-Pipeline:
+
+**Container-Storage (Batches 1-5):**
+- `saveCurrentHDToContainer()`: wallBlob, wallTilemapData, ppuConfig mit wallTilesW/H/Base
+- `buildCatalogByGfxSet()`: wallTilemapData caching, ppuConfig mit Wall-Feldern
+- `loadContainerToHDPack()`: wallBlob → hdPack.wall ImageBitmap
+- `exportContainerAsZip()`: wall.png + wall_tilemap.bin in ZIP
+- `importContainerFromZip()`: wallBlob + wallTilemapData + hdSaveSet() mit Wall-Daten
+- `refreshContainerSetMetadata()`: wallTilemapData refresh aus VRAM + wallBlob + Wall-Checksums
+
+**Hash-Generierung (Batch 6):**
+- Wall-Hashes in `exportAsTexturePack()` nach BG2-Hashes
+- Gleicher chrBase und Layer (1) wie BG2-Decke, andere Tile-Indices → kein Overlap
+- `tileNum === 0` Skip für leere Tilemap-Einträge
+- Dedup-Key: `${gfxset}_1_${vramWordAddr}`
+
+**Per-Tile PNG Export (Batch 7):**
+- Wall-Tiles aus wallBlob extrahiert, un-flipped, 4× skaliert (32×32px)
+- Ausgabe in `bg/bg2/gfxset_XX/` — gleicher Ordner wie Decken-Tiles
+- Keine Filename-Kollision dank unterschiedlicher vramWordAddrs
+- Export-Zusammenfassung zeigt jetzt Wall-Tile-Count separat
+
+### Viewer-Fix Session (2026-07-02)
+
+**terrainChrBase Export-Fix:** Alle HD-Pack-Export- und Hash-Funktionen im DKC2-Viewer
+(`index.html`) verwendeten `bg1ChrBase` für Terrain-Tile-VRAM-Adressen. Bei geschwappten
+BG-Layouts (ppuConfig 0x03, z.B. Rambi Rumble: Terrain auf BG2 statt BG1) führte das zu
+falschen Hashes → 0% Match in Mesen.
+
+**Änderungen (index.html):**
+- `loadLevelBackground()` gibt jetzt `bg1TmLoaded` zurück
+- `loadTileParts()` gibt jetzt `terrainChrBase` zurück
+- `terrainChrBase` propagiert durch `currentTileRawData` und alle ppuConfig-Konstruktionen
+- 6 Export/Hash-Stellen verwenden jetzt `terrainChrBase` (mit `bg1ChrBase`-Fallback)
+- Irreführende Kommentare korrigiert (ppuConfig 0x03 = Rambi Rumble, nicht Lockjaw)
+
+**Weitere Fixes:**
+- `read_gfxset.ps1`: Falsche Level-ID korrigiert (0x02 → 0x15 für Lockjaw's Locker)
+
+**Test-Plan:**
+- Rambi Rumble (Level 0x02, ppuConfig 0x03) im Viewer laden → HD-Pack exportieren → in Mesen testen → Terrain-Hash-Match prüfen
+- Lockjaw's Locker (Level 0x15) im Viewer prüfen: Schiffswand sichtbar?
 
 ### M5.14 Session (2026-07-01)
 
@@ -921,3 +1044,226 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 
 3. **Performance Level 1 (Issue D)** — Tile-Level Caching
    - `GetMatchingTile()` wird 64× pro Tile aufgerufen → 1× cachen und 8px verwenden
+
+---
+
+## Session-Status (2. Juli 2026)
+
+### Abgeschlossen
+
+**GfxSet-Katalog Palette-Fix (2026-07-02)**
+- Bug: gfxSet-Ansicht zeigte immer Lava Lagoons Rot-Filter statt Lockjaw's saubere Palette
+- Root Cause: `buildCatalogByGfxSet()` nahm immer `levels[0]` als Referenz → Lava Lagoon
+- Fix: Bevorzuge `currentLevelId` als Referenz + Cache-Invalidierung bei Level-Wechsel
+- Status: **Getestet und bestätigt** durch User
+
+**Schiffswand Pipeline-Integration (2026-07-01/02)**
+- Wall-Tiles fließen durch komplette Pipeline: Container, ZIP, Import, Hashes, Per-Tile PNGs
+- Wall-Hashes in hashes.bin (Layer 1, gleicher chrBase wie BG2-Decke)
+- Wall per-tile PNGs in bg/bg2/gfxset_XX/ (32×32px, 4× skaliert)
+- Status: **Viewer getestet** (Lockjaw + Lava Lagoon Wall sichtbar), Mesen-Test ausstehend
+
+**Schiffswand (BG2 Wall) — Viewer-Integration (2026-07-01/02)**
+- Root Cause: gfxSet-Entries 3+4 laden Wall-Tilemaps nach VRAM word 0x7800/0x7C00 (BG2 Screens 2+3)
+- SNES nutzt HDMA für mid-frame BG2 vscroll (Decke ↔ Wand), nicht doubleHeight
+- BG2 CHR enthält 676 Tiles: Decke (1-577), Wand (578-652), Übergang (653-675)
+- Cross-validiert: gfxset_03 und gfxset_28 haben identische Wall-Daten
+- 6 Fixes in index.html: Erkennung, Rendering, Katalog, Export
+- Wall wird als separates Bild im Katalog angezeigt (rote Umrandung)
+- Wall wird als `bg2_wall.png` beim ZIP-Export mitgeliefert
+
+**terrainChrBase Fix (Vorherige Session)**
+- Export/Hash-Funktionen nutzten falschen chrBase für Terrain bei vertauschten BG-Layouts (ppuConfig 0x03)
+- Fix: `terrainChrBase` durchgängig in Daten-Pipeline eingeführt
+- Status: Mesen-Test noch ausstehend (keine HD-Tiles erstellt)
+
+**BG3 Foreground-Architektur — Forschung ABGESCHLOSSEN (2026-07-02)**
+- Umfassende Disassembly-Analyse: bank_B5.asm (~330KB), bank_80.asm (~380KB), vram.asm, structs.asm
+- Lokale DKC2_Routine_Macros.asm (175K Zeilen) durchsucht
+- Root Cause gefunden: BG3 ShipDeck-Tilemap wird dynamisch vom Scroll-Engine gestreamt
+- Zwei BG3-Lademechanismen dokumentiert (statisch vs dynamisch)
+- Alle 21 Level-Settings-Felder gemappt + alle 8 Tilemap-Tabellen identifiziert
+- 15 Layer-3-Tilemap-Dateien im ROM gefunden und dokumentiert
+- Status: **Forschung komplett, Implementation noch offen**
+
+**BG3 ShipDeck Viewer-Implementation (2026-07-02)**
+- `loadBg3ShipDeckMap()` Funktion implementiert (~140 Zeilen, nach `renderBgLayer()`)
+- Liest Metatile-Defs (DATA_F52087, 49×32B) + Metatile-Map (DATA_F526A7, 40×16 Words) aus ROM
+- Expandiert 4×4 Metatiles zu SNES-Tilemap-Words, rendert 2bpp Tiles mit Palette
+- Metatile-Flip-Transforms: H-flip, V-flip, HV-flip (Sub-Tile-Reihenfolge + XOR)
+- Output: 1280×512px Bild (40 Rows × 32px horizontal, 16 Cols × 32px vertikal)
+- Erkennung: `style.mapId === 3` in `loadLevelBackground()`
+- Integration: `fgData` als mode='shipdeck' → tiled-Rendering in `renderLevel()`
+- Auch: `buildCatalog()` und `buildBgImageFromCurrentLevel()` für BG3-Anzeige
+- Prioritäts-Diagnostik: pri0/pri1 Count wird geloggt (spätere Priority-Trennung möglich)
+- Status: **Implementiert, User-Test ausstehend**
+
+### Nächste Schritte
+
+1. **BG3 ShipDeck User-Test** — Pirate Panic im Viewer laden, BG3 Foreground prüfen
+   - Seile, Masten, Dekorelemente sollten jetzt als Overlay sichtbar sein
+   - Console-Log prüfen: `BG3 ShipDeck: X metatiles, Y tiles rendered`
+   - Pri0/Pri1-Verteilung prüfen — ggf. Priority-Trennung (Background/Foreground) nötig
+
+2. **Mesen-Test** — HD Pack mit Wall-Tiles in Mesen laden
+   - Ship-Level starten: Wall-Tiles durch Mesen erkannt?
+   - HDMA-Scroll: Wall sichtbar wenn BG2 zur Wand scrollt?
+
+3. **M5.14 testen** — Build + DKC2 Hot-Head Hop laden
+   - `lRetry` Counter im Diag-Log: sollte ~13573 sein
+   - `layerMis` Counter: sollte ~0 sein
+
+4. **BG3 Foreground Erweiterungen** — nach erfolgreichem Test
+   - Komprimierte Layer-3-Tilemaps für andere Level-Typen (Forest, Water, etc.)
+   - Priority-Trennung: pri-0 als Background, pri-1 als Foreground-Overlay
+   - BG3 ShipDeck Tiles in HD Pack Export integrieren (Hashes + per-tile PNGs)
+
+5. **Performance Level 1 (Issue D)** — Tile-Level Caching
+
+---
+
+## BG3 Foreground-Architektur (Forschung 2026-07-02)
+
+### Überblick
+
+BG3 in DKC2 wird für zwei verschiedene Zwecke genutzt:
+- **Vordergrund-Elemente** (Pirate Panic: Schiffstaue, Masten, Dekor) — ohne Color Math
+- **Effekt-Overlays** (Mainbrace Mayhem: Nebel, Hot-Head Hop: Lava-Glow) — mit Color Math
+
+Der Viewer zeigt an Zeile 1619 "Tilemap completely empty (e.g. Pirate Panic)" — dies ist
+korrekt, weil die BG3-Tilemap für ShipDeck-Level **nicht statisch** geladen wird.
+
+### Kritische Erkenntnis: Zwei BG3-Lademechanismen
+
+DKC2 verwendet zwei grundsätzlich verschiedene Mechanismen um BG3-Tilemaps zu befüllen:
+
+| Mechanismus | Beispiel-Level | Ablauf |
+|-------------|---------------|--------|
+| **Statisch via gfxSet DMA** | Forest, Water, Bramble | Komprimierte Daten via `VRAM_payload_handler` nach VRAM $5800/$5C00 dekomprimiert |
+| **Dynamisch via Scroll-Engine** | ShipDeck (Pirate Panic) | Tilemap-Daten spaltenweise aus ROM gestreamt während Gameplay |
+
+Für **Pirate Panic** (ppuConfig 0x01, gfxSet 0x07):
+- gfxSet 0x07 DMA lädt nur BG3 **CHR-Daten** (Tile-Grafiken) nach VRAM $59F0 ($0420 Bytes)
+- Die BG3 **Tilemap** (Tile-Anordnung) wird spaltenweise vom Scroll-Engine befüllt
+- Deshalb ist die Tilemap-VRAM-Region nach gfxSet-Loading legitimerweise leer
+
+### ROM-Datenquellen für ShipDeck BG3
+
+| Label | ROM-Adresse | Inhalt | Format |
+|-------|-------------|--------|--------|
+| `DATA_F52087` | Bank $F5 | Layer3_ShipDeck.bin Tilemap-Daten | Unkomprimiert |
+| `DATA_F52BA7` | Bank $F5 | Layer3_ShipDeck.bin Grafik/CHR-Daten | Unkomprimiert |
+
+### Scroll-Engine Routinen
+
+| Routine | Zweck |
+|---------|-------|
+| `CODE_B5A95B` | Horizontales Scroll + Tilemap-Streaming für ShipDeck |
+| `CODE_B5AB0B` | Vertikales Scroll + Tilemap-Streaming für ShipDeck |
+| `CODE_B5AA88` | BG3-Tilemap-Spalten-Upload (aufgerufen von NMI) |
+| `CODE_B5AC25` | BG3-Tilemap-Spalten-Upload (zweite Routine) |
+
+NMI submode 6 (`CODE_80B977`) ruft `CODE_B5AA88` + `CODE_B5AC25` auf und schreibt
+BG3-Scroll aus $B8 (berechnet von `CODE_80E52B`).
+
+### Level-Settings-Record — 21-Byte-Mapping
+
+Jedes Level hat einen 21-Byte-Konfigurationsblock, der von `CODE_BB9210` geparst wird:
+
+| Byte Offset | Größe | RAM Dest | Zweck |
+|-------------|-------|----------|-------|
+| 0-1 | word | $0517 | Graphics loading handler index (0-20 → DATA_BB9585) |
+| 2-3 | word | $0519 | HDMA handler index (0-26 → DATA_BB95AF) |
+| 4-5 | word | $051B | Music track ID |
+| 6-7 | word | $0A8E | Extra data pointer (bank FD) |
+| 8-9 | word | $051F | Runtime callback 1 |
+| 10-11 | word | $051D | Runtime callback 2 |
+| 12 | byte | $0537 | PPU register config ID (0-57 → DATA_FD79E2) |
+| 13 | byte | $0539 | Graphics/tilemap DMA set ID (0-60 → DATA_FD819A) |
+| 14-15 | word | $0527 | **VBlank PPU handler index** (0-33 → DATA_80B6C1) |
+| 16-17 | word | $0529 | **Game logic handler index** (0-31 → DATA_80D3D1) |
+| 18 | byte | $0523 | **Map type ID (0-20)** — indexiert Tilemap-Tabellen |
+| 19-20 | word | $052B | Level flags |
+
+**Korrektur:** $0527/$0529 sind KEINE "PPU config params" — sie sind **Dispatch-Table-Indices**
+für die per-Frame VBlank- und Game-Logic-Handler.
+
+### Map Type ID ($0523) — Zentraler Tilemap-Index
+
+Die Map Type ID bei $0523 wird an `CODE_B5BCA8` übergeben, die 8 parallele Tabellen indiziert:
+
+| Tabelle | Größe/Eintrag | Inhalt | RAM-Ziel |
+|---------|---------------|--------|----------|
+| DATA_B5BAEF | 3 Bytes (dl) | Tilemap-Datenpointer (Banks $E3-$E5) | $98-$9B |
+| DATA_B5BB2E | 3 Bytes (dl) | Tile-Arrangement-Pointer (Banks $E5-$E6) | $17B4 |
+| DATA_B5BB6D | 2 Bytes (dw) | VRAM-Basisadressen ($6800,$3800,$7800,$7000) | $17B6 |
+| DATA_B5BB97 | 3 Bytes (dl) | Kollisionshöhen-Datenpointer (Bank $FC) | $9C-$9F |
+| DATA_B5BBD6 | 2 Bytes (dw) | Level-Höhenlimits | $A0 |
+| DATA_B5BC00 | 2 Bytes (dw) | Terrain-Handler-Funktionspointer | $17B2 |
+| DATA_B5BC54 | 2 Bytes (dw) | Scroll-Zone-Flags | $0B86 |
+| DATA_B5BC7E | 2 Bytes (dw) | Scroll-Zone-Tabellenpointer | $0B84 |
+
+**Index 3 = ShipDeck** (Pirate Panic's Tileset-Typ)
+
+### VBlank Dispatch-Tabellen
+
+| Tabelle | Adresse | Einträge | Selektiert durch |
+|---------|---------|----------|-----------------|
+| VBlank PPU Handlers | DATA_80B6C1 | 34 | $0527 (vblankType) |
+| Game Logic Handlers | DATA_80D3D1 | 32 | $0529 |
+
+### BG3 Parallax-Scroll-Berechnung (CODE_80E52B)
+
+- Formel: `BG3_X ≈ camera_X × 1.25`, mit rate-limitiertem Catch-Up (Delta auf -8..+7 pro Frame geclampt)
+- Auch `mod 5` auf Scroll-High-Byte
+- Benutzt von Game-Modi 6 und 24
+- Ergebnis in $B8, geschrieben nach `PPU.layer_3_scroll_x` durch NMI submode 6
+
+### BG3 Scroll-Modi (3 Typen)
+
+| Modus | Mechanismus | Verwendung |
+|-------|------------|------------|
+| 1: Direkte PPU-Writes | Kein HDMA, BG3-Scroll direkt aus Kameraposition | Die meisten Level (Bramble, Hive, Mine, Swamp) |
+| 2: 8-Band HDMA | 8 Parallax-Bänder via HDMA Ch6, Wellenanimation | Wasser-Level mit Parallax |
+| 3: Full per-Scanline HDMA | Komplette HDMA-Tabelle für Wasseroberflächen-Effekt + Ripple | Wasser/Wolken-Level |
+
+### Layer 3 Tilemap-Dateien im ROM
+
+| Datei | Komprimiert? | Level-Typ |
+|-------|-------------|-----------|
+| Layer3_ShipDeck.bin | Nein | Schiffs-Level (Pirate Panic) |
+| Layer3_Level_Jungle.bin | Ja | Dschungel-Level |
+| Layer3_Level_Water.bin | Ja | Wasser-Level |
+| Layer3_Level_Bayou.bin | Ja | Sumpf/Bayou-Level |
+| Layer3_Level_Rigging.bin | Ja | Rigging-Level |
+| Layer3_Level_BeeHive.bin | Ja | Bienenstock-Level |
+| Layer3_Level_Forest.bin | Ja | Wald-Level |
+| Layer3_Level_IceCave.bin | Ja | Eishöhlen-Level |
+| Layer3_Level_Brambles.bin | Ja | Bramble-Level |
+| Layer3_Level_HauntedHall.bin | Ja | Haunted Hall-Level |
+| Layer3_Level_LavaCave.bin | Nein | Lavahöhlen-Level |
+| Layer3_WorldMap.bin | Ja | Weltkarte |
+| Layer3_FastRain.bin | Nein | Regeneffekt |
+| Layer3_CastleCrushFloor.bin | Nein | Castle Crush Boden |
+| Layer3_WindyWellLeaves.bin | Ja | Windy Well Blätter |
+
+### Widerlegte Hypothese: $0046/$0048 als VRAM-Adressen
+
+$0046/$0048 sind **NICHT** VRAM-Adressen. Sie sind **Sprite-Feld-Offset-Writes** in der
+Sprite-Config-Script-Engine bei `CODE_BB8474`. Werte die wie VRAM-Adressen aussahen
+(z.B. $5000, $5800) sind tatsächlich Sprite-Bewegungsparameter (Zinger-Flugmuster etc.).
+
+### Nächste Schritte für BG3-Implementation
+
+1. **Deep-Dive in Scroll-Engine Streaming-Format:**
+   - Code von `CODE_B5A95B` und `CODE_B5AB0B` aus bank_B5.asm analysieren
+   - Datenformat von `DATA_F52087` (Layer3_ShipDeck.bin) entschlüsseln
+   - Metatile-Dekodierung verstehen (8×8 Tiles → Bildschirmspalten)
+   - BG3 Tile-Arrangement-Tabelle finden
+
+2. **`loadBg3ForegroundMap()` im Viewer bauen:**
+   - Layer3_ShipDeck Tilemap-Daten aus ROM lesen
+   - Scroll-Engine-Format dekodieren
+   - Als BG3-Vordergrund-Layer rendern
+
+3. **Komprimierte Layer-3-Tilemaps** für andere Level-Typen handhaben (Rare-Kompression)

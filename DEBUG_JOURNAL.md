@@ -1,6 +1,42 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-01 | Mesen Build: M5.14 (untested) | VRAM-Dump-Pipeline: COMPLETE
+Stand: 2026-07-03 | Mesen Build: M5.14 (untested) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED
+
+---
+
+## ShipDeck BG3 Virtual Tilemap Pipeline (2026-07-02)
+
+### Problem
+ShipDeck levels (mapId=3) verwenden ein dynamisches Metatile-Scroll-System für BG3 (Schiffstaue,
+Vordergrund-Dekor). Die VRAM-Tilemap bei $7800 ist zur Ladezeit komplett leer — nur die
+Scroll-Engine füllt sie zur Laufzeit Stück für Stück. Die Export-Pipeline las diese leere
+Tilemap und konnte daher keine BG3 per-tile PNGs oder Hashes generieren.
+
+### Lösung: expandShipDeckMetatilesToTilemap()
+Neue Helper-Funktion, die alle 49 Metatile-Definitionen (ROM 0x352087) und die 40×16 Metatile-Map
+(ROM 0x3526A7) in eine flache 160×64 "virtuelle" Tilemap expandiert. Jedes Metatile wird zu 4×4
+Tiles aufgelöst, mit korrekten H/V-Flip-Bits (XOR zwischen Metatile-Flip und Tile-Flip).
+
+### Pipeline-Integration (4 Stellen)
+| Stelle | Erkennung | Override |
+|--------|-----------|----------|
+| `saveCurrentHDToContainer()` | `currentStyle?.mapId === 3` | bg3TilemapData + ppuConfig.bg3TilesW/H |
+| `buildCatalogByGfxSet()` | `style.mapId === 3` | catalogBg3TilemapData + catalogPpuConfig |
+| `refreshContainerSetMetadata()` | `currentStyle?.mapId === 3` | bg3TilemapData + ppuConfig.bg3TilesW/H |
+| `expandShipDeckMetatilesToTilemap()` | (die Funktion selbst) | Liest ROM, gibt {tilemapData, tilesW, tilesH} zurück |
+
+### Kompatibilitäts-Check
+- Per-tile PNG: srcTileSize = 1280/160 = 8 (1x) oder 5120/160 = 32 (4x HD) ✓
+- Hashes: CHR-Daten in VRAM vorhanden (von gfxSet DMA geladen), nur Tilemap fehlte ✓
+- Dedup: Tile/Palette-Key funktioniert unverändert ✓
+- Un-flip: flipH/flipV korrekt aus dem virtuellen tileWord gelesen ✓
+
+### Test-Plan
+1. ShipDeck-Level laden (Pirate Panic, gfxSet 0x07)
+2. Im Katalog öffnen → BG3-Bild kontrollieren (1280×512, Schiffstaue sichtbar?)
+3. Container speichern → Console prüfen: `[save] ShipDeck BG3: replaced empty VRAM tilemap...`
+4. HD-Pack exportieren → bg/bg3/gfxset_07/ prüfen: per-tile PNGs vorhanden?
+5. hashes.bin: BG3 hash entries für gfxset 7 vorhanden?
 
 ---
 
@@ -14,8 +50,9 @@ Stand: 2026-07-01 | Mesen Build: M5.14 (untested) | VRAM-Dump-Pipeline: COMPLETE
 | D | Performance Level 1 leicht schlechter | OFFEN — Optimierung geplant | M5.10 | M5.10: spielbar aber spürbar |
 | E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | M5.11: VERIFIED ✓ — Lava-Glow auf HD Tiles sichtbar | 2026-06-29 | M5.11 OK |
 | F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | Known Limitation (wie Piratenflagge) | 2026-06-29 | Erste Beobachtung |
-| G | Lockjaw's Locker: BG2 Sub-Screen + HDMA-Scroll-Effekt | Viewer-Limitation, Laufzeit teilweise OK (3D-Hintergrund fehlt) | 2026-06-29 | Erste Beobachtung |
+| G | Glimmer's Galleon (ppuConfig 0x28): BG2 Sub-Screen + HDMA-Scroll-Effekt | Viewer-Limitation, Laufzeit teilweise OK (3D-Hintergrund fehlt) | 2026-06-29 | Erste Beobachtung |
 | H | Hot-Head Hop: Unteres Fünftel — Layer Index Mismatch (BG2 runtime, BG1 in pack) | M5.13: Layer-agnostic retry — M5.14: Fallback-Retry entfernt (Bubble-Regression) | 2026-06-30 | M5.13: unteres 1/5 HD ✓, aber Blasen-Löcher im oberen Bereich |
+| I | Rambi Rumble BG3: Honig opak, Bienenstock verdeckt (Sub-Screen-Blend) | v3 BESTÄTIGT — Layer-Reihenfolge korrekt. Feintuning (Alpha, Catalog) nächste Session | 2026-07-02 | v3 getestet 2026-07-03: Waben=BG, Honig=FG ✓ |
 
 ---
 
@@ -1137,6 +1174,336 @@ window[0].activeLayers[2] = true, invertedLayers[2] = true → BG3 nur außerhal
 Viewer-Limitation bestätigt. Laufzeit funktioniert bis auf 3D-Hintergrund.
 Kein Code-Fix im HD-Filter nötig — Problem liegt im Viewer-Export.
 
+### Sub-Investigation: Decompressor-Truncation-Hypothese (2026-06-30 / 2026-07-01)
+
+**Hypothese:** `rareDecompress()` bricht zu früh ab → fehlende BG-Tiles.
+
+**Untersuchung:**
+1. Diagnostik-Instrumentierung eingebaut (Trace Ring-Buffer, Exit-Logging, Size-Vergleich)
+2. BG1 CHR (VRAM $2000): dekomprimiert $3000 Bytes, GFX-Tabelle sagt $3400 → "Truncation" detektiert
+3. BG2 CHR (VRAM $4000): dekomprimiert $5480, Tabelle $5480 → exakt gleich
+4. Alle 32 Dekompressions-Commands Zeile für Zeile gegen p4plus2/DKC2-disassembly `compression.asm` verifiziert — keine Logik-Fehler
+5. Carry-Flag-Analyse für alle ADC-Operationen: carry=0 in allen Fällen korrekt
+
+**Resolution: KEIN BUG — False Alarm.**
+Analyse des `VRAM_payload_handler` im DKC2-Disassembly ($BB8CB5) beweist:
+```asm
+PHX               ; Table-Index sichern VOR Dekompression
+JSL decompress    ; dekomprimiert nach $7F0000, gibt Anzahl in X zurück
+PLX               ; ÜBERSCHREIBT X sofort — Decompressor-Rückgabewert wird VERWORFEN
+LDA FD819F,x      ; liest DMA-Größe aus TABELLE (Bytes 5-6 des 7-Byte-Eintrags)
+STA DMA[0].size   ; DMA transferiert Tabellen-spezifizierte Bytes aus $7F0000
+```
+Das `size`-Feld in der GFX-Set-Tabelle ist die **DMA-Transfer-Größe**, NICHT die erwartete
+dekomprimierte Größe. Wenn der Decompressor weniger Bytes produziert als die Tabelle sagt,
+kommen die restlichen Bytes aus dem vor-gelöschten $7F0000-Buffer (Nullen).
+Unser `new Uint8Array(0x20000)` ist ebenfalls vor-genullt → identisches Verhalten.
+
+**Cleanup (2026-07-01):**
+- `expectedSize` Parameter aus `rareDecompress()` entfernt
+- Trace Ring-Buffer und False-Alarm-Warnings entfernt
+- Echte Fehler-Warnings (unknown opcode, MAX_ITER) bleiben erhalten
+
+**Ruled Out:** Decompressor-Truncation als Ursache für fehlende BG-Tiles.
+
+---
+
+## Issue H: Fehlende Schiffswand (Ship Wall) — Swapped VRAM Layouts
+
+**Datum:** 2026-07-01  
+**Status:** FIX ANGEWENDET — Wartet auf User-Testing  
+**Betroffene Level:** Rambi Rumble (ppuConfig 0x03), potenziell Glimmer's Galleon (ppuConfig 0x28)
+
+**WICHTIG: Level-ID-Korrektur (2026-07-01):**  
+Die ursprüngliche Analyse bezog sich auf "Lockjaw's Locker (ppuConfig 0x03)" — das war FALSCH.
+- ppuConfig 0x03 ist **Rambi Rumble** (Level ID 0x02), NICHT Lockjaw's Locker
+- Die echte **Lockjaw's Locker** (Level ID 0x15) hat **ppuConfig 0x02** (Standard-Layout)
+- Für Lockjaw's Locker funktioniert der BG2-Rendering-Pfad über bg2TmLoaded bereits korrekt
+- Die BG1-Rendering-Fixes (H.2) sind trotzdem korrekt — sie lösen das Problem für Rambi Rumble
+
+### Problem
+
+Im Viewer fehlt die Schiffswand mit Laternen/Fackeln, die im Spiel als Hintergrund der Ship-Hold-Level sichtbar ist. Der Export zeigt nur den dynamischen Terrain-Layer (Plattformen), aber nicht den statischen Hintergrund.
+
+### Root-Cause-Analyse
+
+**1. loadLevelBackground() renderte BG1 nie (vor Fix):**  
+Die Funktion renderte nur BG2 und BG3 als Hintergrund-Layer. Für ppuConfig 0x03 (Rambi Rumble) liegt die Schiffswand/Scenery aber auf BG1 (statischer Hintergrund), während BG2 der dynamische Terrain-Layer ist. Das VRAM-Layout ist gegenüber dem Standard vertauscht:
+
+| BG | chrBase | tilemapBase | Rolle (ppuConfig 0x03 = Rambi Rumble) |
+|---|---|---|---|
+| BG1 | $5000 | $6C00 | **Statischer Hintergrund (Scenery)** |
+| BG2 | $2000 | $7800 | **Dynamisches Terrain** |
+| BG3 | $7000 | $6800 | **Statischer Hintergrund** |
+
+**2. DMA-Truncation-Bug:**  
+Der Viewer kopiert ALLE dekomprimierten Bytes in VRAM, unabhängig von der DMA-Transfer-Größe (`entry.size`). Auf echter SNES-Hardware überträgt DMA nur `entry.size` Bytes. Overflow in angrenzende VRAM-Regionen verfälscht CHR-Daten, besonders bei gfxSet 0x04 wo Entry 3 ($5300) und Entry 4 ($2000) kontingent sind.
+
+**3. loadTileParts() benutzt falschen chrBase:**  
+Für ppuConfig 0x03 ist BG2 der Terrain-Layer (chrBase=$2000), aber `loadTileParts()` benutzt immer `ppu.bg1.chrBase` ($5000). Map32 Tile-Indices referenzieren Tiles relativ zum Terrain-BG chrBase → falsche CHR-Daten.
+
+### Tilemap-Loading-Heuristik
+
+Zuverlässige Methode um statische BGs von dynamischem Terrain zu unterscheiden:
+- **gfxSet-Entry schreibt an tilemapBase** → statischer Hintergrund (Tilemap aus ROM geladen)
+- **Kein Entry schreibt an tilemapBase** → dynamisches Terrain (Tilemap wird zur Laufzeit vom Scroll-Engine gefüllt)
+
+Verifikation über bekannte Configs:
+
+| Level | ppuConfig | BG1 tm geladen? | BG2 tm geladen? | BG3 tm geladen? |
+|---|---|---|---|---|
+| Lockjaw's Locker | 0x03 | **JA** ($6C00) | NEIN ($7800) | JA ($6800) |
+| Lava Lagoon | 0x02 | NEIN ($3800) | JA ($7000) | JA ($6C00) |
+| Glimmer's Galleon | 0x28 | NEIN ($3800) | JA ($7000) | NEIN ($6C00) |
+
+### Angewendete Fixes (index.html)
+
+**Fix H.1 — DMA Truncation in loadLevelBackground() (~line 1452):**
+```javascript
+if (data.length > entry.size) {
+    data = data.slice(0, entry.size);
+}
+```
+
+**Fix H.2 — Tilemap-Erkennung und BG1-Rendering in loadLevelBackground() (~line 1475-1571):**
+- `bg1TmLoaded` / `bg2TmLoaded` / `bg3TmLoaded` Flags basierend auf Tilemap-Heuristik
+- `primaryBg` Auswahl bevorzugt BGs mit geladenen Tilemaps
+- BG3/BG2 Rendering nur wenn Tilemap geladen (`bg3TmLoaded`, `bg2TmLoaded`)
+- Neuer BG1-Rendering-Block für statische Hintergründe
+
+**Fix H.3 — DMA Truncation in loadTileParts() (~line 2140):**
+Gleiche Truncation wie in loadLevelBackground(), verhindert VRAM-Overflow.
+
+**Fix H.4 — DMA Truncation in loadOverworldLevel() NPC shops (~line 1697):**
+Gleiche Truncation für NPC-Shop VRAM-Loading.
+
+**Fix H.5 — Terrain chrBase Fix in loadTileParts() (~line 2119-2171):**
+Verwendet Tilemap-Heuristik um den korrekten Terrain-BG zu ermitteln:
+```javascript
+const bg1TmLoaded = entries.some(e => e.vram === ppu.bg1.tilemapBase);
+const terrainBg = bg1TmLoaded ? ppu.bg2 : ppu.bg1;
+const terrainChrBase = terrainBg.chrBase;
+```
+Alle Referenzen (`gfxSize`-Tracking, `gfxData`-Extraktion, `injectAnimatedTiles`) verwenden jetzt `terrainChrBase` statt `bg1ChrBase`.
+
+### Offene Punkte
+
+- **User-Testing nötig:** Rambi Rumble mit ppuConfig 0x03 prüfen (BG1 als Hintergrund), Terrain-Tiles verifizieren
+- **User-Testing nötig:** Rambi Rumble HD-Pack exportieren → in Mesen laden → Terrain-Tile-Hashes verifizieren (terrainChrBase-Fix validieren)
+- **Lockjaw's Locker (ppuConfig 0x02):** BG2-Schiffswand sollte bereits korrekt angezeigt werden (bg2TmLoaded greift, verifiziert 2026-07-01)
+- ~~**HD-Pack-Export:** Die Export-Funktionen (lines 6817, 6894, 7371, 7779, 8465) verwenden noch `bg1ChrBase` für Tile-Hash-Berechnung → müssen ebenfalls den terrainBg-Fix bekommen~~ **ERLEDIGT (2026-07-02):** `terrainChrBase` in allen 6 Export-Stellen eingebaut (lines ~6903, 7380, 7788, 7898, 8478 + ppuConfig-Konstruktion an 3 Stellen). Siehe Fix H.6 unten.
+- **Glimmer's Galleon (ppuConfig 0x28):** BG3 Tilemap wird NICHT von gfxSet geladen. Die Schiffswand könnte auf BG2 liegen (das IST geladen) → Viewer-Export prüfen
+- **BG2 Fill-Tile Export:** Niedrigere Priorität, HDMA-Parallax-Regionen werden falsch exportiert
+
+### Fix H.6 — terrainChrBase in HD-Pack-Export-Funktionen (2026-07-02)
+
+**Problem:** Alle Export- und Hash-Funktionen verwendeten `bg1ChrBase` zur Berechnung der
+VRAM-Adressen für Terrain-Tile-Arrangements. Bei geschwappten Layouts (ppuConfig 0x03,
+Rambi Rumble: Terrain auf BG2) war `bg1ChrBase` FALSCH → exportierte Hashes stimmten
+nicht mit Mesens Runtime-Hashes überein → 0% Match.
+
+**Fix:** `terrainChrBase` wird jetzt durch die gesamte Datenpipeline propagiert:
+- `loadLevelBackground()` gibt `bg1TmLoaded` zurück (line ~1639)
+- `loadTileParts()` gibt `terrainChrBase` zurück (line ~2228)
+- `currentTileRawData` enthält `terrainChrBase` (line ~4922)
+- Alle ppuConfig-Konstruktionen enthalten `terrainChrBase` (3 Stellen)
+- 6 Export/Hash-Code-Stellen verwenden `terrainChrBase` (mit `bg1ChrBase`-Fallback)
+
+**Betroffene Funktionen:**
+- `saveCurrentHDToContainer()` — Terrain-Checksum (line ~6903)
+- `exportAsTexturePack()` — chrBase für Hash-Berechnung (line ~7380)
+- Hash-Computation — storedChrBase (line ~7788)
+- VRAM-Fingerprint-Diagnostik (line ~7898)
+- `refreshCurrentHDInContainer()` — Refresh-Checksum (line ~8478)
+
+**Zusätzlich korrigiert:**
+- Irreführende Code-Kommentare: "Lockjaw's Locker" → "Rambi Rumble" für ppuConfig 0x03 (lines ~1565, 2121)
+- `read_gfxset.ps1` line 26: falsche Level-ID 0x02 → 0x15 für Lockjaw's Locker
+
+---
+
+## Disassembly-Analyse: Level-Init und VRAM-Loading (2026-07-01)
+
+### VRAM_payload_handler_global ($BB80B0)
+
+Benutzt **exakt die gleiche Tabelle** wie der Viewer (`DATA_FD819A` = ROM 0x3D819A).
+Nimmt eine Payload-ID als Index, liest 7-Byte-Einträge (Bank, Addr, VRAM-Ziel, DMA-Größe),
+dekomprimiert/kopiert die Daten nach $7F:0000, DMA'd sie zum VRAM. Mehrere Chunks bis Terminator (Bank=0).
+
+**Kritische Erkenntnis:** Der Viewer's `readGfxSetEntries()` implementiert exakt die gleiche
+Logik. Es gibt KEINE versteckte zweite Datenquelle.
+
+### DATA_BB9592 — Level-Init Handler-Tabelle (21 Einträge)
+
+Handler 0x0011 (`CODE_BB95F2`) — benutzt von Lockjaw, Lava Lagoon, Mainbrace, Rambi Rumble:
+```asm
+LDA #$0001                      ; VRAM Payload #1 (gemeinsame Sprite-Tiles)
+JSL VRAM_payload_handler_global
+LDA $0539                       ; Level-spezifischer gfxSet-Index
+JSL VRAM_payload_handler_global
+JSR CODE_BB94B6                  ; Palette/Misc Init
+LDA $0537                       ; PPU Register Config ID
+JSL set_PPU_registers_global
+```
+
+### VRAM Payload #1 (Common/Shared)
+
+Nur **ein** Eintrag: 1664 Bytes raw data nach VRAM word 0x1CC0 (= OBJ Sprite-Tiles 204-255
+der zweiten Sprite-Nametable). Enthält gemeinsame Sprites (DK-Barrel, Bananen etc.).
+**Keine Hintergrunddaten!**
+
+### $0537 und $0539 Herkunft
+
+Diese RAM-Adressen werden in `bank_BB.asm` nur GELESEN, nie geschrieben.
+Sie werden während der Style-Data-Parsing (CODE_BBAF0F) gesetzt:
+- $0537 = ppuConfig (Style Data Offset 12)
+- $0539 = gfxSet (Style Data Offset 13)
+
+### BG2 Tilemap-Verifikation (2026-07-01)
+
+VRAM-Dump-Analyse von Lava Lagoon (ppuConfig 0x02, gfxSet 3) bestätigt:
+- BG2 Tilemap (word 0x7000-0x77FF): **1456 von 2048 Einträgen non-zero**
+- Klares Schiffswand-Muster: sequenzielle Tile-Indices 0x001-0x0CB, symmetrische Struktur
+- BG2 CHR (word 0x4000): vollständig geladen (21632 Bytes, 676 Tiles)
+- Die gfxSet-3 Entries 1+2 laden die BG2 Tilemap korrekt nach word 0x7000/0x7400
+- bg2TmLoaded-Check: `entries.some(e => e.vram === 0x7000)` → TRUE (verifiziert per ROM-Readout)
+- BG2 Rendering-Pfad in loadLevelBackground() wird korrekt ausgeführt
+
+**~~"Unknown" gfxSet 3 Entries ($7800, $7C00):~~ KORRIGIERT (siehe unten)** — Sind NICHT Scratch-Daten,
+sondern die **Schiffswand-Tilemaps** (BG2 Screens 2+3). Siehe Abschnitt "Schiffswand-Analyse".
+
+### Korrekte Level-ID-Zuordnungen (VERIFIED)
+
+| Level ID | Level Name | ppuConfig | gfxSet | vblankType |
+|---|---|---|---|---|
+| 0x00 | Mainbrace Mayhem | 0x01 | 0x02 | 0x01 |
+| 0x01 | Glimmer's Galleon | 0x28 | 0x28 | 0x12 |
+| 0x02 | Rambi Rumble | 0x03 | 0x04 | 0x03 |
+| 0x14 | Lava Lagoon | 0x02 | 0x03 | 0x18 |
+| 0x15 | Lockjaw's Locker | 0x02 | 0x03 | 0x02 |
+
+---
+
+## Schiffswand-Analyse und Fix (2026-07-01 / 2026-07-02)
+
+### Problem
+
+In Schiffs-Levels (Lockjaw's Locker, Lava Lagoon, Glimmer's Galleon) war die Schiffswand
+im Viewer unsichtbar. Die BG2-Schiffsdecke und BG3-Wasser wurden korrekt dargestellt,
+aber der untere Bereich (Holzplanken-Wand) fehlte komplett.
+
+### Root-Cause-Analyse
+
+**VRAM-Dump-Analyse** (gfxset_03_vram.bin + gfxset_28_vram.bin) ergab:
+
+Die gfxSet-Entries 3+4 laden Tilemap-Daten nach VRAM-Adressen **außerhalb** des normalen
+BG2 64×32 Tilemap-Bereichs:
+
+| Entry | VRAM Word | Inhalt | Größe |
+|---|---|---|---|
+| 3 | 0x7800 | Wall Tilemap Screen 2 (links) | 768 Bytes = 12×32 Tiles |
+| 4 | 0x7C00 | Wall Tilemap Screen 3 (rechts) | 768 Bytes = 12×32 Tiles |
+
+Diese Adressen liegen bei word 0x7800-0x7FFF, also Screens 2+3 einer konzeptuellen 64×64 Tilemap.
+Die PPU-Register zeigen `doubleHeight=false` (64×32), aber das Spiel nutzt **HDMA** um
+BG2 vscroll mid-frame zwischen Decke und Wand umzuschalten.
+
+**BG2 CHR enthält DREI Tile-Gruppen (676 Tiles gesamt):**
+
+| Tile-Indices | Zweck |
+|---|---|
+| 1-577 (577 Tiles) | Schiffsdecke (BG2 Tilemap Rows 0-23) |
+| 578-652 (75 Tiles) | Schiffswand (referenziert von Entries 3+4) |
+| 653-675 (23 Tiles) | Übergangsstreifen Decke→Wand (Rows 24-27) |
+
+**Cross-Validation:** gfxset_03 (Lava Lagoon) und gfxset_28 (Glimmer's Galleon) haben
+byte-identische Wall-Tilemap-Daten.
+
+### Implementierung (5 Fixes)
+
+**Fix 1 — Wall-Erkennung in `loadLevelBackground()` (~Zeile 1480)**
+- Erkennt Wall-Tilemap-Entries an Adresse `bg2.tilemapBase + 0x800` / `+ 0xC00`
+- Rendert Wall als separates `wallData` Image mit synthetischer bgConfig
+- Rückgabeobjekt enthält jetzt `wallData`
+
+**Fix 2 — `buildCatalog()` (~Zeile 5455)**
+- Erstellt `wallImage` Canvas aus `currentBgData.wallData`
+- Return-Objekt enthält `wallImage`
+
+**Fix 3 — Katalog-Anzeige (~Zeile 5611)**
+- Rendert Wall-Sektion nach BG2 mit rotem Rahmen (#e57373) und Label "BG2 Wall (Schiffswand)"
+
+**Fix 4 — `buildCatalogByGfxSet()` Return (~Zeile 4411)**
+- `wallImage: null` zum Return hinzugefügt für Konsistenz
+
+**Fix 5 — `buildBgImageFromCurrentLevel()` (~Zeile 5297)**
+- Unterstützt jetzt `layer === 'wall'` als Parameter
+- Nutzt `currentBgData.wallData` statt `ppu[layer]`
+
+**Fix 6 — ZIP-Export (~Zeile 6050)**
+- Wall wird automatisch als `bg2_wall.png` exportiert wenn BG2-Checkbox aktiviert
+- `manifest.bg2_wall` im Manifest
+
+### Status
+
+- Viewer-Fixes: implementiert, **Test ausstehend** (Browser-Test mit Lockjaw/Lava Lagoon)
+- HD-Pack-Export: Wall-PNG wird exportiert, **Hash-Integration ABGESCHLOSSEN (2026-07-02)**
+  - Wall-Hashes in hashes.bin (Layer 1, gleicher chrBase wie BG2-Decke)
+  - Wall per-tile PNGs in bg/bg2/gfxset_XX/ (32×32px, 4× skaliert, un-flipped)
+  - Container-Pipeline komplett: save, load, ZIP export/import, refresh
+- HDMA-basierte Darstellung in Mesen (mid-frame vscroll) ist eine eigene Aufgabe
+
+### Pipeline-Integration Details (2026-07-02)
+
+**Batch 4 (importContainerFromZip):** wallTilemapData aus wall_tilemap.bin geladen,
+wallBlob + wallTilemapData in hdSaveSet()-Aufruf eingefügt.
+
+**Batch 5 (refreshContainerSetMetadata):** wallTilemapData Refresh aus VRAM mit
+ppuConfig.wallTilemapBase, wallBlob + wallTilemapData + Wall-Checksums in hdSaveSet().
+
+**Batch 6 (Hash-Generierung):** Wall-Hash-Loop nach BG2-Hashes in exportAsTexturePack().
+Layer 1, gleicher chrBase, tileNum===0 Skip, Dedup-Key ${gfxset}_1_${vramWordAddr}.
+
+**Batch 7 (Per-Tile PNG Export):** Wall-Tiles aus wallBlob extrahiert, in gleichen
+bg/bg2/gfxset_XX/ Ordner wie Decken-Tiles. Keine Filename-Kollision (verschiedene
+vramWordAddrs wegen verschiedener Tile-Indices 578-652 vs 1-577).
+
+**User-Test (2026-07-02):** Wall-Pipeline getestet — Lockjaw + Lava Lagoon zeigen
+beide BG2-Bilder (Decke + Wand) korrekt im Viewer.
+
+---
+
+## GfxSet-Katalog Palette-Bug (2026-07-02)
+
+### Symptom
+
+GfxSet-Ansicht für gfxSet 0x03 zeigte immer Lava Lagoons rötlichen Farbfilter,
+auch wenn Lockjaw's Locker geladen war. Rein visueller Viewer-Bug — exportierte
+Tiles im ZIP waren korrekt (ohne Rot-Filter).
+
+### Root Cause
+
+`buildCatalogByGfxSet()` Zeile 4257 nahm immer `setInfo.levels[0]` als Referenz-Level.
+`scanGraphicsSets()` iteriert Level-IDs aufsteigend (0-191), daher wird für gfxSet 0x03
+Lava Lagoon (ID 0x14) vor Lockjaw's Locker (ID 0x15) eingefügt → `levels[0]` = Lava Lagoon.
+
+Lava Lagoons `routine1=0x14` triggert in `loadTileParts()` Zeile 2237-2242 eine **komplette
+Palette-Ersetzung** aus ROM 0x3D1610 (rötliche Palette). Die CHR-Grafikdaten sind zwar
+identisch für alle Levels im gleichen gfxSet, aber Palette (routine1), ppuConfig (Color Math),
+und vblankType (animierte Tiles) sind **per-Level Eigenschaften**.
+
+### Fix
+
+1. **`buildCatalogByGfxSet()`:** Wenn `currentLevelId` im selben gfxSet enthalten ist,
+   wird dessen Level als Referenz benutzt statt `levels[0]`.
+2. **`toggleCatalogView()`:** Cache-Invalidierung erweitert — prüft jetzt auch
+   `catalogData.refLevelId !== currentLevelId`.
+3. **catalogData Return:** Neues Feld `refLevelId` für Cache-Vergleich.
+
+### Status
+
+**GETESTET UND BESTÄTIGT** — User hat Lockjaw/Lava Lagoon Wechsel geprüft, sieht sauber aus.
+
 ---
 
 ## Prozess-Regeln
@@ -1158,3 +1525,317 @@ Kein Code-Fix im HD-Filter nötig — Problem liegt im Viewer-Export.
 3. Key-Metriken extrahieren: match/miss/palMis/notInPack Ratio
 4. Spezifische MISS-Hashes gegen hashes.bin prüfen
 5. Ergebnis dokumentieren BEVOR nächster Fix implementiert wird
+
+---
+
+## BG3 Foreground-Architektur — Forschung (2026-07-02)
+
+### Kontext
+
+BG3-Vordergrund-Elemente (Seile, Masten, Dekor) in Pirate Panic sind im Viewer unsichtbar.
+Die Analyse ergab, dass dies KEIN Bug ist — die BG3-Tilemap für ShipDeck-Level wird
+zur Laufzeit dynamisch vom Scroll-Engine befüllt und ist nach gfxSet-Loading tatsächlich leer.
+
+### Forschungsmethodik
+
+Umfangreiche Analyse folgender Quellen:
+- p4plus2 DKC2-Disassembly: `bank_B5.asm` (~330KB), `bank_80.asm` (~380KB), `vram.asm`, `structs.asm`
+- Lokale `DKC2_Routine_Macros.asm` (175K Zeilen)
+- Cross-Referenzierung von RAM-Adressen, Dispatch-Tabellen, Tilemap-Tabellen
+
+### Ergebnisse
+
+Alle Forschungsergebnisse wurden in `SNES_HD_PACK_PROJECT.md` → Abschnitt "BG3 Foreground-
+Architektur (Forschung 2026-07-02)" dokumentiert. Hier die Kurzfassung:
+
+**Root Cause:** BG3 ShipDeck-Tilemap wird dynamisch vom Scroll-Engine aus `DATA_F52087`
+(Layer3_ShipDeck.bin, unkomprimiert, Bank $F5) spaltenweise gestreamt. Die gfxSet-DMA
+lädt nur CHR-Daten (Tile-Grafiken), NICHT die Tilemap.
+
+**Zwei Mechanismen:**
+- Statisch (Forest, Water, etc.): Tilemap via gfxSet DMA direkt ins VRAM
+- Dynamisch (ShipDeck, evtl. andere): Tilemap spaltenweise vom Scroll-Engine gestreamt
+
+**Key ROM/Code Referenzen:**
+- `DATA_F52087` — Layer3_ShipDeck.bin Tilemap-Daten
+- `CODE_B5A95B` — Horizontales Scroll/Streaming
+- `CODE_B5AB0B` — Vertikales Scroll/Streaming
+- `CODE_B5BCA8` — Zentrales Map/Tileset-Loading (nimmt Map Type ID)
+- 8 parallele Tabellen bei `DATA_B5BAEF`..`DATA_B5BC7E` (indiziert durch Map Type $0523)
+- 15 Layer-3-Tilemap-Dateien im ROM identifiziert
+
+**Widerlegte Hypothesen:**
+- $0046/$0048 sind KEINE VRAM-Adressen → Sprite-Feld-Offsets in der Sprite-Config-Engine
+
+### Nächste Schritte
+
+1. ~~Deep-Dive: Scroll-Engine Streaming-Format von `CODE_B5A95B` / `CODE_B5AB0B` verstehen~~ **DONE**
+2. ~~Datenformat von `DATA_F52087` entschlüsseln (Metatile-Struktur → 8×8 Tiles)~~ **DONE**
+3. ~~`loadBg3ForegroundMap()` im Viewer implementieren~~ **DONE** (als `loadBg3ShipDeckMap()`)
+4. Komprimierte Layer-3-Tilemaps für andere Level-Typen (Rare-Kompression)
+
+---
+
+## BG3 ShipDeck Viewer-Implementation (2026-07-02)
+
+### Änderungen in index.html
+
+**Neue Funktion: `loadBg3ShipDeckMap()` (~Zeile 1427-1565)**
+- Liest Metatile-Definitionen aus ROM offset `0x352087` (DATA_F52087, 49 × 32 Bytes)
+- Liest Metatile-Map aus ROM offset `0x3526A7` (DATA_F526A7, 40 × 16 Words)
+- Expandiert 4×4 Metatiles zu individuellen 8×8 SNES-Tiles
+- Rendert 2bpp Tiles mit korrekter Palette (identische Logik wie `renderBgLayer()`)
+- Metatile-Flip-Transforms: H-flip, V-flip, HV-flip (reversed Sub-Tile-Reihenfolge + XOR $4000/$8000)
+- Output: 1280×512px ImageData (40 Rows=horizontal × 16 Cols=vertikal)
+- Parameter `priorityFilter`: null=alle, 0=nur pri-0, 1=nur pri-1
+
+**Hook in `loadLevelBackground()` (~Zeile 1616-1622):**
+- Erkennung: `style.mapId === 3` → ShipDeck-Level
+- Aufruf mit `priorityFilter=null` (alle Tiles)
+- Ergebnis in `bg3ShipDeckData` gespeichert
+
+**BG3 Empty-Check Erweiterung (~Zeile 1767-1779):**
+- Neue Priorität: wenn ShipDeck-Daten vorhanden UND `bg3TmNonZero === 0` → fgData aus Metatile-Map
+- `fgData.mode = 'shipdeck'`, `colorMathAlpha = 1.0`
+- Sonst: Fallback auf bestehende Empty-Check-Logik
+
+**Return-Value erweitert:**
+- `bg3ShipDeckData` als neues Feld im Return-Objekt
+
+**buildCatalog() BG3-Sektion (~Zeile 5631-5656):**
+- Prüft `currentBgData.bg3ShipDeckData` vor VRAM-basiertem Rendering
+- ShipDeck: Verwendet Metatile-Image für bg3Image-Canvas
+
+**buildBgImageFromCurrentLevel() (~Zeile 5494-5499):**
+- Neuer Early-Return für `layer === 'bg3'` + ShipDeck-Daten vorhanden
+
+### ROM-Adressen (HiROM, ohne SMC-Header)
+
+| Daten | Adresse | Größe | SNES-Label |
+|-------|---------|-------|------------|
+| Metatile-Definitionen | `0x352087` | 0x620 (1568B) | DATA_F52087 |
+| Metatile-Map | `0x3526A7` | 0x500 (1280B) | DATA_F526A7 |
+| BG3 CHR (Grafik) | `0x352BA7` | variabel | DATA_F52BA7 |
+
+### Erwartetes Console-Log bei Pirate Panic
+
+```
+BG3 ShipDeck: X metatiles, Y tiles rendered (1280x512px, pri0=N, pri1=M, filter=all)
+BG3 foreground: ShipDeck metatile map (1280x512px, Y tiles, pri0=N, pri1=M)
+```
+
+### Offene Punkte
+
+- Priority-Trennung: Aktuell werden ALLE Tiles als Foreground-Overlay gerendert.
+  Falls pri-0 Tiles (Background) vorhanden sind, könnten diese fälschlicherweise
+  VOR dem Terrain erscheinen statt dahinter. → Test zeigt ob relevant.
+- HD Pack Export: ShipDeck BG3 Tiles sind noch nicht in der Hash-/Export-Pipeline.
+- Andere Level-Typen: Komprimierte Layer-3-Tilemaps (Forest, Water, etc.) noch nicht unterstützt.
+
+---
+
+## Issue I: Rambi Rumble BG3 — Honig opak, Bienenstock verdeckt (Sub-Screen-Blend)
+
+**Datum:** 2026-07-02  
+**Status:** v3 BESTÄTIGT (2026-07-03) — Layer-Reihenfolge korrekt, Feintuning ausstehend  
+**Betroffene Level:** Rambi Rumble (Level 0x02, ppuConfig 0x03, gfxSet 0x04)  
+**Betrifft:** Viewer `index.html` — `loadLevelBackground()` BG3 Foreground-Detection
+
+### Symptom
+
+- **Erwartet:** Bienenstock-Muster (BG1) als Hintergrund sichtbar, Honig-Tropfen (BG3) als semi-transparentes Foreground-Overlay darüber
+- **Tatsächlich:** Bienenstock VERDECKT, Honig als voll-opakes Foreground-Overlay über dem gesamten Canvas
+
+### Verifizierte ROM-Daten (via PowerShell ROM-Trace)
+
+**PPU Config 0x03:**
+| Register | Wert | Bedeutung |
+|----------|------|-----------|
+| $2105 | 0x09 | Mode 1, BG3 Priority Bit gesetzt |
+| BG1 | tm=0x6C00, chr=0x5000 | 32×32 tiles, Bienenstock-Muster |
+| BG2 | tm=0x7800, chr=0x2000 | 64×32 tiles, Terrain (dynamisch) |
+| BG3 | tm=0x6800, chr=0x7000 | 32×32 tiles, Honig-Overlay |
+| mainScreen | 0x01 | **Nur BG1** auf Main Screen |
+| subScreen | 0x16 | BG2 + BG3 + OBJ auf Sub Screen |
+| cgwsel | 0x02 | useSubScreen=true |
+| cgadsub | 0x21 | Color Math: BG1 + Backdrop, ADD, full |
+
+**GfxSet 0x04 DMA Entries:**
+| # | VRAM | Ziel | Größe |
+|---|------|------|-------|
+| 0 | 0x6800 | BG3 Tilemap | 2048 (compressed) |
+| 1 | 0x6C00 | BG1 Tilemap | 2048 (compressed) |
+| 2 | 0x7000 | BG3 CHR | 4096 (compressed) |
+| 3 | 0x5300 | BG1 CHR (ab Tile 48) | 10752 (compressed) |
+| 4 | 0x2000 | BG2 CHR | 26112 (compressed) |
+
+**Viewer Detection Ergebnisse:**
+- `bg1TmLoaded = true` (Entry 1 → 0x6C00)
+- `bg2TmLoaded = false` (kein Entry bei 0x7800 — Terrain dynamisch)
+- `bg3TmLoaded = true` (Entry 0 → 0x6800)
+
+### SNES Hardware-Verhalten (ppuConfig 0x03)
+
+Dies ist ein **Sub-Screen-Blend-Muster** — grundlegend anders als der Mainbrace-Nebel:
+
+1. **Main Screen:** Nur BG1 (Bienenstock) wird angezeigt
+2. **Sub Screen:** BG2 (Terrain) + BG3 (Honig) sind die Blend-Quellen
+3. **Color Math:** `finalPixel = BG1_pixel + SubScreen_pixel` (ADD, full intensity)
+4. **Effekt:** Der Honig (BG3 auf Sub Screen) wird additiv in den Bienenstock (BG1 auf Main Screen) eingeblendet
+
+**Vergleich der zwei Color-Math-Muster:**
+
+| Eigenschaft | Mainbrace-Nebel | Rambi-Rumble-Honig |
+|-------------|-----------------|---------------------|
+| BG3 auf | Main Screen | **Sub Screen** |
+| Color Math Target | BG3 (subtract) | **BG1 (add)** |
+| useSubScreen | false (fixed color) | **true** |
+| Viewer-Approximation | BG3 als halbtransparentes Overlay | BG3 als additives Sub-Screen-Overlay |
+
+### Root-Cause: 2 Bugs in loadLevelBackground()
+
+**Bug 1: `hasPri1` blockiert Color Math (index.html:1837)**
+
+```javascript
+// Line 1829-1840:
+const fgImgPri1 = new ImageData(fgW, fgH);
+renderBgLayer(vram, ppu.bg3, palette, false, fgImgPri1, fgW, fgH, 1);
+// ...
+if (hasPri1) {
+    // OPAQUE foreground (alpha=1.0) — VERDECKT den Bienenstock!
+    fgData = { imgData: fgImgPri1, ..., colorMathAlpha: 1.0, mode: 'priority' };
+}
+```
+
+Wenn BG3 Priority-1 Tiles hat (Honig-Tropfen mit Mode 1 BG3 Priority), werden diese als voll-opakes Foreground-Overlay gerendert. Die Color-Math-Analyse in der `else`-Branch wird **nie erreicht**.
+
+**Bug 2: Color Math prüft nur Main Screen (index.html:1868)**
+
+```javascript
+// Line 1864-1868:
+const bg3OnMain = !!(ppu.mainScreen & 0x04);  // = false! BG3 ist auf SUB Screen
+// ...
+if (bg3OnMain && hasColorMath) { ... }  // SCHLÄGT FEHL — bg3OnMain=false
+```
+
+Selbst wenn `hasPri1=false` wäre: Die Color-Math-Detection prüft `bg3OnMain`, aber BG3 ist auf dem **Sub Screen** (0x16 & 0x04 = true). Der Check `bg3OnMain` ist hier der falsche Test.
+
+### Fix-Strategie (3 Änderungen in loadLevelBackground)
+
+**1. `isSubScreenBlend` Flag berechnen (nach Zeile 1718):**
+```javascript
+const bg3OnSub = !!(ppu.subScreen & 0x04);
+const bg3OnMain = !!(ppu.mainScreen & 0x04);
+const isSubScreenBlend = bg3OnSub && !bg3OnMain && ppu.colorMath.useSubScreen 
+                         && (ppu.colorMath.bg1 || ppu.colorMath.backdrop);
+```
+
+**2. BG3 pri-0 Background gaten (Zeile 1797):**
+```javascript
+if (bg3TmLoaded && ppu.bg3.enabled && !isSubScreenBlend) {
+```
+BG3 darf NICHT als Hintergrund-Layer hinter BG1 gerendert werden, wenn es ein Sub-Screen-Blend ist.
+
+**3. Neue Foreground-Branch VOR pri-1 Check (Zeile 1823+):**
+Wenn `isSubScreenBlend` aktiv: alle BG3 Tiles (pri-0 + pri-1) als semi-transparentes Overlay rendern, mit `mode='colormath'` und passendem Alpha.
+
+### Level-Scan (2026-07-02): Sub-Screen-Blend ist weit verbreitet!
+
+**ppuConfig 0x03:** 13 Levels (alle gfxSet=0x04)
+- mapId=0x02 (BeeHive): Level 0x02, 0x11, 0x12, 0x26, 0xAE-0xB2
+- mapId=0x07 (IceCave): Level 0x13, 0x60, 0xB3-0xB4
+
+**Sub-Screen-Blend insgesamt: 35 Levels, 6 ppuConfig-Werte**
+
+| ppuCfg | mainScreen | subScreen | cgadsub | CM-Target | Levels |
+|--------|-----------|-----------|---------|-----------|--------|
+| 0x03 | 0x01 (BG1) | 0x16 (BG2+BG3+OBJ) | 0x21 | BG1+backdrop ADD full | 13 |
+| 0x24 | 0x13 (BG1+BG2+OBJ) | 0x04 (BG3) | 0x22 | BG2+backdrop ADD full | 10+ |
+| 0x29 | 0x13 | 0x04 (BG3) | 0x43 | BG1+BG2 ADD **half** | 2 |
+| 0x2C | 0x02 (BG2) | 0x15 (BG1+BG3+OBJ) | 0x22 | BG2+backdrop ADD full | 3 |
+| 0x31 | 0x13 | 0x14 (BG3+OBJ) | 0x01 | BG1 ADD full | 4 |
+| 0x35 | 0x01 (BG1) | 0x16 | 0x31 | BG1+OBJ+backdrop ADD full | 3 |
+
+**Erkennung (generisch):**
+```javascript
+const isSubScreenBlend = bg3OnSub && !bg3OnMain && ppu.colorMath.useSubScreen
+    && (ppu.colorMath.bg1 || ppu.colorMath.bg2 || ppu.colorMath.backdrop);
+```
+Deckt alle 6 ppuConfig-Werte ab. Die Fix-Strategie bleibt gleich (3 Änderungen), 
+ist aber jetzt verifiziert generisch statt nur für ppuConfig 0x03.
+
+### Alpha-Wert-Strategie
+- `half` in cgadsub (z.B. ppuCfg 0x29) → alpha=0.5
+- `full` (kein half-bit) → alpha=0.7 als Approximation (echtes additives Blending wäre `globalCompositeOperation='lighter'`, aber die bestehende Pipeline nutzt Alpha)
+- `subtract` → `globalCompositeOperation='difference'` (bestehend)
+
+### Implementierung (2026-07-02)
+
+Alle 3 Änderungen in `loadLevelBackground()` umgesetzt:
+
+**Change 1 — `isSubScreenBlend` Flag (Zeile 1720-1731):**
+```javascript
+const bg3OnSub = !!(ppu.subScreen & 0x04);
+const bg3NotOnMain = !(ppu.mainScreen & 0x04);
+const isSubScreenBlend = ppu.bg3.enabled && bg3OnSub && bg3NotOnMain
+    && ppu.colorMath.useSubScreen
+    && (ppu.colorMath.bg1 || ppu.colorMath.bg2 || ppu.colorMath.backdrop);
+```
+
+**Change 2 — BG3 Background gated (Zeile 1811):**
+```javascript
+if (bg3TmLoaded && ppu.bg3.enabled && !isSubScreenBlend) {
+```
+Verhindert, dass BG3 als separater pri-0-Hintergrund unter BG1 gerendert wird.
+
+**Change 3 — Per-Pixel Additive Blend (Zeile 1843-1876):**
+
+**Erster Versuch (v1):** BG3 als semi-transparentes fgData-Overlay (alpha=0.7).
+**Problem:** fgData wird in `renderLevel()` ÜBER dem Terrain getiled (Zeile 2769-2793).
+Auf der SNES passiert der Sub-Screen-Blend aber HINTER dem Terrain (BG3 auf Sub Screen
+wird additiv in BG1 auf Main Screen eingeblendet, beides hinter BG2/Terrain).
+**Resultat:** Elemente visuell vertauscht — BG3 lag im Vordergrund über dem Terrain.
+
+**Zweiter Versuch (v2):** Per-Pixel additives Compositing direkt in imgData.
+BG3 wird in temporäres ImageData gerendert, dann pixelweise in imgData (das BG1 enthält) 
+eingeblendet: `pixel = BG1 + BG3 * factor`. Factor=1.0 (full) oder 0.5 (half, ppuCfg 0x29).
+Kein separates fgData — das kombinierte BG1+BG3 Bild liegt korrekt hinter dem Terrain.
+**Problem:** User-Test zeigt: BEIDE Elemente sind jetzt hinter den Terrain-Tiles verborgen.
+Die Honig-Effekte (BG1) sollen aber als Foreground-Overlay ÜBER dem Terrain sichtbar sein.
+
+**Dritter Versuch (v3 — aktuell):** Layer-Swap.
+Aus v1-Feedback identifiziert: BG3 = Bienenwaben (Hintergrund), BG1 = Honig (Vordergrund).
+- BG3 wird als Hintergrund auf imgData gerendert (alle Priorities, Zeile 1811-1815)
+- BG1 wird NICHT auf imgData gerendert (gated mit `!isSubScreenBlend`, Zeile 1834)
+- BG1 wird als semi-transparentes fgData-Overlay gerendert (alpha=0.7/0.5, Zeile 1851-1876)
+- fgData wird in renderLevel() über dem Terrain getiled → Honig-Overlay über dem Level
+
+**Noch zu testen:**
+- Rambi Rumble (Level 0x02, ppuCfg 0x03): Bienenwaben als Hintergrund, Honig als Overlay
+- Andere ppuCfg-Werte (0x24, 0x29, 0x2C, 0x31, 0x35): korrekte Erkennung + Layer-Zuordnung
+- Keine Regression bei Main-Screen-ColorMath Leveln (Mainbrace Mayhem Nebel etc.)
+- Half-Intensity Levels (ppuCfg 0x29): alpha=0.5 Blending korrekt?
+
+### v3 Test-Ergebnis (2026-07-03)
+
+**BESTÄTIGT — Layer-Reihenfolge korrekt:**
+- Honigwaben (BG3) als Hintergrund hinter dem Terrain ✓
+- BG1 in der Mitte ✓
+- Honig-Effekt (BG1) als Overlay ganz vorne ✓
+
+**Verbleibende Issues (nächste Session):**
+
+1. **Honig-Overlay zu dunkel:** Alpha=0.7 ist noch zu intensiv/dunkel, muss transparenter
+   werden. Nächster Schritt: Alpha auf ~0.4-0.5 reduzieren oder `globalCompositeOperation='lighter'`
+   (echtes additives Blending) testen.
+
+2. **Catalog-View zeigt kein Foreground-Element:** Im Katalog-View werden nur BG1 und
+   BG3-Honigwaben-Hintergrund angezeigt. Es gibt kein separates Fenster/Canvas für das
+   BG1-Foreground-Overlay. Nächster Schritt: `buildCatalog()` und `buildCatalogByGfxSet()`
+   müssen ein drittes Bild-Feld für das SSB-Foreground-Element erzeugen.
+
+3. **Andere ppuConfig-Werte testen:** 0x24, 0x29, 0x2C, 0x31, 0x35 — Erkennung verifiziert
+   (generische `isSubScreenBlend`-Formel deckt alle ab), aber visuelles Ergebnis noch
+   nicht pro Level-Typ geprüft. Besonders ppuCfg 0x29 (half-intensity, alpha=0.5).
+
+4. **Regressions-Check:** Nicht-SSB-Level wie Mainbrace Mayhem (Nebel) auf Regression prüfen.
