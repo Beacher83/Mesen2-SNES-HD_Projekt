@@ -7,7 +7,73 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 ## Current Status
 
 **Stand: 2026-07-03**  
-**Issue I Feintuning ABGESCHLOSSEN (Alpha, Catalog-View, Source-Tagging). Pipeline-Integration läuft.**
+**Tile Seam Elimination implementiert (Export v4, Score-Import, Whole-Cluster Rendering). Test am anderen Rechner steht aus.**
+
+### Tile Seam Elimination — 3 Verbesserungen (2026-07-03)
+
+**Problem:** HD-upscalte Tiles zeigen sichtbare Nähte an Tile-Grenzen weil:
+1. Edge-Tiles in Clustern keinen Nachbar-Kontext für den AI-Upscaler haben
+2. First-wins Import — erste Version gewinnt unabhängig von Qualität
+3. Covered Tiles nie einzeln mit Padding exportiert werden
+
+**Lösung: Drei zusammenhängende Verbesserungen:**
+
+#### Improvement 1: Padded Cluster Export (Export v4)
+
+`buildPaddedClusterCanvas(ids, w, h, flips)` erzeugt `(w+2)×(h+2)` Canvas:
+- Cluster-Tiles bei Offset `(1,1)` gezeichnet
+- Padding-Ring via `bestNeighbor()` Statistiken aus Tilemap-Analyse:
+  - Top/Bottom Reihen, Left/Right Spalten, 4 Ecken (transitiv)
+- Manifest: `paddingTiles: 1`, `paddedWidthPx`, `paddedHeightPx`
+- Rückwärtskompatibel: alte Manifests ohne `paddingTiles` → default 0
+
+**Code:** `exportCatalogAsZip()` in index.html (~Zeile 6448-6530)
+
+#### Improvement 2: Score-Based Tile Import
+
+```
+tileScore(clusterArea, exposedEdges, hasPadding):
+  realContext = 4 - exposedEdges   // 0-4
+  sizeBonus = min(floor(area/4), 6) // 0-6
+  paddingBonus = hasPadding ? 10 : 0
+  → paddingBonus + sizeBonus + realContext
+PADDED_INDIVIDUAL_SCORE = 12
+```
+
+| Quelle | Score-Beispiel |
+|--------|---------------|
+| Grosser gepaddeter Cluster, inneres Tile | 20 |
+| Grosser gepaddeter Cluster, 1 Edge | 19 |
+| Grosser gepaddeter Cluster, Ecke | 18 |
+| Kleiner gepaddeter 2×2, Ecke | 13 |
+| Einzelnes gepaddetes Tile | 12 |
+| Ungepaddeter Cluster, inneres Tile | 10 |
+
+Phase 1: Alle Kandidaten pro Tile sammeln. Phase 2: Bester Score gewinnt, Verlierer `.close()`.
+
+**Code:** `importHDPack()` in index.html (~Zeile 7093-7261)
+
+#### Improvement 3: Whole-Cluster Rendering
+
+Vor dem Tile-by-Tile Loop in `renderLevel()`:
+1. Anchor-Index: `(partId, flip)` → Cluster-Kandidaten (O(1) Lookup)
+2. Clusters nach Fläche sortiert (grösste zuerst)
+3. Pattern-Match gegen Tilemap: alle IDs + Flips müssen übereinstimmen
+4. Match → ganzes Cluster-Bild in einem `drawImage()` (null Seams)
+5. `coveredPositions` Set verhindert Doppel-Rendering im Tile-Loop
+6. Clusters mit leeren Positionen (id < 0) werden übersprungen
+
+**Code:** `renderLevel()` in index.html (~Zeile 2776-2855)
+
+#### Pipeline-Kohärenz (verifiziert)
+
+- Manifest-Feldnamen: `paddingTiles` konsistent Export↔Import
+- Scale-Detection: `(w + 2*padTiles) * 32` bei gepaddetem Bild
+- Tile-Extraktion: `padOffset = padTiles * tileSize` für korrekte Position
+- Cluster-Cropping: `(padOffset, padOffset)` → exakter Content ohne Padding
+- Flips: `hdClusters.flips` immer gesetzt, Rendering matcht korrekt
+- Key-Format: `"x,y"` Pixel-Koordinaten durchgängig
+- Rückwärtskompatibilität: v3 Manifests → `paddingTiles || 0` → altes Verhalten
 
 ### Issue I: Sub-Screen-Blend Feintuning (2026-07-03)
 
