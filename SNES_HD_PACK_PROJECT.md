@@ -7,9 +7,46 @@ Adding SNES HD texture pack support to Mesen2, modeled after the existing NES HD
 ## Current Status
 
 **Stand: 2026-07-03**  
-**Issue I (Sub-Screen-Blend) v3 BESTÄTIGT. Feintuning (Alpha, Catalog-View) nächste Session.**
+**Issue I Feintuning ABGESCHLOSSEN (Alpha, Catalog-View, Source-Tagging). Pipeline-Integration läuft.**
 
-### Issue I: Sub-Screen-Blend Fix v3 — BESTÄTIGT (2026-07-03)
+### Issue I: Sub-Screen-Blend Feintuning (2026-07-03)
+
+**Aufbauend auf Issue I v3 Fix.** Feintuning der Alpha-Werte, Catalog-View-Integration
+und Source-Layer-Tagging für korrekte Pipeline-Unterscheidung.
+
+**Architektur: Zwei Color-Math Foreground-Typen:**
+
+| Typ | Beispiel | fgData.source | CHR-Quelle | Tilemap |
+|-----|----------|---------------|-------------|---------|
+| SSB (Sub-Screen-Blend) | Rambi Rumble (ppuConfig 0x03) | `'bg1'` | bg1ChrBase | BG1 VRAM-Tilemap |
+| Standard Color Math | Mainbrace Mayhem (Nebel) | `'bg3'` | bg3ChrBase | BG3 VRAM-Tilemap |
+
+**Änderungen (index.html, 9 Punkte):**
+
+1. **Alpha SSB-Pfad** (~Zeile 1869): `cm.half ? 0.25 : 0.35` (war 0.5/0.7)
+2. **Alpha Standard-CM** (~Zeile 1933): `cm.half ? 0.20 : 0.25` (war 0.5/0.7)
+3. **Source-Tagging SSB**: `fgData.source = 'bg1'` (~Zeile 1875)
+4. **Source-Tagging Standard**: `fgData.source = 'bg3'` (~Zeile 1939)
+5. **`buildCatalog()` ssbFgImage** (~Zeile 5847): Neues Feld aus currentFgData
+6. **`buildCatalogByGfxSet()` ssbFgImage** (~Zeile 4749): Neues Feld aus bgData.fgData
+7. **Duplicate-Suppression**: `source === 'bg3'` → `bg3Image = null` in buildCatalog (~Zeile 5860)
+8. **`renderCatalog()` cmFg-Sektion** (~Zeile 6014): Orange (#ffab40) Label mit Source-Anzeige
+9. **Source propagiert** zu ssbFgImage-Objekten in beiden Catalog-Funktionen
+
+**Pipeline-Lücke identifiziert:** SSB-Foreground-Tiles (bg1ChrBase) werden von der
+bestehenden Pipeline NICHT exportiert. Der "BG1-Export" verwendet terrainChrBase (= bg2ChrBase
+bei SSB-Levels). Siehe "Color Math Foreground Pipeline" unten für den Integrationsplan.
+
+**Alpha-Werte (User bestätigt im Viewer):**
+
+| Pfad | Alpha (full) | Alpha (half) |
+|------|-------------|-------------|
+| SSB BG1 Honig | 0.35 | 0.25 |
+| Standard BG3 Nebel | 0.25 | 0.20 |
+
+**Status:** Viewer-seitig abgeschlossen. Mesen In-Game-Test steht noch aus.
+
+### Issue I v3: Sub-Screen-Blend Fix — BESTÄTIGT (2026-07-03)
 
 **Problem:** Rambi Rumble (ppuConfig 0x03) — BG3 Honig-Overlay wurde voll-opak als
 Foreground gerendert und verdeckte den BG1-Bienenstock-Hintergrund komplett. Root Cause:
@@ -19,16 +56,10 @@ Main-Screen) und renderte BG3 Priority-1 Tiles immer als opakes Overlay.
 **Fix (3 Änderungen in `loadLevelBackground()`):**
 1. **`isSubScreenBlend` Flag** (Zeile ~1720): Erkennt 6 ppuConfig-Muster generisch
 2. **BG3 als Hintergrund** (Zeile ~1811): SSB → BG3 alle Priorities als imgData (Hintergrund)
-3. **BG1 als Foreground-Overlay** (Zeile ~1851): SSB → BG1 als fgData mit alpha=0.7
+3. **BG1 als Foreground-Overlay** (Zeile ~1851): SSB → BG1 als fgData mit alpha
 
 **User-Test v3:** Layer-Reihenfolge korrekt — Waben (BG3) im Hintergrund, Honig (BG1)
 als Overlay vorne. Betrifft 35 Levels mit 6 verschiedenen ppuConfig-Werten.
-
-**Verbleibende Issues (nächste Session):**
-- Honig-Overlay zu dunkel (Alpha reduzieren oder echtes additives Blending)
-- Catalog-View zeigt kein Foreground-Element (fehlendes Canvas)
-- Andere ppuConfig-Werte visuell prüfen (besonders 0x29 half-intensity)
-- Regressions-Check bei Nicht-SSB-Leveln
 
 ### ShipDeck BG3 Virtual Tilemap (2026-07-02)
 
@@ -110,6 +141,67 @@ Die Schiffswand-Tiles fließen jetzt durch die gesamte Daten-Pipeline:
 - Ausgabe in `bg/bg2/gfxset_XX/` — gleicher Ordner wie Decken-Tiles
 - Keine Filename-Kollision dank unterschiedlicher vramWordAddrs
 - Export-Zusammenfassung zeigt jetzt Wall-Tile-Count separat
+
+### Color Math / Foreground Pipeline (2026-07-03)
+
+Die Foreground-Pipeline behandelt drei verschiedene Foreground-Typen. Alle drei verwenden
+`fgData.source = 'bg1'` oder `'bg3'` und fließen durch die cmFg-Pipeline.
+
+**Drei Foreground-Typen:**
+
+| Typ | Beispiel | `fgData.mode` | `fgData.source` | Alpha | Color Math |
+|-----|----------|---------------|-----------------|-------|------------|
+| SSB (Sub-Screen-Blend) | Rambi Rumble (ppuConfig 0x03) | `colormath` | `bg1` | 0.35/0.25 | Ja |
+| BG1 Overlay | Gusty Glade (ppuConfig 0x1D) | `bg1overlay` | `bg1` | 1.0 | Nein |
+| Standard Color Math | Mainbrace Mayhem (Nebel) | `colormath` | `bg3` | 0.25/0.20 | Ja |
+
+**SSB (Sub-Screen-Blend) — source='bg1', mode='colormath':**
+In SSB-Levels (z.B. Rambi Rumble) sind die Layer getauscht:
+- Terrain liegt auf BG2 (nicht BG1) → `terrainChrBase = bg2ChrBase`
+- Der bestehende "BG1-Export" exportiert Terrain-Tiles via tileArrangement + terrainChrBase
+- Die SSB-Foreground-Tiles (Honig) liegen auf BG1 bei `bg1ChrBase` — NICHT exportiert!
+- Diese Tiles haben eine VRAM-Tilemap (wie BG2/BG3), KEINE Map32-tileArrangement
+
+**BG1 Overlay — source='bg1', mode='bg1overlay' (NEU 2026-07-03):**
+In manchen Levels liegt ein opakes Foreground-Overlay auf BG1 mit eigenem chrBase:
+- Gusty Glade: BG3=Hintergrund (Himmel), BG2=Terrain (Plattformen), BG1=Vordergrund (Windblätter)
+- BG1 chrBase=$7000 (Blätter) ≠ BG2 chrBase=$2000 (Terrain) → separater Layer
+- Erkennung: `bg1TmLoaded && !isSubScreenBlend && ppu.bg2.enabled && (bg1ChrBase !== bg2ChrBase)`
+- Keine Color Math → alpha=1.0, voll opak
+- Unterschied zu Hot Head Hop: Dort sind FG-Elemente Map32-Tiles mit Priority-Bit 13
+  (selber chrBase wie Terrain). Gusty Glade hat einen strukturell getrennten BG1-VRAM-Layer.
+
+**Container-Storage (gilt für SSB und BG1 Overlay):**
+- `saveCurrentHDToContainer()`: cmFgBlob (PNG des Foreground-Overlay), bg1TilemapData
+  (BG1 VRAM-Tilemap), ppuConfig erweitert um bg1TilesW/bg1TilesH/cmFgSource/cmFgAlpha
+- Mode-Gate: `mode === 'colormath' || mode === 'bg1overlay'`
+- `buildCatalogByGfxSet()`: cmFgBlob + bg1TilemapData caching (via bgData.fgData)
+- `loadContainerToHDPack()`: cmFgBlob → hdPack.cmFg ImageBitmap mit Source/Alpha-Metadaten
+- `exportContainerAsZip()`: cmfg.png + bg1_tilemap.bin in ZIP
+- `importContainerFromZip()`: cmFgBlob + bg1TilemapData + hdSaveSet() mit cmFg-Daten
+
+**Hash-Generierung (gilt für SSB und BG1 Overlay):**
+- cmFg-Hashes in `exportAsTexturePack()` nach BG3-Hashes
+- chrBase = bg1ChrBase (NICHT terrainChrBase), Layer = 0 (BG1)
+- 4bpp (Mode 1): wordsPerTile = 16, bytesPerTile = 32
+- Dedup-Key: `${gfxset}_0_${vramWordAddr}` — keine Kollision mit Terrain-Hashes weil
+  bg1ChrBase ≠ bg2ChrBase (terrainChrBase) → verschiedene vramWordAddrs
+- BG1 VRAM-Tilemap als Quelle (nicht tileArrangement)
+
+**Per-Tile PNG Export (gilt für SSB und BG1 Overlay):**
+- cmFg-Tiles aus cmFgBlob extrahiert, un-flipped, 4× skaliert (32×32px)
+- Ausgabe in `bg/bg1/gfxset_XX/` — gleicher Ordner wie Terrain-Tiles
+- Keine Filename-Kollision dank unterschiedlicher vramWordAddrs (anderer chrBase)
+- Export-Zusammenfassung zeigt cmFg-Tile-Count separat
+
+**Standard Color Math (source='bg3') — kein Pipeline-Bedarf:**
+BG3-Foreground (Nebel, Regen) wird identisch wie normales BG3 exportiert. bg3Blob,
+bg3TilemapData, BG3-Hashes und BG3-PNGs decken alles ab. Das `source`-Feld dient nur
+dem Viewer (Catalog-Anzeige, Duplicate-Suppression) — nicht der Export-Pipeline.
+
+**Pipeline-Kompatibilität:** Alle downstream-Prüfungen verwenden `source === 'bg1'`
+(nicht `mode === 'colormath'`), daher fließt bg1overlay automatisch durch die bestehende
+cmFg-Pipeline. Nur die Mode-Gate-Checks an den Pipeline-Einstiegspunkten mussten erweitert werden.
 
 ### Viewer-Fix Session (2026-07-02)
 
