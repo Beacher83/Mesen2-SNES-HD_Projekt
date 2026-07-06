@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-03 | Mesen Build: M5.14 (untested) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED
+Stand: 2026-07-06 | Mesen Build: M5.16 (test pending) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED | Issue O: BG1 Overlay-Blend M5.16 IMPLEMENTED (test pending)
 
 ---
 
@@ -2181,6 +2181,59 @@ Tile-Adressen erforderlich.
 
 ### Status: **PALETTE-FIX KORREKT, LAYER REVERTIERT — CONTENT HASH MISMATCH OFFEN**
 
+### Update (2026-07-06c) — Echte Root Cause + BG1 Overlay-Blend Fix (M5.16)
+
+**Neue Erkenntnis: Content Hash Mismatch war NICHT das Hauptproblem.**
+
+Die M5.15 WINNERS-Diagnostik zeigte: `wn0=55140, acm0=55140` — BG1 gewinnt das
+PPU-Compositing auf ALLEN Pixeln. Die Honig-HD-Tiles (im `bg/bg1/` Ordner) wurden
+gefunden und gerendert — aber sie deckten den BG2-Terrain komplett ab. BG2 Terrain-
+HD-Tiles wurden nie nachgeschlagen.
+
+**Dies ist exakt das gleiche Problem wie BG3-Fog in Mainbrace Mayhem (Issue L),
+nur auf BG1 statt BG3.**
+
+**Layer-Struktur Beehive-Level (ppuConfig $03):**
+
+| Layer | ChrBase | Inhalt | Rolle |
+|-------|---------|--------|-------|
+| 0 (BG1) | $5000 | Honig-Overlay | Semi-transparent, gewinnt Compositing |
+| 1 (BG2) | $2000 | Terrain (Brambles, Plattformen) | Darunter verborgen |
+| 2 (BG3) | $7000 | Dunkler Hintergrund | Hinterste Schicht |
+
+**Alle betroffenen Level (bestätigt via ASM-Disassembly, alle ppuConfig $03):**
+Rambi Rumble (0x02), Hornet Hole (0x11), Rambi Scene (0x12),
+Parrot Chute Panic (0x13), Shortcut (0x26), King Zing Sting (0x60),
+plus 7 Bonus-Räume — 13 Varianten total.
+
+**Bramble-Level (ppuConfig $27) sind NICHT betroffen** — kein Color Math, kein Overlay.
+
+**Fix (2-teilig):**
+
+1. **Viewer** (`dkc2-viewer/index.html`, Zeile ~8935):
+   cmFg PNG-Export-Ordner `bg/bg1/gfxset_XX` → `cmFg/gfxset_XX`.
+   Damit werden die Honig-Tiles nicht mehr als BG1-HD-Tiles geladen.
+   - **PNGs werden weiterhin exportiert** — nur in den `cmFg/`-Ordner statt `bg/bg1/`.
+     Mesen's Loader scannt nur `bg/bg1-4/` und `sprites/`, NICHT `cmFg/` →
+     die Tiles sind auf der Festplatte vorhanden, aber zur Laufzeit unsichtbar.
+   - **Hashes bleiben in `hashes.bin`** mit `layer: 0` — werden zu harmlosen Orphans
+     (Hash existiert, aber kein PNG wird dafür geladen). Kein Einfluss auf Matching.
+   - **Zweck:** PNGs werden aufbewahrt für zukünftige Erweiterung (eigener `cmFg/`
+     Loader-Pfad für echte HD-Honig-Overlays statt nur Farb-Tint).
+
+2. **C++ Emulator** (`SnesHdVideoFilter.cpp`, Build M5.16):
+   Neuer `bg1OverlayBlend`-Pfad — wenn BG1 das Compositing gewinnt und
+   AllowColorMath aktiv ist, aber kein HD-Tile für BG1 existiert:
+   → Suche HD-Tile auf BG2 (Terrain) und BG3 (Hintergrund)
+   → Rendere mit 80% HD + 20% Honig-Tint (identisch zu BG3-Fog-Blend)
+   → Color Math Delta wird übersprungen (falsches Ergebnis für Overlay)
+   - **Tint-Quelle:** PPU `MainScreenColor` (= native BG1-Honig-Farbe), NICHT die
+     cmFg-PNG-Dateien. Die Farbe wird direkt aus dem PPU-Output genommen.
+
+**Erwartetes Ergebnis:** HD-Terrain sichtbar durch semi-transparenten Honig-Schleier.
+
+### Status: **M5.16 C++ EDITS KOMPLETT — User-Test ausstehend**
+
 ---
 
 ## Issue P: Gusty Glade — Blaue Quadrate + Partieller Match (2026-07-05)
@@ -2305,13 +2358,13 @@ Nach additivem Delta:   R=0*  G=0*  B=34   ← BLAU! (* = geclampt)
 | L | Mainbrace Mayhem | Hoch | Sub-Screen BG3 Fog | OFFEN |
 | M | Lockjaw's Locker | Hoch | Multi (Tilemap+Scroll+Color) | OFFEN |
 | N | Hot Head Hop | Mittel | Artefakte+Seams | OFFEN (teilw. E/F/H) |
-| O | Rambi Rumble | Kritisch | 0% Match (Palette fix OK, Layer revertiert, Content Hash offen) | OFFEN |
-| P(a) | Gusty Glade | Hoch | Blaue Quadrate (CM Subtract) | C++ Fix committed, **User-Test ausstehend** |
+| O | Rambi Rumble | Kritisch | BG1 Overlay verdeckt BG2 Terrain (Honig blockiert HD-Tiles) | M5.16: BG1 Overlay-Blend + cmFg Ordner-Separation — **User-Test ausstehend** |
+| P(a) | Gusty Glade | Hoch | Blaue Quadrate — Color Math NICHT die Ursache (acm=0), PNG-Inhalt verdächtig | C++ Subtract-Fix irrelevant, **PNG-Dateien untersuchen** |
 | P(b,c) | Gusty Glade | Mittel | Layer-Mismatch+Blätter | OFFEN |
 | D | Alle Level | Mittel | Performance | OFFEN |
 
 ### Priorisierung (empfohlen)
-1. **Issue O** (Rambi Rumble 0%): Grundlegendster Fehler — kein einziges Tile rendert
+1. **Issue O** (Rambi Rumble): M5.16 BG1 Overlay-Blend implementiert — Test ausstehend
 2. **Issue L** (Mainbrace Mayhem Fog): Sehr sichtbar, BG3-Nebel-Compositing
 3. **Issue M** (Lockjaw's Locker): Drei Sub-Issues, teilweise fehlende Tiles
 4. **Issue J** (Pirate Panic BG3): Subtil, nur bei Sprite-Überlappung

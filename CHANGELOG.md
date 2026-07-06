@@ -5,6 +5,46 @@ Für Änderungen am DKC2-HD-Tools Viewer siehe `DKC2-HD-Tools/CHANGELOG.md`.
 
 ---
 
+## [2026-07-06c] — M5.16: BG1 Overlay-Blend (Issue O — Rambi Rumble Beehive HD)
+
+### Neue Feature: BG1 Overlay-Blend Rendering-Pfad
+
+**Problem:** In Beehive-Leveln (ppuConfig $03) liegt die semi-transparente Honig-Overlay
+auf BG1 (layer=0). BG1 gewinnt das PPU-Compositing auf 100% der Pixel (wn0=55140,
+acm0=55140). Die Honig-HD-Tiles wurden gerendert und deckten den BG2-Terrain komplett ab.
+BG2 Terrain-HD-Tiles wurden nie nachgeschlagen → kein HD-Terrain sichtbar.
+
+**Root Cause:** Exakt das gleiche Problem wie BG3-Fog in Mainbrace Mayhem, aber auf BG1
+statt BG3. Der bestehende `bg3FogBlend`-Pfad triggert nur für `winLayer == 2`. Kein
+äquivalenter Pfad für `winLayer == 0` (BG1 overlay).
+
+**Lösung: `bg1OverlayBlend`-Pfad in `SnesHdVideoFilter.cpp`:**
+
+1. **Erkennung** (~Zeile 333): `bg1OverlayWinner` = Pixel wo BG1 gewinnt, kein HD-Tile
+   für BG1 vorhanden, und AllowColorMath aktiv → Honig-Overlay erkannt
+2. **Step 2 Skip** (~Zeile 347): Overlay-Winner überspringen Palette-Vergleichs-Logik
+3. **Step 3b** (~Zeile 423-462): Neuer BG1 Overlay-Blend Pfad — sucht HD-Tile auf
+   BG2 (Terrain) und BG3 (Hintergrund), inkl. Layer-Retry
+4. **Fog-Color Berechnung** (~Zeile 707): `bg3FogBlend || bg1OverlayBlend` →
+   MainScreenColor als Overlay-Tint (80% HD + 20% Honig-Farbe)
+5. **Color Math Delta Guard** (~Zeile 727): Overlay-Blend Pixel überspringen
+   cmDelta (falsche Berechnung für diesen Fall)
+6. **Rendering** (~Zeile 759, 808): Fog-Blend auf opaque und alpha-blended Pixel
+   wird für Overlay-Blend identisch angewendet
+7. **Diagnostik**: `ovBlend=%u` im FRAME-Log, `(OV-BLEND)` Tag bei MATCH-Einträgen,
+   `frameBg1OverlayBlend` Counter
+
+**Betroffene Level (alle ppuConfig $03, $2131=$21):**
+Rambi Rumble (0x02), Hornet Hole (0x11), Rambi Scene (0x12),
+Parrot Chute Panic (0x13), Shortcut (0x26), King Zing Sting (0x60),
+plus 7 Bonus-Räume — insgesamt 13 Level-Varianten.
+
+**Dateien:**
+- `Core/SNES/HdPacks/SnesHdVideoFilter.cpp` — BG1 overlay-blend Erkennung,
+  Rendering-Pfad, Diagnostik (Build M5.15 → M5.16)
+
+---
+
 ## [2026-07-06b] — M5.15: Per-Layer Diagnostik + Issue O/P Journal-Update
 
 ### Diagnostik-Erweiterung (M5.15)

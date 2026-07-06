@@ -12,7 +12,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.15"
+#define SNES_HD_BUILD_VERSION "M5.16"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -207,6 +207,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameColorMathDelta = 0;      // HD pixels with color math delta applied (M5.11)
 	uint32_t frameBg3BgFallback = 0;       // BG3 bg won w/o colorMath → BG1 HD rendered plain (M5.12 Issue H)
 	uint32_t frameLayerRetry = 0;          // BG1↔BG2 layer-agnostic retry matches (M5.13 Issue H)
+	uint32_t frameBg1OverlayBlend = 0;     // BG1 overlay-blend: HD terrain under honey/overlay (M5.16 Issue O)
 	bool frameHasBg1ColorMath = false;     // Any BG1-winning pixel had AllowColorMath this frame (M5.12)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
@@ -237,6 +238,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPpuTileInfo* tileInfo = nullptr;
 			bool usedFallbackLayer = false;
 			bool bg3FogBlend = false;  // true when rendering HD BG1 under semi-transparent BG3 fog
+			bool bg1OverlayBlend = false;  // true when rendering HD BG2 under semi-transparent BG1 overlay (honey, M5.16)
 			int fallbackStopLayer = -1;  // Which layer stopped the fallback loop (for miss diagnostics)
 
 			// Only attempt HD BG tile replacement when:
@@ -331,20 +333,22 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 			}
 
+			// 1c) BG1 overlay detection (M5.16, Issue O):
+			//     BG1 won compositing WITH AllowColorMath but has no HD tile.
+			//     This indicates a semi-transparent foreground overlay (e.g. honey
+			//     in DKC2 beehive levels: Rambi Rumble, Hornet Hole, Parrot Chute
+			//     Panic, King Zing Sting — all ppuConfig $03).
+			//     Skip the generic fallback (step 2) because applyColorMathDelta
+			//     uses wrong math for overlay-under-terrain rendering.
+			//     Step 3b handles this with proper overlay blending.
+			bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80));
+
 			// 2) Fallback: try other layers if winner has no HD tile
 				//    GATE: Skip fallback when BG3 (layer 2) wins compositing
 				//    WITHOUT color math (opaque foreground — Issue A fix).
-				//    When BG3 wins WITH color math (AllowColorMath set), it's a
-				//    semi-transparent effect (fog, honey, water) — fall through
-				//    to the fog-blend path below instead.
-				//
-				//    IMPORTANT: stop at the FIRST layer that has tile data
-				//    (BgLayerMask bit set), regardless of whether an HD tile
-				//    exists.  This prevents lower-priority layers (e.g. BG2
-				//    far-background) from replacing native composited pixels
-				//    that contain higher-priority content (BG1 level graphics
-				//    + BG3 fog blend + sprites).
-			if(!hdTile && winLayer != 2) {
+				//    Also skip when BG1 overlay is detected (bg1OverlayWinner) —
+				//    step 3b provides proper blend rendering for that case.
+			if(!hdTile && winLayer != 2 && !bg1OverlayWinner) {
 				for(int i = 0; i < 4; i++) {
 					if(i == (int)winLayer) continue;
 					if(pixelInfo.BgLayerMask & (1 << i)) {
@@ -417,6 +421,44 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 			}
 
+			// 3b) BG1 overlay-blend path (M5.16, Issue O):
+			//     BG1 won compositing WITH AllowColorMath but has no HD tile.
+			//     This is a semi-transparent foreground overlay (honey in DKC2
+			//     beehive levels: Rambi Rumble, Hornet Hole, Parrot Chute Panic,
+			//     King Zing Sting — all ppuConfig $03).
+			//     BG2 carries the actual terrain underneath.  Find the BG2 HD tile
+			//     and render it with BG1's overlay color blended on top — same
+			//     approach as BG3 fog-blend (80% HD + 20% overlay color).
+			//     MainScreenColor holds the raw BG1 overlay pixel color (pre-math),
+			//     which serves as the tint, just like fog color in step 3.
+			if(!hdTile && bg1OverlayWinner) {
+				// Try BG2 (layer 1) first — terrain under honey overlay
+				if(pixelInfo.BgLayerMask & 0x02) {
+					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[1].Key, hdScreen->Vram);
+					// Layer retry: try with BG1's layer index (terrain tiles may be
+					// exported as layer 0 from other levels where the same gfxset
+					// renders terrain on BG1 instead of BG2)
+					if(!hdTile) {
+						SnesHdTileKey altKey = pixelInfo.BgTiles[1].Key;
+						altKey.LayerIndex = 0;
+						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+						if(hdTile) frameLayerRetry++;
+					}
+					if(hdTile) {
+						tileInfo = &pixelInfo.BgTiles[1];
+						bg1OverlayBlend = true;
+					}
+				}
+				// If no BG2 match, try BG3 (layer 2) — background
+				if(!hdTile && (pixelInfo.BgLayerMask & 0x04)) {
+					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[2].Key, hdScreen->Vram);
+					if(hdTile) {
+						tileInfo = &pixelInfo.BgTiles[2];
+						bg1OverlayBlend = true;
+					}
+				}
+			}
+
 				// 4) BG3 background fallback (Issue H, M5.12):
 				//    BG3 won compositing WITHOUT color math on this scanline, but
 				//    earlier scanlines showed BG1 WITH color math — indicating
@@ -466,11 +508,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					if(usedFallbackLayer) {
 						frameFallback++;
 					}
-					if(bg3FogBlend) {
-						frameBg3FogBlend++;
-					}
-					// Track color math delta application (M5.11)
-					if(!bg3FogBlend && (pixelInfo.MainScreenFlags & 0x80)) {
+				if(bg3FogBlend) {
+					frameBg3FogBlend++;
+				}
+				if(bg1OverlayBlend) {
+					frameBg1OverlayBlend++;
+				}
+				// Track color math delta application (M5.11)
+				if(!bg3FogBlend && !bg1OverlayBlend && (pixelInfo.MainScreenFlags & 0x80)) {
 						uint16_t pre = pixelInfo.MainScreenColor & 0x7FFF;
 						uint16_t post = ppuOutputBuffer[ppuIndex] & 0x7FFF;
 						if(pre != post) {
@@ -486,10 +531,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							char buf[320];
 							{
 								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s%s",
-									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
-									usedFallbackLayer ? " (FALLBACK)" : "",
-									bg3FogBlend ? " (FOG-BLEND)" : "");
+								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s%s%s",
+								(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
+								usedFallbackLayer ? " (FALLBACK)" : "",
+								bg3FogBlend ? " (FOG-BLEND)" : "",
+								bg1OverlayBlend ? " (OV-BLEND)" : "");
 								DiagLog(buf);
 							}
 							diagMatchCount++;
@@ -649,16 +695,17 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				uint8_t srcTileX = hFlip ? (7 - rawX) : rawX;
 				uint8_t srcTileY = vFlip ? (7 - rawY) : rawY;
 
-				// Pre-compute fog color if this pixel uses BG3 fog blending.
-				// MainScreenColor holds the raw BG3 layer color captured before
-				// the PPU applied color math.
-				// Blend weight: 80% HD tile + 20% fog color.  The original PPU
-				// uses 50/50 half-addition, but HD tiles are painted brighter than
-				// native tiles, so a lighter fog weight preserves art quality while
-				// still conveying the atmospheric effect.
+			// Pre-compute fog/overlay color if this pixel uses BG3 fog
+				// blending or BG1 overlay blending (honey in beehive levels).
+				// MainScreenColor holds the raw overlay layer color captured
+				// before the PPU applied color math.
+				// Blend weight: 80% HD tile + 20% fog/overlay color.  The
+				// original PPU uses 50/50 half-addition, but HD tiles are
+				// painted brighter than native tiles, so a lighter weight
+				// preserves art quality while still conveying the effect.
 				uint32_t fogColorRGB = 0;
 				uint8_t fogR = 0, fogG = 0, fogB = 0;
-				if(bg3FogBlend) {
+				if(bg3FogBlend || bg1OverlayBlend) {
 					fogColorRGB = _calculatedPalette[pixelInfo.MainScreenColor & 0x7FFF];
 					fogR = (fogColorRGB >> 16) & 0xFF;
 					fogG = (fogColorRGB >> 8) & 0xFF;
@@ -677,7 +724,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				bool cmSubtractMode = false;
 				int cmPreR = 0, cmPreG = 0, cmPreB = 0;
 				int cmPostR = 0, cmPostG = 0, cmPostB = 0;
-				if(!bg3FogBlend && (pixelInfo.MainScreenFlags & 0x80)) {
+				if(!bg3FogBlend && !bg1OverlayBlend && (pixelInfo.MainScreenFlags & 0x80)) {
 					uint16_t preMath = pixelInfo.MainScreenColor & 0x7FFF;
 					uint16_t postMath = ppuOutputBuffer[ppuIndex] & 0x7FFF;
 					cmPreR = preMath & 0x1F;
@@ -708,8 +755,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 							if(outIndex < frameInfo.Width * frameInfo.Height) {
 								uint8_t alpha = (hdColor >> 24) & 0xFF;
-								if(alpha == 0xFF) {
-									if(bg3FogBlend) {
+							if(alpha == 0xFF) {
+								if(bg3FogBlend || bg1OverlayBlend) {
 										// BG3 fog-blend: render HD tile with atmospheric
 										// fog tint.  80% HD + 20% fog keeps art visible
 										// while conveying the fog effect.
@@ -758,8 +805,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									uint8_t blendR = hdR + ((srcR * (255 - alpha)) / 255);
 									uint8_t blendG = hdG + ((srcG * (255 - alpha)) / 255);
 									uint8_t blendB = hdB + ((srcB * (255 - alpha)) / 255);
-									if(bg3FogBlend) {
-										// Apply fog on top of the alpha-blended result (80/20)
+								if(bg3FogBlend || bg1OverlayBlend) {
+									// Apply fog on top of the alpha-blended result (80/20)
 										blendR = (uint8_t)((blendR * 4 + fogR) / 5);
 										blendG = (uint8_t)((blendG * 4 + fogG) / 5);
 										blendB = (uint8_t)((blendB * 4 + fogB) / 5);
@@ -808,12 +855,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u fogB=%u bgFb=%u cmDelta=%u lRetry=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
+			": total=%u bg=%u match=%u (fb=%u fogB=%u ovBlend=%u bgFb=%u cmDelta=%u lRetry=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount,
 			ctxLabel,
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend, frameBg3BgFallback, frameColorMathDelta, frameLayerRetry,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend, frameBg1OverlayBlend, frameBg3BgFallback, frameColorMathDelta, frameLayerRetry,
 			frameHdMiss, frameBg3FogNative,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,
