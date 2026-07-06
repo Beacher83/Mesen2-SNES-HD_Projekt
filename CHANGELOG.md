@@ -2,6 +2,75 @@
 
 Dieses Changelog dokumentiert Änderungen am Mesen2-Fork (C++ Emulator-Code).
 Für Änderungen am DKC2-HD-Tools Viewer siehe `DKC2-HD-Tools/CHANGELOG.md`.
+Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
+
+---
+
+## ═══════════════════════════════════════════════════════════════
+## HD Compositing Engine (v2)
+## ═══════════════════════════════════════════════════════════════
+##
+## Branch: feature/hd-compositing-engine
+## Vorgänger: v0.1-sonderfall-m5.19 (Tag) — M5.1 bis M5.19
+##
+## Architekturwechsel: Statt pro-Level-Typ Sonderfälle (bg3FogBlend,
+## bg1OverlayBlend, colorMathDelta etc.) wird die PPU-Compositing-
+## Pipeline (Color Math, Windowing, Brightness) generisch auf HD-
+## Auflösung repliziert. Ein Code-Pfad für alle Level-Typen.
+## ═══════════════════════════════════════════════════════════════
+
+---
+
+## [2026-07-06] — Phase 1: Per-Scanline PPU Register Snapshot
+
+### Neue Datenstruktur: SnesHdScanlineInfo
+
+**Datei:** `Core/SNES/HdPacks/SnesHdData.h`
+
+Neue Struktur `SnesHdScanlineInfo` — Snapshot aller PPU-Register die für
+HD-Compositing relevant sind, erfasst pro Scanline:
+
+- **Color Math:** `ColorMathEnabled`, `SubtractMode`, `HalveResult`,
+  `AddSubscreen`, `ClipMode`, `PreventMode` ($2130, $2131)
+- **Fixed Color:** `FixedColor` ($2132) — HDMA-animiert pro Scanline
+  (Nebelgradient, Lavatönung, Eiseffekt)
+- **Brightness:** `ScreenBrightness` ($2100) — Fade-In/Out
+- **Layer-Zuordnung:** `MainScreenLayers`, `SubScreenLayers` ($212C, $212D)
+- **Window-Positionen:** `Window1Left/Right`, `Window2Left/Right` ($2126-$2129)
+- **Color-Window-Konfiguration:** `ColorWindowActive[2]`, `ColorWindowInverted[2]`,
+  `ColorWindowMaskLogic` — für Color-Window-Auswertung auf HD-Auflösung
+
+### SnesHdScreenInfo erweitert
+
+`ScanlineInfo[239]` Array hinzugefügt. Wird in `SendFrame()` beim
+Double-Buffer-Swap via `memset` gecleared.
+
+### PPU befüllt ScanlineInfo
+
+**Datei:** `Core/SNES/SnesPpu.cpp`
+
+In `RenderScanline()`, direkt nach `hdScanline`-Berechnung und VOR
+`ApplyColorMath()`, wird `_state` in `ScanlineInfo[hdScanline]` kopiert.
+So hat der HD-Filter den Register-Zustand *vor* der nativen Color Math
+und kann sie selbst auf HD-Pixeln neu berechnen.
+
+### Include-Abhängigkeit
+
+`SnesHdData.h` inkludiert jetzt `SNES/SnesPpuTypes.h` für die Enum-Typen
+`ColorWindowMode` und `WindowMaskLogic`. Keine zirkuläre Abhängigkeit
+(SnesPpuTypes.h ist ein reines Type-Definition-Header).
+
+### Kein Verhaltensunterschied
+
+Phase 1 fügt nur Daten hinzu — die werden noch nicht konsumiert.
+Der bestehende HD-Filter arbeitet exakt wie M5.19 weiter.
+
+---
+
+## ═══════════════════════════════════════════════════════════════
+## v1 — Per-Level-Typ Sonderfälle (M5.1 bis M5.19)
+## Gesichert als Tag: v0.1-sonderfall-m5.19
+## ═══════════════════════════════════════════════════════════════
 
 ---
 

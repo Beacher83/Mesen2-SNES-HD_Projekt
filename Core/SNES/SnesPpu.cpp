@@ -917,6 +917,41 @@ void SnesPpu::RenderScanline()
 		// Compute HD scanline offset (shared by pre- and post-math blocks)
 		uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
 
+		// --- HD Compositing Engine: Per-scanline register snapshot ---
+		// Capture PPU register state BEFORE ApplyColorMath() so the HD filter
+		// can re-apply color math on HD-resolution pixels.
+		// This runs on every partial render call; last write wins for the scanline.
+		// DKC2 (and most Mode 1 games) only change these registers via HDMA between
+		// scanlines, never mid-line, so all partial calls see the same state.
+		if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight) {
+			SnesHdScanlineInfo& sl = _hdActiveScreen->ScanlineInfo[hdScanline];
+			// Color math registers ($2130, $2131)
+			sl.ColorMathEnabled      = _state.ColorMathEnabled;
+			sl.ColorMathSubtractMode = _state.ColorMathSubtractMode;
+			sl.ColorMathHalveResult  = _state.ColorMathHalveResult;
+			sl.ColorMathAddSubscreen = _state.ColorMathAddSubscreen;
+			sl.ColorMathClipMode     = _state.ColorMathClipMode;
+			sl.ColorMathPreventMode  = _state.ColorMathPreventMode;
+			// Fixed color ($2132) — HDMA-animated per scanline
+			sl.FixedColor            = _state.FixedColor;
+			// Brightness ($2100)
+			sl.ScreenBrightness      = _state.ScreenBrightness;
+			// Layer designation ($212C, $212D)
+			sl.MainScreenLayers      = _state.MainScreenLayers;
+			sl.SubScreenLayers       = _state.SubScreenLayers;
+			// Window positions ($2126-$2129)
+			sl.Window1Left           = _state.Window[0].Left;
+			sl.Window1Right          = _state.Window[0].Right;
+			sl.Window2Left           = _state.Window[1].Left;
+			sl.Window2Right          = _state.Window[1].Right;
+			// Color window config (layer index 5 = color math window)
+			sl.ColorWindowActive[0]  = _state.Window[0].ActiveLayers[5];
+			sl.ColorWindowActive[1]  = _state.Window[1].ActiveLayers[5];
+			sl.ColorWindowInverted[0] = _state.Window[0].InvertedLayers[5];
+			sl.ColorWindowInverted[1] = _state.Window[1].InvertedLayers[5];
+			sl.ColorWindowMaskLogic  = _state.MaskLogic[5];
+		}
+
 		// Save pre-color-math main screen color for HD delta computation.
 		// Apply brightness inline so the pre-math value is brightness-scaled
 		// like the post-math value (from ppuOutputBuffer), preventing the
@@ -1635,6 +1670,7 @@ void SnesPpu::SendFrame()
 		_hdActiveScreen = (_hdActiveScreen == _hdScreenInfo[0]) ? _hdScreenInfo[1] : _hdScreenInfo[0];
 		// Clear next frame's screen info
 		memset(_hdActiveScreen->ScreenTiles, 0, sizeof(SnesHdPpuPixelInfo) * SnesHdScreenInfo::ScreenPixelCount);
+		memset(_hdActiveScreen->ScanlineInfo, 0, sizeof(SnesHdScanlineInfo) * SnesHdScreenInfo::ScreenHeight);
 	}
 
 	_emu->GetVideoDecoder()->UpdateFrame(frame, isRewinding, isRewinding);

@@ -1,6 +1,7 @@
 #pragma once
 #include "pch.h"
 #include "Utilities/SimpleLock.h"
+#include "SNES/SnesPpuTypes.h"
 
 // ============================================================================
 // SNES HD Pack Data Structures
@@ -147,6 +148,59 @@ struct SnesHdPpuPixelInfo
 };
 
 // ---------------------------------------------------------------------------
+// SnesHdScanlineInfo — Per-scanline PPU register snapshot for HD compositing
+// ---------------------------------------------------------------------------
+// Captured once per scanline from SnesPpuState during RenderScanline().
+// Contains all register state needed to reproduce SNES post-tile compositing
+// (color math, windowing, brightness) at HD resolution.
+//
+// Why per-scanline: HDMA updates registers between scanlines (at HBlank).
+// DKC2 uses HDMA to animate FixedColor (fog gradient), toggle color math
+// layers, and move window boundaries — all between scanlines, never mid-line.
+//
+// Used by Phase 2-4 of the HD compositing engine to replace the old
+// per-level-type special cases (bg3FogBlend, bg1OverlayBlend, etc.)
+
+struct SnesHdScanlineInfo
+{
+	// --- Color Math ($2130, $2131) ---
+	uint8_t ColorMathEnabled = 0;          // $2131 bits 0-5: bitmask of layers that participate
+	                                       //   bit 0 = BG1, 1 = BG2, 2 = BG3, 3 = BG4,
+	                                       //   4 = OBJ (sprites with palette 4-7), 5 = Backdrop
+	bool ColorMathSubtractMode = false;    // $2131 bit 7: true = subtract, false = add
+	bool ColorMathHalveResult = false;     // $2131 bit 6: halve the add/sub result
+	bool ColorMathAddSubscreen = false;    // $2130 bit 1: true = blend with sub-screen pixel,
+	                                       //              false = blend with FixedColor
+	ColorWindowMode ColorMathClipMode = ColorWindowMode::Never;    // $2130 bits 6-7: clip color to black
+	ColorWindowMode ColorMathPreventMode = ColorWindowMode::Never; // $2130 bits 4-5: prevent color math
+
+	// --- Fixed Color ($2132) ---
+	uint16_t FixedColor = 0;               // BGR555, HDMA-animated per scanline (fog/lava/ice gradient)
+
+	// --- Brightness ($2100) ---
+	uint8_t ScreenBrightness = 0;          // 0-15 (0 = black, 15 = full)
+
+	// --- Layer Designation ($212C, $212D) ---
+	uint8_t MainScreenLayers = 0;          // $212C: bitmask of layers on main screen
+	uint8_t SubScreenLayers = 0;           // $212D: bitmask of layers on sub screen
+
+	// --- Window Positions ($2126-$2129) ---
+	// Needed to re-evaluate color window boundaries at HD resolution.
+	// At 4x scale, SNES window boundary at x=100 → HD boundary at x=400.
+	uint8_t Window1Left = 0;               // $2126
+	uint8_t Window1Right = 0;              // $2127
+	uint8_t Window2Left = 0;               // $2128
+	uint8_t Window2Right = 0;              // $2129
+
+	// --- Color Window Configuration ---
+	// The SNES has 2 windows. For the color math layer (index 5 in PPU terms),
+	// we need to know: is each window active? is it inverted? how are they combined?
+	bool ColorWindowActive[2] = {};        // Window 1/2 active for color math (layer 5)
+	bool ColorWindowInverted[2] = {};      // Window 1/2 inverted for color math (layer 5)
+	WindowMaskLogic ColorWindowMaskLogic = WindowMaskLogic::Or;  // How to combine W1+W2 for color
+};
+
+// ---------------------------------------------------------------------------
 // SnesHdScreenInfo — Full frame of pixel info for HD rendering
 // ---------------------------------------------------------------------------
 
@@ -157,6 +211,7 @@ struct SnesHdScreenInfo
 	static constexpr int ScreenPixelCount = ScreenWidth * ScreenHeight;
 
 	SnesHdPpuPixelInfo* ScreenTiles;
+	SnesHdScanlineInfo ScanlineInfo[ScreenHeight];  // Per-scanline PPU register snapshot (filled by PPU)
 	uint16_t* Vram = nullptr;   // Pointer to PPU VRAM (word-addressed, 0x8000 entries); set by PPU at init
 	uint32_t FrameNumber = 0;
 	uint16_t Scanline = 0;
