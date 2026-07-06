@@ -753,7 +753,7 @@ Nur die HD-Grafiken (PNGs) ändern sich — die Hash-Seite bleibt stabil.
 | gfxset_27 | Krow's Nest |
 | gfxset_28 | Hot Head Hop / Red Hot Ride |
 | gfxset_29 | Slime Climb (Note: Palette differs from gfxset_25, gleiche CHR) |
-| gfxset_2A | Rambi Rumble |
+| gfxset_2A | ~~Rambi Rumble~~ (Falsch — Rambi Rumble = gfxSet 0x04, Level 0x02) |
 | gfxset_2B | Bramble Scramble |
 | gfxset_2C | Snakey Chantey Bonus |
 | gfxset_2D | Slime Climb |
@@ -2088,62 +2088,82 @@ PAL MISMATCH (Zeilen 1390-1409, wiederholt):
 ### Symptom
 - **Nichts** wird in HD gerendert — kompletter Fallback auf native Pixel
 - Das gesamte Level zeigt nur das originale SNES-Bild
-- Kein sichtbarer HD-Effekt obwohl Tiles für gfxset 02 (Beehive) vorhanden sein sollten
+- Kein sichtbarer HD-Effekt obwohl Tiles für gfxSet 0x04 (Beehive SSB) vorhanden sein sollten
+- Level 0x02 (Rambi Rumble), ppuConfig 0x03, gfxSet 0x04
 
-### Log-Analyse (sig=AD7DD09D5F515544, context [other])
+### Log-Analyse — KORRIGIERT (sig=02D047A001E155B7)
+
+Erste Analyse (sig=AD7DD09D...) war irreführend (falsches Level/Context).
+Korrekte Analyse nach gezieltem Rambi-Rumble-Test:
+
 ```
-Steady-State Frame (Zeile 1700):
-  bg=54163 match=0 miss=54163 notInPack=51751 palMis=2412
-  BG1=54163 BG2=0 BG3=0 BG4=0
-  sprWon=3101 mask0=80 BG1miss=54163 BG1notInPack=51751
+Frame 10 (erster Render):
+  bg=57240 match=0 palMis=22168 notInPack=35072 BG1miss=0
 
-PAL MISMATCH (Zeilen 1558-1577):
-  hash=84330E8399FF5C85 runtime_pal=7 pack_pal=6
-  runtime_layer=0 pack_layer=0 vram=0x2000
+Frame 12+ (steady state):
+  bg=53024 match=176 palMis=0 notInPack=52848 BG1miss=1152
 
-MISS-Detail (Zeilen 1580-1609):
-  Alle MISSes mit [DMA_RANGE] Tag
-  VRAM-Adressen: 0x2000-0x21B0
-  Paletten: pal=5, pal=6, pal=7, pal=0 (gemischt)
+PAL MISMATCH (Frame 10, Zeilen 1390-1409):
+  hash=8A1303A809810035 runtime_pal=6 pack_pal=2
+  runtime_layer=1 pack_layer=0 vram=0x5000
+  → Content Hash MATCHT, aber Layer UND Palette sind falsch
+
+MISS-Detail (steady state):
+  layer=1 pal=6 vram=$5010-$5380 (BG2 honey tiles)
+  layer=2 vram=$7000+ (BG3)
 ```
 
-### Analyse
-- **match=0 bei bg=54163:** Null von 54163 Background-Pixeln gematched → totaler Fehlschlag
-- **BG1=54163, BG2=0, BG3=0:** Nur BG1 aktiv. Kein BG2 oder BG3.
-  Das ist ungewöhnlich für gfxset 02 (Beehive), der normalerweise BG3 für Bienenwaben hat.
-  → Entweder falsches gfxset-Mapping oder abweichende PPU-Konfiguration in diesem Level
-- **notInPack=51751:** 95% der BG1-Tiles sind nicht im HD-Pack → der Container enthält
-  diese Tiles schlicht nicht
-- **palMis=2412:** 4,5% der Tiles SIND im Pack (gleicher Hash), aber mit falscher Palette
-  (pack_pal=6, runtime_pal=7). Diese Tiles könnten gematched werden, wenn Palette-
-  tolerantes Matching aktiviert würde
-- **[DMA_RANGE] auf allen MISSes:** Alle fehlenden Tiles haben VRAM-Adressen in einem
-  DMA-Transfer-Bereich. DKC2 nutzt DMA um Tiles zur Laufzeit in VRAM zu laden
-  (Animation, Level-Streaming). Diese DMA-Tiles sind nicht im statischen Ground-Truth-
-  VRAM-Dump enthalten → beim Export nicht erfasst
-- **Nur BG1 aktiv:** Möglicherweise verwendet Rambi Rumble eine spezielle PPU-Konfiguration
-  die BG2/BG3 deaktiviert oder über Mode 7 / Window-Masking ausblendet
+### Root Cause — Dreifach-Problem im cmFg SSB-Export (Viewer)
 
-### Vermutete Ursache (Mehrfach-Problem)
-1. **Falscher gfxset im Container:** Der Viewer exportiert gfxset 02 (Beehive) Tiles,
-   aber Rambi Rumble nutzt zur Laufzeit andere Tile-Daten (DMA-geladen)
-2. **DMA-Tiles nicht im Export:** Die VRAM-Region 0x2000-0x21B0 wird per DMA
-   zur Laufzeit überschrieben. Der statische VRAM-Dump (Ground Truth) kennt diese
-   Tiles nicht → sie sind nicht im HD-Pack
-3. **Palette-Shift:** Selbst die wenigen Tiles die per Hash matchen, haben eine
-   um +1 verschobene Palette (6→7)
+**Root Cause 1: Layer-Mismatch (cmFg)**
+DKC2 reprogrammiert PPU-Register $210B zur Laufzeit und **tauscht die chrBases**:
+- ROM ppuConfig: $210B=$25 → BG1.chr=$5000 (Honig), BG2.chr=$2000 (Terrain)
+- Runtime:       $210B=$52 → BG1.chr=$2000 (Terrain), BG2.chr=$5000 (Honig)
 
-### Verwandte Issues
-- **Issue I** (Rambi Rumble BG3 Honig/Bienenstock): Viewer-seitige Sub-Screen-Blend-
-  Darstellung. Issue I adressiert den Viewer, Issue O das Mesen-Rendering.
+Die Honig-Overlay-Tiles bei $5000 werden zur Laufzeit von **BG2 (layer=1)** gerendert,
+aber der Viewer exportierte sie als **BG1 (layer=0)** → Folder `bg/bg1/` → Mesen
+ordnet layer=0 zu → runtime_layer=1 ≠ pack_layer=0 → kein Match.
 
-### Nächste Schritte
-1. VRAM-Dump von Rambi Rumble **zur Laufzeit** erstellen (nicht statischer Ground Truth)
-   — `dkc2_vram_dump.lua` während des Levels ausführen
-2. DMA-Transfer-Ziel analysieren: Welche Tiles werden dynamisch geladen?
-   Sind es animierte Tiles (Honig-Tropf) oder Level-Streaming-Tiles?
-3. Prüfen ob der Container überhaupt das richtige gfxset für Rambi Rumble enthält
-4. Palette-tolerantes Matching als Workaround testen (palMis→match statt miss)
+**Root Cause 2: Palette-Mismatch**
+Der cmFg-Export las die Palette aus der **BG1-Tilemap** (bg1TilemapData aus simuliertem
+VRAM bei ppu.bg1.tilemapBase). Diese DMA-geladene Tilemap hatte **pal=2**.
+Zur Laufzeit liest BG2 seine Tilemap von **bg2TilemapBase** — im Ground Truth VRAM bei
+Wort-Adresse **$6C00** liegt eine reine pal=6-Tilemap (1024/1024 Einträge = pal=6).
+Ergebnis: pack_pal=2, runtime_pal=6 → kein Match.
+
+**Root Cause 3: Content Hash (animierte Tiles, niedrige Priorität)**
+BG1miss=1152 steady-state → ~18 Terrain-Tiles bei $2000 matchen nicht (Content Hash
+unterschiedlich). Vermutlich VBlank-DMA-animierte Tiles (Honigtropf-Effekte), die der
+Ground Truth nur in einem Frame erfasst.
+
+### Frame 10→12 Transition
+- Frame 10: palMis=22168 → Content Hashes matchen noch (frisch aus DMA geladen),
+  aber Layer+Palette falsch → palMis
+- Frame 12: palMis=0 → VRAM-Inhalt bei $5000 hat sich per VBlank-DMA geändert,
+  Content Hashes matchen nicht mehr → alles wird notInPack statt palMis
+
+### Fix (2026-07-06) — DKC2-HD-Tools Viewer
+
+**Fix 1: Layer cmFg 0→1** (index.html)
+- Hash-Export: `layer: 0` → `layer: 1`, Dedup-Key `_0_` → `_1_` (Zeile ~9226/9233)
+- PNG-Export: Folder `bg/bg1/gfxset_XX` → `bg/bg2/gfxset_XX` (Zeile ~8935)
+- Mesen Loader ordnet `bg/bg2/` → layer=1 zu → matcht runtime BG2
+
+**Fix 2: Palette aus Ground Truth BG2-Tilemap** (index.html)
+- `bg2TilemapBase` zu ppuConfig hinzugefügt (Zeile ~7683)
+- cmFg PNG-Export: Extrahiert BG2-Tilemap aus Ground Truth VRAM bei `bg2TilemapBase`
+  und überschreibt die Palette aus der BG1-Tilemap (Zeile ~8944-8997)
+- Für gfxSet 0x04: bg2TilemapBase=$6C00 → pal=6 für alle Honig-Tiles
+- Fallback: Wenn kein Ground Truth verfügbar, bleibt BG1-Palette erhalten
+
+**Betrifft:** Alle 35 SSB-Levels (ppuConfig 0x03, 0x24, 0x29, 0x2C, 0x31, 0x35).
+Der Fix ist generisch — er liest die BG2-Tilemap aus dem Ground Truth VRAM für
+jedes SSB-Level, sodass verschiedene Levels verschiedene Paletten erhalten.
+
+### Status: **CODE COMPLETE — UNTESTED**
+- Container muss re-exportiert werden (Viewer öffnen → Save → Export)
+- Mesen-Test mit neuem HD-Pack erforderlich
+- Root Cause 3 (animierte Tiles, ~18 Tiles) ist LOW PRIORITY und nicht adressiert
 
 ---
 
