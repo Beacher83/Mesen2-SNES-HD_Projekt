@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-06 | Mesen Build: M5.16 (test pending) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED | Issue O: BG1 Overlay-Blend M5.16 IMPLEMENTED (test pending)
+Stand: 2026-07-06 | Mesen Build: M5.16 (VERIFIED) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED | Issue O: BG1 Overlay-Blend M5.16 VERIFIED
 
 ---
 
@@ -49,7 +49,7 @@ Tiles aufgelöst, mit korrekten H/V-Flip-Bits (XOR zwischen Metatile-Flip und Ti
 | C | Worldmap Tile-Kontamination | CLOSED | M5.1 | M5.7 (gefixt via vramSig-Sperre) |
 | D | Performance Level 1 leicht schlechter | OFFEN — Optimierung geplant | M5.10 | M5.10: spielbar aber spürbar |
 | E | Hot-Head Hop: Lava-Glow Color-Math (BG3 subtract) | M5.11: VERIFIED ✓ — Lava-Glow auf HD Tiles sichtbar | 2026-06-29 | M5.11 OK |
-| F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | Known Limitation (wie Piratenflagge) | 2026-06-29 | Erste Beobachtung |
+| F | Hot-Head Hop: Bubble-Animation (Frame-Mismatch) | Known Limitation (wie Piratenflagge, Beehive-Bienen/Larven) | 2026-06-29 | Erste Beobachtung |
 | G | Glimmer's Galleon (ppuConfig 0x28): BG2 Sub-Screen + HDMA-Scroll-Effekt | Viewer-Limitation, Laufzeit teilweise OK (3D-Hintergrund fehlt) | 2026-06-29 | Erste Beobachtung |
 | H | Hot-Head Hop: Unteres Fünftel — Layer Index Mismatch (BG2 runtime, BG1 in pack) | M5.13: Layer-agnostic retry — M5.14: Fallback-Retry entfernt (Bubble-Regression) | 2026-06-30 | M5.13: unteres 1/5 HD ✓, aber Blasen-Löcher im oberen Bereich |
 | I | Rambi Rumble BG3: Honig opak, Bienenstock verdeckt (Sub-Screen-Blend) | v3 BESTÄTIGT — Layer-Reihenfolge korrekt. Feintuning (Alpha, Catalog) nächste Session | 2026-07-02 | v3 getestet 2026-07-03: Waben=BG, Honig=FG ✓ |
@@ -2232,7 +2232,13 @@ plus 7 Bonus-Räume — 13 Varianten total.
 
 **Erwartetes Ergebnis:** HD-Terrain sichtbar durch semi-transparenten Honig-Schleier.
 
-### Status: **M5.16 C++ EDITS KOMPLETT — User-Test ausstehend**
+### Status: **M5.16 VERIFIED** — Alle Layer in HD sichtbar, nativer Honig-Overlay vorhanden.
+
+**Verbleibende Feintuning-Punkte:**
+- Honig-Tint könnte etwas kräftiger sein (aktuell 80/20 HD/Overlay-Ratio). Niedrige Prio.
+- Animierte Hintergrundelemente (kleine Bienen, Larven) zeigen dieselben Darstellungsfehler
+  wie Bubbles in Hot-Head Hop (→ Issue F: Frame-Mismatch bei VBlank-DMA-animierten Tiles).
+  Bekannte Limitation, betrifft alle Level mit animierten BG-Sprites.
 
 ---
 
@@ -2358,13 +2364,13 @@ Nach additivem Delta:   R=0*  G=0*  B=34   ← BLAU! (* = geclampt)
 | L | Mainbrace Mayhem | Hoch | Sub-Screen BG3 Fog | OFFEN |
 | M | Lockjaw's Locker | Hoch | Multi (Tilemap+Scroll+Color) | OFFEN |
 | N | Hot Head Hop | Mittel | Artefakte+Seams | OFFEN (teilw. E/F/H) |
-| O | Rambi Rumble | Kritisch | BG1 Overlay verdeckt BG2 Terrain (Honig blockiert HD-Tiles) | M5.16: BG1 Overlay-Blend + cmFg Ordner-Separation — **User-Test ausstehend** |
+| O | Rambi Rumble | Kritisch | BG1 Overlay verdeckt BG2 Terrain (Honig blockiert HD-Tiles) | **M5.16 VERIFIED** — HD-Terrain + Honig-Tint sichtbar. Feintuning (Tint-Stärke) niedrige Prio. Animierte BG-Elemente (Bienen/Larven) → Issue F |
 | P(a) | Gusty Glade | Hoch | Blaue Quadrate — Color Math NICHT die Ursache (acm=0), PNG-Inhalt verdächtig | C++ Subtract-Fix irrelevant, **PNG-Dateien untersuchen** |
 | P(b,c) | Gusty Glade | Mittel | Layer-Mismatch+Blätter | OFFEN |
 | D | Alle Level | Mittel | Performance | OFFEN |
 
 ### Priorisierung (empfohlen)
-1. **Issue O** (Rambi Rumble): M5.16 BG1 Overlay-Blend implementiert — Test ausstehend
+1. ~~**Issue O** (Rambi Rumble): M5.16 BG1 Overlay-Blend implementiert — Test ausstehend~~ **VERIFIED**
 2. **Issue L** (Mainbrace Mayhem Fog): Sehr sichtbar, BG3-Nebel-Compositing
 3. **Issue M** (Lockjaw's Locker): Drei Sub-Issues, teilweise fehlende Tiles
 4. **Issue J** (Pirate Panic BG3): Subtil, nur bei Sprite-Überlappung
