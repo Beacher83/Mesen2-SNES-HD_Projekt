@@ -2142,28 +2142,44 @@ Ground Truth nur in einem Frame erfasst.
 - Frame 12: palMis=0 → VRAM-Inhalt bei $5000 hat sich per VBlank-DMA geändert,
   Content Hashes matchen nicht mehr → alles wird notInPack statt palMis
 
-### Fix (2026-07-06) — DKC2-HD-Tools Viewer
+### Fix (2026-07-06) — DKC2-HD-Tools Viewer — **LAYER-FIX WAR FALSCH (revertiert 2026-07-06b)**
 
-**Fix 1: Layer cmFg 0→1** (index.html)
+**Fix 1: Layer cmFg 0→1** (index.html) — **FALSCH, REVERTIERT**
 - Hash-Export: `layer: 0` → `layer: 1`, Dedup-Key `_0_` → `_1_` (Zeile ~9226/9233)
 - PNG-Export: Folder `bg/bg1/gfxset_XX` → `bg/bg2/gfxset_XX` (Zeile ~8935)
 - Mesen Loader ordnet `bg/bg2/` → layer=1 zu → matcht runtime BG2
+- **REVERTIERT** weil Diagnostic-Log zeigt: BG1 (layer=0) rendert Honig, nicht BG2!
 
-**Fix 2: Palette aus Ground Truth BG2-Tilemap** (index.html)
+**Fix 2: Palette aus Ground Truth BG2-Tilemap** (index.html) — **KORREKT, BEIBEHALTEN**
 - `bg2TilemapBase` zu ppuConfig hinzugefügt (Zeile ~7683)
 - cmFg PNG-Export: Extrahiert BG2-Tilemap aus Ground Truth VRAM bei `bg2TilemapBase`
   und überschreibt die Palette aus der BG1-Tilemap (Zeile ~8944-8997)
 - Für gfxSet 0x04: bg2TilemapBase=$6C00 → pal=6 für alle Honig-Tiles
 - Fallback: Wenn kein Ground Truth verfügbar, bleibt BG1-Palette erhalten
 
-**Betrifft:** Alle 35 SSB-Levels (ppuConfig 0x03, 0x24, 0x29, 0x2C, 0x31, 0x35).
-Der Fix ist generisch — er liest die BG2-Tilemap aus dem Ground Truth VRAM für
-jedes SSB-Level, sodass verschiedene Levels verschiedene Paletten erhalten.
+### Update (2026-07-06b) — Korrigierte Analyse nach Diagnostic-Log
 
-### Status: **CODE COMPLETE — UNTESTED**
-- Container muss re-exportiert werden (Viewer öffnen → Save → Export)
-- Mesen-Test mit neuem HD-Pack erforderlich
-- Root Cause 3 (animierte Tiles, ~18 Tiles) ist LOW PRIORITY und nicht adressiert
+**Post-Log-Analyse** (36.931 Zeilen, Rambi Rumble sig CE539ABFD210DBD0):
+
+| Layer | ChrBase | VRAM-Bereich | Palette | Inhalt |
+|-------|---------|-------------|---------|--------|
+| 0 (BG1) | $5000 | $5xxx-$6xxx | pal=6 | Honig-Tiles (cmFg) |
+| 1 (BG2) | $2000 | $2xxx-$4xxx | pal=3 | Terrain-Tiles |
+| 2 (BG3) | $7000 | $7xxx | — | Hintergrund (9684 FALLBACK matches) |
+
+**Korrekte Root Cause Analyse:**
+- $210B bleibt $25 (BG1.chr=$5000, BG2.chr=$2000) — KEIN Swap in diesen Frames
+- Layer 0→1 Änderung war FALSCH (Runtime rendert Honig auf BG1/layer=0)
+- Palette 2→6 Änderung war KORREKT (BG2 Tilemap hat pal=6)
+- 14.130 MATCH insgesamt — ALLE sind BG3 FALLBACK, KEIN exakter BG1/BG2 Match
+- 4 Gameplay-Kontext-Signaturen rotieren im 6er-Zyklus (HDMA?)
+
+**Offenes Problem:** Trotz korrektem Layer + Palette + chrBase sind fast alle Honig-Tiles
+MISS (Content Hash nicht im Pack). Mögliche Ursache: Ground Truth VRAM Snapshot weicht
+vom Runtime-VRAM ab. Vergleich der exportierten vs. Runtime-Hashes für spezifische
+Tile-Adressen erforderlich.
+
+### Status: **PALETTE-FIX KORREKT, LAYER REVERTIERT — CONTENT HASH MISMATCH OFFEN**
 
 ---
 
@@ -2289,8 +2305,8 @@ Nach additivem Delta:   R=0*  G=0*  B=34   ← BLAU! (* = geclampt)
 | L | Mainbrace Mayhem | Hoch | Sub-Screen BG3 Fog | OFFEN |
 | M | Lockjaw's Locker | Hoch | Multi (Tilemap+Scroll+Color) | OFFEN |
 | N | Hot Head Hop | Mittel | Artefakte+Seams | OFFEN (teilw. E/F/H) |
-| O | Rambi Rumble | Kritisch | 0% Match (DMA-Tiles) | OFFEN |
-| P(a) | Gusty Glade | Hoch | Blaue Quadrate (CM Subtract) | **BEHOBEN** |
+| O | Rambi Rumble | Kritisch | 0% Match (Palette fix OK, Layer revertiert, Content Hash offen) | OFFEN |
+| P(a) | Gusty Glade | Hoch | Blaue Quadrate (CM Subtract) | C++ Fix committed, **User-Test ausstehend** |
 | P(b,c) | Gusty Glade | Mittel | Layer-Mismatch+Blätter | OFFEN |
 | D | Alle Level | Mittel | Performance | OFFEN |
 

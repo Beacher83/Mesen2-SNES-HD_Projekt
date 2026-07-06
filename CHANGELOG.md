@@ -5,6 +5,28 @@ Für Änderungen am DKC2-HD-Tools Viewer siehe `DKC2-HD-Tools/CHANGELOG.md`.
 
 ---
 
+## [2026-07-06b] — M5.15: Per-Layer Diagnostik + Issue O/P Journal-Update
+
+### Diagnostik-Erweiterung (M5.15)
+
+**Neue Features in `SnesHdVideoFilter.cpp`:**
+- `frameWin[4]` / `frameWinACM[4]` — Per-Layer Winner- und AllowColorMath-Pixelzähler
+- `BG3WIN sample` Logging — Erste 3 BG3-gewinnende Pixel pro Context (MSFlags, MSColor, ppuOut, Tile-Info)
+- `WINNERS` Summary-Zeile pro Frame: `wn0/wn1/wn2/wn3 | acm0/acm1/acm2/acm3`
+- Build-Version: M5.14 → M5.15
+
+### Journal-Update
+
+**Issue O (Rambi Rumble):** Post-Log-Analyse (36.931 Zeilen) dokumentiert —
+Layer-Fix von vorheriger Session war FALSCH (reverted im Viewer), Palette pal=6 korrekt,
+Content-Hash-Mismatch bleibt als offenes Problem.
+
+**Issue P (Gusty Glade):** Pre-Log-Analyse zeigt cmDelta=0 in JEDEM Gameplay-Frame —
+unser Subtract-Mode-Fix (9d97024c) wird nie ausgelöst, blaue Quadrate haben eine
+völlig andere Ursache. M5.15 WINNERS-Daten sollen die echte Quelle identifizieren.
+
+---
+
 ## [2026-07-06] — Issue P Fix: Blaue Quadrate (Color Math Subtract) + Brightness + Delta-Skalierung
 
 ### Fix 1: Multiplikative Color Math für Subtract-Modus (Issue P — Blaue Quadrate)

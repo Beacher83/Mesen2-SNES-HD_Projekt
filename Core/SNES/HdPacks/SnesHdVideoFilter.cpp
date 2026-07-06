@@ -12,7 +12,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.14"
+#define SNES_HD_BUILD_VERSION "M5.15"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -157,6 +157,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagPalFallbackCount = 0;
 	static int diagDetailCount = 0;
 	static std::unordered_set<uint64_t> diagLoggedHashes;
+	static int diagBg3WinSampleCount = 0;  // M5.15: log first few BG3-winning pixel details
 
 	// Compute VRAM context signature from two stable reference tiles
 	uint64_t sigA = 0, sigB = 0;
@@ -187,6 +188,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagPalFallbackCount = 0;
 		diagDetailCount = 0;
 		diagLoggedHashes.clear();
+		diagBg3WinSampleCount = 0;
 	}
 	diagPrevVramSig = vramSig;
 
@@ -210,6 +212,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
 	uint32_t frameLayerBits[4] = {};       // Per-layer pixel counts (bit N set in mask)
 	uint32_t frameTotalPixels = 0;         // Total pixels iterated
+	uint32_t frameWin[4] = {};             // Per-layer: pixels where layer N wins compositing (M5.15)
+	uint32_t frameWinACM[4] = {};          // Per-layer: winner pixels with AllowColorMath flag (M5.15)
 
 	// For each pixel in the original SNES frame (always 256x239 for HD info)
 	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
@@ -262,10 +266,37 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					if(pixelInfo.BgLayerMask & (1 << li)) frameLayerBits[li]++;
 				}
 
-			// 1) Try the compositing winner first
-				uint8_t winLayer = pixelInfo.BgWinnerLayer;
+		// 1) Try the compositing winner first
+			uint8_t winLayer = pixelInfo.BgWinnerLayer;
 
-				// Track if BG1 ever wins with color math this frame (M5.12 Issue H).
+				// M5.15: Track per-layer winner counts and AllowColorMath
+				if(winLayer < 4) {
+					frameWin[winLayer]++;
+					if(pixelInfo.MainScreenFlags & 0x80) frameWinACM[winLayer]++;
+				}
+
+				// M5.15: Log first 3 BG3-winning pixel details per context
+				if(winLayer == 2 && diagBg3WinSampleCount < 3) {
+					char buf[384];
+					snprintf(buf, sizeof(buf),
+						"[SNES HD diag] BG3WIN sample: MSFlags=0x%02X MSColor=0x%04X ppuOut=0x%04X "
+						"mask=0x%02X win=%d bg3hash=%016llX bg3pal=%d bg3layer=%d bg3vram=0x%04X "
+						"x=%u y=%u",
+						pixelInfo.MainScreenFlags,
+						pixelInfo.MainScreenColor & 0x7FFF,
+						ppuOutputBuffer[ppuIndex] & 0x7FFF,
+						pixelInfo.BgLayerMask,
+						winLayer,
+						(unsigned long long)pixelInfo.BgTiles[2].Key.ContentHash,
+						pixelInfo.BgTiles[2].Key.PaletteIndex,
+						pixelInfo.BgTiles[2].Key.LayerIndex,
+						pixelInfo.BgTiles[2].VramWordAddr,
+						x, y);
+					DiagLog(buf);
+					diagBg3WinSampleCount++;
+				}
+
+			// Track if BG1 ever wins with color math this frame (M5.12 Issue H).
 				// In HDMA-animated levels (Hot-Head Hop), BG1 has AllowColorMath on
 				// upper scanlines. This flag enables the BG3-background fallback
 				// path on lower scanlines where BG3 wins without color math.
@@ -790,6 +821,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameBg1MissPixels, frameBg1NotInPack,
 			_hdData->TileByKey.size(),
 			(unsigned long long)vramSig);
+		DiagLog(buf);
+		// M5.15: Second log line with per-winner-layer breakdown
+		snprintf(buf, sizeof(buf),
+			"[SNES HD diag]   WINNERS: wn0=%u wn1=%u wn2=%u wn3=%u | acm0=%u acm1=%u acm2=%u acm3=%u",
+			frameWin[0], frameWin[1], frameWin[2], frameWin[3],
+			frameWinACM[0], frameWinACM[1], frameWinACM[2], frameWinACM[3]);
 		DiagLog(buf);
 		diagFrameCount++;
 		if(frameBgPixels > 0) {
