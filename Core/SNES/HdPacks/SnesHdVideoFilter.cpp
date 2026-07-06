@@ -12,7 +12,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.16"
+#define SNES_HD_BUILD_VERSION "M5.17"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -208,6 +208,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameBg3BgFallback = 0;       // BG3 bg won w/o colorMath → BG1 HD rendered plain (M5.12 Issue H)
 	uint32_t frameLayerRetry = 0;          // BG1↔BG2 layer-agnostic retry matches (M5.13 Issue H)
 	uint32_t frameBg1OverlayBlend = 0;     // BG1 overlay-blend: HD terrain under honey/overlay (M5.16 Issue O)
+	uint32_t frameBg3FogSkip = 0;          // BG3 fog winner: HD tile lookup skipped, deferred to step 3 (M5.17 Issue L)
 	bool frameHasBg1ColorMath = false;     // Any BG1-winning pixel had AllowColorMath this frame (M5.12)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
@@ -307,9 +308,18 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 
 			if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
-				hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
-				if(hdTile) {
-					tileInfo = &pixelInfo.BgTiles[winLayer];
+				// M5.17 Issue L: Skip BG3 winner HD tile lookup when AllowColorMath
+				// is set (fog/overlay). BG3 fog HD tiles would render opaquely and
+				// block terrain underneath. Defer to step 3 (bg3FogBlend) which
+				// finds BG1/BG2 terrain HD tiles and renders with fog tint.
+				bool bg3FogWinner = (winLayer == 2 && (pixelInfo.MainScreenFlags & 0x80));
+				if(!bg3FogWinner) {
+					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
+					if(hdTile) {
+						tileInfo = &pixelInfo.BgTiles[winLayer];
+					}
+				} else {
+					frameBg3FogSkip++;
 				}
 			}
 
@@ -333,7 +343,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 			}
 
-			// 1c) BG1 overlay detection (M5.16, Issue O):
+			// 1c) BG1 overlay detection (M5.16, Issue O; refined M5.17, Issue L):
 			//     BG1 won compositing WITH AllowColorMath but has no HD tile.
 			//     This indicates a semi-transparent foreground overlay (e.g. honey
 			//     in DKC2 beehive levels: Rambi Rumble, Hornet Hole, Parrot Chute
@@ -341,7 +351,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			//     Skip the generic fallback (step 2) because applyColorMathDelta
 			//     uses wrong math for overlay-under-terrain rendering.
 			//     Step 3b handles this with proper overlay blending.
-			bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80));
+			//     M5.17: Also require BG3 to have a tile at this pixel.
+			//     In beehive levels, BG1 wins OVER BG3 (both present → overlay).
+			//     In Mainbrace Mayhem, BG1 only wins where BG3 has NO tile
+			//     (fog gap → BG1 is terrain, not overlay). The BG3 presence
+			//     check (BgLayerMask & 0x04) distinguishes these two cases.
+			bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)
+			                         && (pixelInfo.BgLayerMask & 0x04));
 
 			// 2) Fallback: try other layers if winner has no HD tile
 				//    GATE: Skip fallback when BG3 (layer 2) wins compositing
@@ -855,12 +871,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u fogB=%u ovBlend=%u bgFb=%u cmDelta=%u lRetry=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
+			": total=%u bg=%u match=%u (fb=%u fogB=%u fogSkip=%u ovBlend=%u bgFb=%u cmDelta=%u lRetry=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
 			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
 			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount,
 			ctxLabel,
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend, frameBg1OverlayBlend, frameBg3BgFallback, frameColorMathDelta, frameLayerRetry,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend, frameBg3FogSkip, frameBg1OverlayBlend, frameBg3BgFallback, frameColorMathDelta, frameLayerRetry,
 			frameHdMiss, frameBg3FogNative,
 			framePalMismatch, frameLayerMismatch, frameNotInPack,
 			frameSpriteWon, frameMaskZero,

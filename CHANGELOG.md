@@ -5,6 +5,50 @@ Für Änderungen am DKC2-HD-Tools Viewer siehe `DKC2-HD-Tools/CHANGELOG.md`.
 
 ---
 
+## [2026-07-06d] — M5.17: BG3 Fog-Winner Gate + BG1 Overlay Fix (Issue L — Mainbrace Mayhem)
+
+### Fix 1: BG3 Fog-Winner Gate (Step 1)
+
+**Problem:** In Mainbrace Mayhem liegen BG3-Fog-HD-Tiles im Pack (`bg/bg3/`). Step 1 fand
+diese Tiles und renderte sie opak — der Nebel war sichtbar, aber das Terrain darunter
+komplett verdeckt. Der bestehende `bg3FogBlend`-Pfad (Step 3) wurde nie erreicht, weil
+`!hdTile` bereits false war.
+
+**Root Cause:** Step 1 macht keinen Unterschied zwischen BG3-Fog-Winnern (semi-transparent,
+AllowColorMath aktiv) und normalen BG3-Winnern. BG3-Fog-HD-Tiles wurden wie normale
+opake Tiles behandelt.
+
+**Lösung:** `bg3FogWinner`-Gate in Step 1 (~Zeile 315): Wenn `winLayer == 2` UND
+`AllowColorMath` gesetzt ist, wird der HD-Tile-Lookup für BG3 übersprungen. Step 3
+(`bg3FogBlend`) findet stattdessen BG1/BG2-Terrain-HD-Tiles und rendert sie mit
+Nebel-Tint (80% HD + 20% Fog-Farbe).
+
+**Neuer Diagnostik-Counter:** `fogSkip=%u` im FRAME-Log — zählt übersprungene
+BG3-Fog-Winner-Lookups pro Frame (erwarteter Wert: ~49800 in Mainbrace).
+
+### Fix 2: BG1 Overlay-Winner Einschränkung
+
+**Problem:** Die `bg1OverlayWinner`-Erkennung (M5.16) war zu breit. In Mainbrace Mayhem
+feuerte sie ~3914 Mal pro Frame — BG1 gewann in Nebellücken (wo BG3 keinen Tile hat),
+wurde aber als "Overlay" fehlinterpretiert. Das Ergebnis: BG2-Hintergrund mit
+BG1-Terrain-Tint (falsche Darstellung).
+
+**Root Cause:** Die Bedingung `!hdTile && winLayer == 0 && AllowColorMath` unterschied
+nicht zwischen echtem Overlay (BG1 über BG3, Beehive) und Terrain in Nebellücken
+(BG1 wo BG3 fehlt, Mainbrace).
+
+**Lösung:** Zusätzliche Bedingung `(pixelInfo.BgLayerMask & 0x04)` (~Zeile 359):
+BG1 ist nur Overlay, wenn BG3 am selben Pixel AUCH einen Tile hat.
+- **Beehive:** BG1 gewinnt ÜBER BG3 (beide vorhanden) → `0x04` gesetzt → Overlay ✓
+- **Mainbrace:** BG1 gewinnt WO BG3 FEHLT (Nebellücke) → `0x04` = 0 → Terrain ✓
+
+**Erwartete Log-Werte für Mainbrace nach Fix:**
+- `fogSkip` ≈ 49800 (alle BG3-Fog-Pixel übersprungen)
+- `fogB` ≈ 49800 (Step 3 findet Terrain unter Fog)
+- `ovBlend` = 0 (kein BG1-Overlay in diesem Level)
+
+---
+
 ## [2026-07-06c] — M5.16: BG1 Overlay-Blend (Issue O — Rambi Rumble Beehive HD)
 
 ### Neue Feature: BG1 Overlay-Blend Rendering-Pfad

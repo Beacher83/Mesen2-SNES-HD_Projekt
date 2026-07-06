@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-06 | Mesen Build: M5.16 (VERIFIED) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED | Issue O: BG1 Overlay-Blend M5.16 VERIFIED
+Stand: 2026-07-06 | Mesen Build: M5.17 (TEST PENDING) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED | Issue O: BG1 Overlay-Blend M5.16 VERIFIED | Issue L: BG3 Fog-Winner Gate + BG1 Overlay Fix M5.17 IMPLEMENTED
 
 ---
 
@@ -1920,6 +1920,8 @@ DKC2 erzeugt den Sunset-Effekt über **HDMA-Palette-Manipulation**:
 
 ## Issue L: Mainbrace Mayhem — BG3-Nebel-Interaktion (2026-07-05)
 
+**Status: M5.17 IMPLEMENTIERT — TEST AUSSTEHEND**
+
 ### Symptom
 Komplementäres Verhalten je nachdem ob BG3-HD-Tiles im Pack sind:
 
@@ -1931,46 +1933,80 @@ Komplementäres Verhalten je nachdem ob BG3-HD-Tiles im Pack sind:
 - HD-Elemente sichtbar, ABER native Pixel bluten durch wo der Nebel NICHT ist
 - Inverses Problem zu (a)
 
-### Log-Analyse (context [LEVEL2], multiple rotating sigs)
-```
-Typischer Frame (Zeile 169):
-  bg=55094 match=55094 miss=0 notInPack=0 fogB=0
-  BG1=17342 BG2=55094 BG3=49739 cmDelta=53631 fb=2476
+### Log-Analyse (M5.16, mit BG3-HD-Tiles)
 
-Beobachtungen:
-  - fogB=0 → Kein Fog-Blending wird diagnostisch gezählt
-  - BG3≈49739 → Extrem viele BG3-Pixel (Nebel deckt fast ganzen Bildschirm)
-  - fb≈2476-4200 → Fallback-Pixel vorhanden (HD-Pack hat Tile, aber Fallback genutzt)
-  - cmDelta≈53000-55000 → Nahezu ALLE Pixel haben Color-Math-Delta
-  - match=bg → 100% aller BG-Pixel gematched, kein MISS
-  - 8 rotierende Signaturen (HDMA-Parallax ändert sig alle ~8 Frames)
+Diagnostik-Log: `snes_hd_diag MM mit BG3 HD tiles.txt` (~3220 Zeilen)
+
+```
+Typischer Steady-State Frame (sig 26F9149D83DDEF29):
+  bg=55228 match=55228 fogB=0 ovBlend=3914 cmDelta=42699
+  BG1=17413 BG2=55228 BG3=49858
+  WINNERS: wn0=5370 wn1=0 wn2=49858 wn3=0 | acm0=5370 acm1=0 acm2=49858 acm3=0
 ```
 
-### Ursache (vorläufig)
-BG3 ist der **Nebel-Layer** in Mainbrace Mayhem. Die SNES rendert den Nebel über
-**Sub-Screen Color Math**: BG3 liegt auf dem Sub-Screen und wird additiv in den
-Main-Screen (BG1+BG2) eingeblendet.
+**Schlüsselerkenntnisse:**
+1. **wn0 + wn2 = bg** (5370 + 49858 = 55228): Nur BG1 und BG3 gewinnen jemals. BG2 gewinnt NIE.
+2. **acm = wn (100%)**: AllowColorMath auf ALLEN Gewinner-Pixeln — BG1 UND BG3.
+3. **BG3 hat höhere Priorität als BG1**: BG1=17413 Tiles, aber nur wn0=5370 gewinnen.
+4. **ovBlend=3914**: bg1OverlayBlend feuerte FALSCH — BG1-Terrain als Overlay interpretiert.
+5. **fogB=0**: bg3FogBlend nie erreicht (BG3-HD-Tiles in Step 1 gefunden).
+6. **match=bg**: 100% Match-Rate. Kein einziger Miss.
+7. **BG3WIN MSFlags=0x81**: Sub-Screen-Blend aktiv auf BG3-Nebel.
+8. **8 rotierende Signaturen**: HDMA-Parallax (26F9→BD2C→989D→14AD→975E...).
 
-Das Problem:
-1. Der HD-Filter rendert BG3-HD-Tiles als opake Pixel auf einem Layer
-2. Der native PPU-Output hat die Color-Math-Blending bereits angewendet
-3. Wenn BG3-HD-Tiles vorhanden: Der HD-Filter zeigt den HD-Tile wo der Nebel
-   NICHT blendet, aber wo Color Math aktiv ist, wird der native cmDelta-Pixel
-   bevorzugt → HD-Tile verschwindet hinter dem nativen Nebel
-4. Ohne BG3-HD: Kein HD-Tile für BG3-Pixel, also native Pixel überall wo BG3
-   aktiv ist → "Durchbluten"
+### Root Cause (2 Probleme identifiziert)
+
+**Problem 1: BG3-Fog-HD-Tiles blockieren bg3FogBlend**
+- Step 1 findet BG3-HD-Tile → rendert opak → Nebel sichtbar, aber Terrain verdeckt
+- Der `bg3FogBlend`-Pfad (Step 3) triggert nur bei `!hdTile` → wird nie erreicht
+
+**Problem 2: bg1OverlayWinner feuert falsch in Mainbrace**
+- Bedingung `!hdTile && winLayer == 0 && AllowColorMath` zu breit
+- In Mainbrace: BG1 gewinnt in Nebellücken (5370 px), ~3914 ohne BG1-HD-Tile
+- bg1OverlayBlend rendert BG2-Hintergrund mit BG1-Terrain-Tint → FALSCH
+
+**Unterscheidungskriterium:** BgLayerMask Bit 2 (BG3-Präsenz):
+- Beehive: BG1 gewinnt ÜBER BG3 (beide vorhanden → `mask & 0x04 == true` → Overlay) ✓
+- Mainbrace: BG1 gewinnt WO BG3 FEHLT (Nebellücke → `mask & 0x04 == false` → Terrain) ✓
+
+### Fix (M5.17)
+
+**Fix 1: bg3FogWinner Gate (SnesHdVideoFilter.cpp ~Zeile 315)**
+```cpp
+bool bg3FogWinner = (winLayer == 2 && (pixelInfo.MainScreenFlags & 0x80));
+if(!bg3FogWinner) {
+    hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
+    if(hdTile) { tileInfo = &pixelInfo.BgTiles[winLayer]; }
+} else {
+    frameBg3FogSkip++;
+}
+```
+Wenn BG3 mit AllowColorMath gewinnt, wird der HD-Tile-Lookup übersprungen.
+Step 3 (bg3FogBlend) findet stattdessen BG1/BG2-Terrain unter dem Nebel.
+
+**Fix 2: bg1OverlayWinner Einschränkung (~Zeile 359)**
+```cpp
+bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)
+                         && (pixelInfo.BgLayerMask & 0x04));
+```
+BG1 ist nur Overlay wenn BG3 am selben Pixel AUCH vorhanden ist.
+
+**Neuer Diagnostik-Counter:** `fogSkip=%u` im FRAME-Log.
+
+**Erwartete Log-Werte nach Fix:**
+- `fogSkip` ≈ 49800 (BG3-Fog-Winner übersprungen)
+- `fogB` ≈ 49800 (Step 3 findet Terrain unter Fog)
+- `ovBlend` = 0 (kein BG1-Overlay in Mainbrace)
+- `match` sollte sinken (BG3-Fog-Tiles nicht mehr gematched)
+
+### Regressions-Check: Beehive-Level
+Die Änderungen dürfen Issue O (Rambi Rumble) NICHT brechen:
+- Fix 1 (bg3FogWinner): Beehive hat `winLayer == 0` (BG1 gewinnt, nicht BG3) → Gate greift nicht ✓
+- Fix 2 (bg1OverlayWinner): Beehive hat BG3-Tiles vorhanden → `mask & 0x04` = true → Overlay ✓
 
 ### Verwandte Issues
 - **Issue B** (BG3 Fog blockiert HD BG1): Gleicher Grundmechanismus
-- **Issue I** (Rambi Rumble BG3 Sub-Screen-Blend): Ähnliche Sub-Screen-Logik
-
-### Nächste Schritte
-1. Sub-Screen-Blend-Erkennung für Mainbrace Mayhem BG3 aktivieren
-   (ppuConfig prüfen: BG3 auf Sub-Screen, Color-Math aktiv)
-2. BG3-Nebel-Pixel: HD-Tile rendern, dann additiv über BG1+BG2 blenden
-   (analog zu Issue I v3 Layer-Swap, aber additiv statt opak)
-3. fogB-Counter müsste > 0 sein wenn Nebel korrekt erkannt wird — prüfen
-   warum fogB=0
+- **Issue O** (Rambi Rumble BG1 Overlay): bg1OverlayBlend-Pfad, jetzt verfeinert
 
 ---
 
