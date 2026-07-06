@@ -5,6 +5,30 @@ Für Änderungen am DKC2-HD-Tools Viewer siehe `DKC2-HD-Tools/CHANGELOG.md`.
 
 ---
 
+## [2026-07-06e] — M5.18: Fog Contour Fix — ADD Color Math für BG3 Fog (Issue L)
+
+### Fix: Native ADD statt gewichtetem Blend für BG3-Fog
+
+**Problem:** Die M5.17 Fog-Blend-Formel `(hdR * 4 + fogR) / 5` (80% HD + 20% Fog)
+erzeugte einen uniformen dunklen Schleier statt sichtbarer Nebelkonturen/Wisps.
+- Schwarzer Fog (0x0000): `hdR * 0.80` → 20% Verdunklung (FALSCH — nativ: keine Änderung)
+- Heller Fog (0x2108): `hdR * 0.85` → nur 5% Variation (FALSCH — nativ: deutlicher Kontrast)
+- Ergebnis: kaum sichtbarer Fog-Gradient trotz HDMA-Animation der Fog-Dichte
+
+**Root Cause:** Mainbrace Mayhem nutzt ADD Color Math (MSFlags=0x81, Bit 5=0).
+Die native PPU addiert die BG3-Fog-Farbe (HDMA-animiert, 0x0000–0x2108 Graustufen)
+auf das Terrain. Die 80/20-Gewichtung ignoriert den ADD-Modus komplett.
+
+**Lösung:** Separater Blend-Pfad für `bg3FogBlend` vs `bg1OverlayBlend`:
+- **bg3FogBlend (Mainbrace Fog):** `result = min(255, hdPixel + fogColor)` — nativer ADD.
+  HDMA variiert fogColor pro Scanline → Contour/Wisps werden sichtbar.
+  Half-Add (MSFlags Bit 6) wird ebenfalls unterstützt: `fog/2` statt vollem `fog`.
+- **bg1OverlayBlend (Beehive Honey):** Unverändert `(hdR * 4 + fogR) / 5` — keine Regression.
+
+Beide Rendering-Pfade betroffen: alpha=255 (opak) UND alpha>0 (semi-transparent).
+
+---
+
 ## [2026-07-06d] — M5.17: BG3 Fog-Winner Gate + BG1 Overlay Fix (Issue L — Mainbrace Mayhem)
 
 ### Fix 1: BG3 Fog-Winner Gate (Step 1)

@@ -1920,7 +1920,7 @@ DKC2 erzeugt den Sunset-Effekt über **HDMA-Palette-Manipulation**:
 
 ## Issue L: Mainbrace Mayhem — BG3-Nebel-Interaktion (2026-07-05)
 
-**Status: M5.17 IMPLEMENTIERT — TEST AUSSTEHEND**
+**Status: M5.17 VERIFIZIERT ✓ — M5.18 IMPLEMENTIERT (Fog Contour Fix) — TEST AUSSTEHEND**
 
 ### Symptom
 Komplementäres Verhalten je nachdem ob BG3-HD-Tiles im Pack sind:
@@ -1998,6 +1998,78 @@ BG1 ist nur Overlay wenn BG3 am selben Pixel AUCH vorhanden ist.
 - `fogB` ≈ 49800 (Step 3 findet Terrain unter Fog)
 - `ovBlend` = 0 (kein BG1-Overlay in Mainbrace)
 - `match` sollte sinken (BG3-Fog-Tiles nicht mehr gematched)
+
+### M5.17 Verifizierung (2026-07-06)
+
+Diagnostik-Log: `snes_hd_diag MM neu.txt` (~1310 Zeilen, Mainbrace Mayhem ohne BG3-HD-Tiles)
+
+**Log-Counter M5.16 → M5.17:**
+
+| Counter | M5.16 | M5.17 | Status |
+|---------|-------|-------|--------|
+| fogSkip | N/A | ~49876 | ✓ NEU — BG3-Fog-Winner übersprungen |
+| fogB | 0 | ~49876 | ✓ FIXED — Fog-Blend feuert jetzt |
+| ovBlend | 3914 | 0 | ✓ FIXED — kein falsches BG1-Overlay |
+| miss | 0 | 0 | ✓ |
+| cmDelta | 42699 | ~4616 | ✓ Deutlich weniger (nur BG1-Gap-Pixel) |
+
+**BG2 wird in HD gerendert:** Alle MATCH-Samples zeigen `layer=1 (FOG-BLEND)` = BG2-Tiles unter Fog.
+
+**User-Feedback:** "Geht in die richtige Richtung. Das seltsame Verhalten an den Stellen,
+wo kein Nebel ist, ist weg." — Struktureller Fix funktioniert, aber Nebel erscheint als
+uniformer dunkler Schleier statt sichtbarer Fog-Wisps/Contour.
+
+### Fog Contour Problem — Root Cause Analyse
+
+**BG3WIN MSColor Samples (HDMA-animiert):**
+```
+MSColor=0x0000 → ppuOut=0x0000  (Loading-Frame)
+MSColor=0x0000 → ppuOut=0x1863
+MSColor=0x0421 → ppuOut=0x3107
+MSColor=0x1084 → ppuOut=0x5A0E
+MSColor=0x1CE7 → ppuOut=0x6E2E
+MSColor=0x14A5 → ppuOut=0x7E4D
+MSColor=0x0842 → ppuOut=0x7DEA
+MSColor=0x18C6 → ppuOut=0x7E6E
+```
+
+Alle MSColor-Werte sind **Graustufen** (R=G=B), Bereich 0–8 in 5-Bit. HDMA animiert
+die Fog-Dichte pro Scanline.
+
+**ADD-Modus empirisch bestätigt:**
+- MSColor=0x0000 + Terrain → ppuOut ≈ Terrain (Fog addiert 0) ✓
+- MSColor=0x14A5 (R=5) + Terrain(R≈8) = ppuOut(R=13) → 5+8=13 ✓ (FULL ADD, nicht Half)
+- MSFlags=0x81 → Bit 5 (0x20) NICHT gesetzt → ADD (nicht Subtract)
+- MSFlags=0x81 → Bit 6 (0x40) NICHT gesetzt → Full ADD (nicht Half)
+
+**Problem der M5.17-Formel `(hdR * 4 + fogR) / 5`:**
+- Schwarzer Fog (0x0000): `hdR × 0.80` → 20% Verdunklung (FALSCH — nativ: keine Änderung)
+- Heller Fog (0x2108): `hdR × 0.85` → nur 5% Variation über gesamten HDMA-Bereich
+- → Uniformer dunkler Schleier, kein Fog-Gradient sichtbar
+
+### Fix (M5.18) — Fog Contour: ADD Color Math
+
+**Änderung:** Getrennter Blend-Pfad für `bg3FogBlend` vs `bg1OverlayBlend`:
+
+**bg3FogBlend (Mainbrace Fog)** — Native ADD Color Math:
+```cpp
+bool halfAdd = (pixelInfo.MainScreenFlags & 0x40) != 0;
+int fR = halfAdd ? fogR / 2 : fogR;
+uint8_t outR = (uint8_t)std::min(255, (int)hdR + fR);
+```
+- Schwarzer Fog: HD + 0 = HD unverändert (korrekt — kein Fog-Effekt)
+- Heller Fog: HD + 66 = aufgehellt/neblig (korrekt — Fog sichtbar)
+- HDMA-Gradient → fogR variiert pro Scanline → Contour/Wisps werden sichtbar
+
+**bg1OverlayBlend (Beehive Honey)** — Unverändert:
+```cpp
+uint8_t outR = (uint8_t)((hdR * 4 + fogR) / 5);  // 80/20 wie bisher
+```
+
+**Betroffene Stellen in SnesHdVideoFilter.cpp:**
+- Kommentar-Block (~Zeile 714): Erklärung der zwei Modi
+- Alpha=255 Rendering (~Zeile 779): `if(bg3FogBlend)` ADD, `else if(bg1OverlayBlend)` gewichtet
+- Alpha>0 Rendering (~Zeile 842): Gleicher Split
 
 ### Regressions-Check: Beehive-Level
 Die Änderungen dürfen Issue O (Rambi Rumble) NICHT brechen:

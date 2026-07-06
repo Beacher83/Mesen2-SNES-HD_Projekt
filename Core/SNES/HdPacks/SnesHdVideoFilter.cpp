@@ -12,7 +12,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.17"
+#define SNES_HD_BUILD_VERSION "M5.18"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -715,10 +715,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// blending or BG1 overlay blending (honey in beehive levels).
 				// MainScreenColor holds the raw overlay layer color captured
 				// before the PPU applied color math.
-				// Blend weight: 80% HD tile + 20% fog/overlay color.  The
-				// original PPU uses 50/50 half-addition, but HD tiles are
-				// painted brighter than native tiles, so a lighter weight
-				// preserves art quality while still conveying the effect.
+				//
+				// bg3FogBlend (Mainbrace fog): Uses native ADD color math —
+				//   result = min(255, hdPixel + fogColor).  The fog color
+				//   varies per scanline via HDMA, creating contour/wisps.
+				//   MSFlags bit 6 (0x40) = half-add: result = min(255, hd + fog/2).
+				// bg1OverlayBlend (beehive honey): Uses weighted blend —
+				//   result = 80% HD + 20% overlay.  Preserves HD art quality
+				//   while conveying the honey tint.
 				uint32_t fogColorRGB = 0;
 				uint8_t fogR = 0, fogG = 0, fogB = 0;
 				if(bg3FogBlend || bg1OverlayBlend) {
@@ -772,10 +776,24 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							if(outIndex < frameInfo.Width * frameInfo.Height) {
 								uint8_t alpha = (hdColor >> 24) & 0xFF;
 							if(alpha == 0xFF) {
-								if(bg3FogBlend || bg1OverlayBlend) {
-										// BG3 fog-blend: render HD tile with atmospheric
-										// fog tint.  80% HD + 20% fog keeps art visible
-										// while conveying the fog effect.
+							if(bg3FogBlend) {
+										// BG3 fog: native ADD color math.  fogColor
+										// varies per scanline via HDMA → fog contour.
+										// Half-add (MSFlags bit 6) halves the addend.
+										uint8_t hdR = (hdColor >> 16) & 0xFF;
+										uint8_t hdG = (hdColor >> 8) & 0xFF;
+										uint8_t hdB = hdColor & 0xFF;
+										bool halfAdd = (pixelInfo.MainScreenFlags & 0x40) != 0;
+										int fR = halfAdd ? fogR / 2 : fogR;
+										int fG = halfAdd ? fogG / 2 : fogG;
+										int fB = halfAdd ? fogB / 2 : fogB;
+										uint8_t outR = (uint8_t)std::min(255, (int)hdR + fR);
+										uint8_t outG = (uint8_t)std::min(255, (int)hdG + fG);
+										uint8_t outB = (uint8_t)std::min(255, (int)hdB + fB);
+										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+								} else if(bg1OverlayBlend) {
+										// BG1 overlay (honey): weighted blend.
+										// 80% HD + 20% overlay preserves art quality.
 										uint8_t hdR = (hdColor >> 16) & 0xFF;
 										uint8_t hdG = (hdColor >> 8) & 0xFF;
 										uint8_t hdB = hdColor & 0xFF;
@@ -821,8 +839,17 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									uint8_t blendR = hdR + ((srcR * (255 - alpha)) / 255);
 									uint8_t blendG = hdG + ((srcG * (255 - alpha)) / 255);
 									uint8_t blendB = hdB + ((srcB * (255 - alpha)) / 255);
-								if(bg3FogBlend || bg1OverlayBlend) {
-									// Apply fog on top of the alpha-blended result (80/20)
+								if(bg3FogBlend) {
+									// ADD fog on top of alpha-blended result
+									bool halfAdd = (pixelInfo.MainScreenFlags & 0x40) != 0;
+									int fR = halfAdd ? fogR / 2 : fogR;
+									int fG = halfAdd ? fogG / 2 : fogG;
+									int fB = halfAdd ? fogB / 2 : fogB;
+									blendR = (uint8_t)std::min(255, (int)blendR + fR);
+									blendG = (uint8_t)std::min(255, (int)blendG + fG);
+									blendB = (uint8_t)std::min(255, (int)blendB + fB);
+								} else if(bg1OverlayBlend) {
+									// Weighted overlay on top of alpha-blended result (80/20)
 										blendR = (uint8_t)((blendR * 4 + fogR) / 5);
 										blendG = (uint8_t)((blendG * 4 + fogG) / 5);
 										blendB = (uint8_t)((blendB * 4 + fogB) / 5);
