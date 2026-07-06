@@ -917,12 +917,20 @@ void SnesPpu::RenderScanline()
 		// Compute HD scanline offset (shared by pre- and post-math blocks)
 		uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
 
-		// Save pre-color-math main screen color for HD fog blending.
-		// After ApplyColorMath(), _mainScreenBuffer is overwritten with the math
-		// result, so we must capture the raw layer color (e.g. BG3 fog) here.
+		// Save pre-color-math main screen color for HD delta computation.
+		// Apply brightness inline so the pre-math value is brightness-scaled
+		// like the post-math value (from ppuOutputBuffer), preventing the
+		// brightness factor from contaminating the color math ratio/delta.
 		if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight) {
 			for(int x = _drawStartX; x <= _drawEndX && x < SnesHdScreenInfo::ScreenWidth; x++) {
-				_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].MainScreenColor = _mainScreenBuffer[x];
+				uint16_t color = _mainScreenBuffer[x];
+				if(_state.ScreenBrightness != 15) {
+					uint16_t r = (color & 0x1F) * _state.ScreenBrightness / 15;
+					uint16_t g = ((color >> 5) & 0x1F) * _state.ScreenBrightness / 15;
+					uint16_t b = ((color >> 10) & 0x1F) * _state.ScreenBrightness / 15;
+					color = r | (g << 5) | (b << 10);
+				}
+				_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].MainScreenColor = color;
 			}
 		}
 
@@ -955,7 +963,7 @@ void SnesPpu::RenderScanline()
 
 void SnesPpu::RenderBgColor()
 {
-	uint8_t pixelFlags = (_state.ColorMathEnabled & 0x20) ? PixelFlags::AllowColorMath : 0;
+	uint8_t pixelFlags = (_state.ColorMathEnabled & 0x20) ? (PixelFlags::AllowColorMath | (_state.ColorMathSubtractMode ? PixelFlags::IsSubtractMode : 0)) : 0;
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
 		if((_mainScreenFlags[x] & 0x0F) == 0) {
 			_state.InternalCgramAddress = 0;
@@ -993,7 +1001,7 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 			if(drawMain && ((_mainScreenFlags[x] & 0x0F) < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
 				uint16_t paletteRamOffset = 128 + (_spritePalette[x] << 4) + _spriteColors[x];
 				_mainScreenBuffer[x] = _cgram[paletteRamOffset];
-				_mainScreenFlags[x] = spritePrio | PixelFlags::IsSpritePixel | (((_state.ColorMathEnabled & 0x10) && _spritePalette[x] > 3) ? PixelFlags::AllowColorMath : 0);
+				_mainScreenFlags[x] = spritePrio | PixelFlags::IsSpritePixel | (((_state.ColorMathEnabled & 0x10) && _spritePalette[x] > 3) ? (PixelFlags::AllowColorMath | (_state.ColorMathSubtractMode ? PixelFlags::IsSubtractMode : 0)) : 0);
 			}
 
 			if(drawSub && (_subScreenPriority[x] < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(subWindowCount, x)) {
@@ -1038,7 +1046,7 @@ void SnesPpu::RenderTilemap()
 	uint8_t lookupIndex;
 	uint8_t chrDataOffset;
 	uint8_t hiresSubColor;
-	uint8_t pixelFlags = (((_state.ColorMathEnabled >> layerIndex) & 0x01) ? PixelFlags::AllowColorMath : 0);
+	uint8_t pixelFlags = (((_state.ColorMathEnabled >> layerIndex) & 0x01) ? (PixelFlags::AllowColorMath | (_state.ColorMathSubtractMode ? PixelFlags::IsSubtractMode : 0)) : 0);
 
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
 		if constexpr(hiResMode) {
@@ -1276,7 +1284,7 @@ void SnesPpu::RenderTilemapMode7()
 	xValue += xStep * _drawStartX;
 	yValue += yStep * _drawStartX;
 	
-	uint8_t pixelFlags = ((_state.ColorMathEnabled >> layerIndex) & 0x01) ? PixelFlags::AllowColorMath : 0;
+	uint8_t pixelFlags = ((_state.ColorMathEnabled >> layerIndex) & 0x01) ? (PixelFlags::AllowColorMath | (_state.ColorMathSubtractMode ? PixelFlags::IsSubtractMode : 0)) : 0;
 
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
 		int32_t xOffset = xValue >> 8;

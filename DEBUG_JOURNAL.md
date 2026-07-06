@@ -1839,3 +1839,447 @@ Aus v1-Feedback identifiziert: BG3 = Bienenwaben (Hintergrund), BG1 = Honig (Vor
    nicht pro Level-Typ geprüft. Besonders ppuCfg 0x29 (half-intensity, alpha=0.5).
 
 4. **Regressions-Check:** Nicht-SSB-Level wie Mainbrace Mayhem (Nebel) auf Regression prüfen.
+
+---
+
+# Test-Session 2026-07-05 — Neue Issues (J bis P)
+
+**Build:** M5.14  
+**Diagnoselog:** `snes_hd_diag05072026 abends.txt` (35.376 Zeilen)  
+**Viewer-Stand:** Commit `a4351fa` (3 neue Commits seit `a105510`)  
+**Getestete Level:** Pirate Panic, Mainbrace Mayhem, Gangplank Galleon, Lockjaw's Locker, Hot Head Hop, Rambi Rumble, Gusty Glade
+
+---
+
+## Issue J: BG3 Foreground Bleed-Through — Pirate Panic (2026-07-05)
+
+### Symptom
+- BG3 Seile/Takelage werden in HD gerendert
+- **ABER:** native BG3-Pixel scheinen durch, wenn Charakter-Sprites auf derselben Y-Position sind
+- Effekt: Hinter/um die Spielfigur herum sind kurzzeitig native Low-Res-Pixel sichtbar,
+  die das HD-Rendering durchbrechen
+
+### Log-Analyse (sig=1DF33CEAA50F7F08, context [other])
+```
+Typischer Frame (Zeile 47):
+  bg=55074 match=55074 miss=0 notInPack=0 sprWon=2270
+  BG1=26994 BG2=55074 BG3=2561 cmDelta=26597
+
+Beobachtung:
+  - match=bg → 100% Match-Rate, kein einziger MISS
+  - sprWon=2270 → ca. 2270 Pixel von Sprites "gewonnen" (OBJ über BG)
+  - cmDelta=26597..3000 → Color-Math-Fade (Einblend-Animation)
+  - BG3=2561 → BG3-Tiles sind vorhanden und werden gematched
+```
+
+### Vermutete Ursache
+Kein Tile-Matching-Problem — alle Tiles matchen zu 100%. Das Problem liegt im **Compositing/Rendering**:
+- Der HD-Filter zeichnet BG3 als Background-Layer (Priorität 0)
+- Wenn Sprites (OBJ) denselben Bildschirmbereich belegen, gewinnt der Sprite (`sprWon`)
+- **ABER:** die SNES-PPU rendert OBJ ÜBER BG1/BG2, nicht über BG3 in allen Fällen
+- Der HD-Filter könnte die Layer-Priority falsch auflösen: BG3 wird transparent,
+  statt den nativen Pixel zeigt der HD-Filter das raw PPU-Output, und die nativen
+  BG3-Pixel bluten durch
+
+### Nächste Schritte
+1. `SnesHdVideoFilter.cpp`: Prüfen wie BG3-Pixel in Kombination mit sprWon behandelt werden
+2. Testen ob das Bleed-Through nur bei bestimmten BG3-Priorities auftritt
+3. Vergleich: natives PPU-Output vs. HD-Output am gleichen Pixel (BG3 + OBJ Overlap)
+
+---
+
+## Issue K: Gangplank Galleon — Sunset-Effekt fehlt (2026-07-05)
+
+### Symptom
+- Gangplank Galleon nutzt **gfxset 07** (identisch mit Pirate Panic)
+- Im Original hat der Hintergrund einen Sunset/Dämmerungseffekt:
+  warme Orange-/Rottöne statt des Standard-Tageslicht-Hintergrunds
+- Mit HD-Pack: Die HD-Tiles zeigen den normalen Tageslicht-Hintergrund,
+  der Sunset-Farbeffekt fehlt komplett
+
+### Vermutete Ursache
+DKC2 erzeugt den Sunset-Effekt über **HDMA-Palette-Manipulation**:
+- HDMA-Kanäle schreiben pro VBlank neue Palette-Werte in CGRAM ($2121/$2122)
+- Die BG-Tiles haben identische VRAM-Daten wie in Pirate Panic (gleicher gfxset)
+- Zur Laufzeit werden die Paletten-Farben "warm" verschoben (mehr Rot, weniger Blau)
+- HD-Tiles sind statische PNGs mit der Export-Palette → keine HDMA-Farbanpassung
+
+### Verwandte Issues
+- **Issue E** (Hot Head Hop Lava Glow): Ähnliches Problem, gelöst mit cmDelta-Mechanismus.
+  cmDelta erfasst die Color-Math-Differenz (pre-math vs. post-math), nicht Palette-Änderungen.
+- Der Sunset-Effekt ist eine **Palette-Änderung**, kein Color-Math-Effekt.
+  cmDelta greift hier nicht.
+
+### Nächste Schritte
+1. Prüfen ob der Sunset-Effekt über $2121/$2122 (Direct CGRAM) oder über $2132 (FixedColor) läuft
+2. Falls CGRAM: Runtime-Palette vs. Export-Palette vergleichen, Delta berechnen
+3. Neuer Mechanismus nötig: "Palette Delta" analog zu cmDelta, aber basierend auf
+   CGRAM-Differenz statt Color-Math-Differenz
+
+---
+
+## Issue L: Mainbrace Mayhem — BG3-Nebel-Interaktion (2026-07-05)
+
+### Symptom
+Komplementäres Verhalten je nachdem ob BG3-HD-Tiles im Pack sind:
+
+**(a) MIT BG3-HD-Tiles im Pack:**
+- HD-Elemente nur dort sichtbar, wo der Nebel NICHT ist
+- Wo Nebel ist → HD-Tiles verschwinden, native Pixel erscheinen
+
+**(b) OHNE BG3-Tiles im Container:**
+- HD-Elemente sichtbar, ABER native Pixel bluten durch wo der Nebel NICHT ist
+- Inverses Problem zu (a)
+
+### Log-Analyse (context [LEVEL2], multiple rotating sigs)
+```
+Typischer Frame (Zeile 169):
+  bg=55094 match=55094 miss=0 notInPack=0 fogB=0
+  BG1=17342 BG2=55094 BG3=49739 cmDelta=53631 fb=2476
+
+Beobachtungen:
+  - fogB=0 → Kein Fog-Blending wird diagnostisch gezählt
+  - BG3≈49739 → Extrem viele BG3-Pixel (Nebel deckt fast ganzen Bildschirm)
+  - fb≈2476-4200 → Fallback-Pixel vorhanden (HD-Pack hat Tile, aber Fallback genutzt)
+  - cmDelta≈53000-55000 → Nahezu ALLE Pixel haben Color-Math-Delta
+  - match=bg → 100% aller BG-Pixel gematched, kein MISS
+  - 8 rotierende Signaturen (HDMA-Parallax ändert sig alle ~8 Frames)
+```
+
+### Ursache (vorläufig)
+BG3 ist der **Nebel-Layer** in Mainbrace Mayhem. Die SNES rendert den Nebel über
+**Sub-Screen Color Math**: BG3 liegt auf dem Sub-Screen und wird additiv in den
+Main-Screen (BG1+BG2) eingeblendet.
+
+Das Problem:
+1. Der HD-Filter rendert BG3-HD-Tiles als opake Pixel auf einem Layer
+2. Der native PPU-Output hat die Color-Math-Blending bereits angewendet
+3. Wenn BG3-HD-Tiles vorhanden: Der HD-Filter zeigt den HD-Tile wo der Nebel
+   NICHT blendet, aber wo Color Math aktiv ist, wird der native cmDelta-Pixel
+   bevorzugt → HD-Tile verschwindet hinter dem nativen Nebel
+4. Ohne BG3-HD: Kein HD-Tile für BG3-Pixel, also native Pixel überall wo BG3
+   aktiv ist → "Durchbluten"
+
+### Verwandte Issues
+- **Issue B** (BG3 Fog blockiert HD BG1): Gleicher Grundmechanismus
+- **Issue I** (Rambi Rumble BG3 Sub-Screen-Blend): Ähnliche Sub-Screen-Logik
+
+### Nächste Schritte
+1. Sub-Screen-Blend-Erkennung für Mainbrace Mayhem BG3 aktivieren
+   (ppuConfig prüfen: BG3 auf Sub-Screen, Color-Math aktiv)
+2. BG3-Nebel-Pixel: HD-Tile rendern, dann additiv über BG1+BG2 blenden
+   (analog zu Issue I v3 Layer-Swap, aber additiv statt opak)
+3. fogB-Counter müsste > 0 sein wenn Nebel korrekt erkannt wird — prüfen
+   warum fogB=0
+
+---
+
+## Issue M: Lockjaw's Locker — Multi-Issue (2026-07-05)
+
+### Symptom
+Drei separate visuelle Probleme in einem Level:
+
+**(a) Wand-Hintergrund falsch positioniert + nur nativ:**
+- Die Schiffswand im Hintergrund ist horizontal verschoben
+- Nur native Pixel, keine HD-Tiles für den Wand-Bereich
+
+**(b) Deckeneffekt — Scroll-Diskontinuitäten:**
+- Die Decke über dem Spielfeld zeigt Sprünge/Versätze beim Scrollen
+- Tiles "springen" statt flüssig zu scrollen
+
+**(c) Wasseroberfläche — falsche Farbe:**
+- HD-Tiles für die Wasseroberfläche vorhanden, ABER Farbe ist falsch
+- Zu transparent/blass, sollte blau-getönt sein
+
+### Log-Analyse (sig=E10E4686511EB716, context [other])
+```
+Frame 10 (erste Spielframe, Zeile 1180):
+  bg=57266 match=54280 miss=2986 notInPack=2986
+  fb=20960 cmDelta=51743 BG1=31585 BG2=55552 BG3=1861
+
+Ab Frame 11 (Zeile 1182):
+  bg=55802 match=53840 miss=1962 notInPack=1962
+  BG1=31532 BG2=54074 BG3=0 cmDelta=0
+
+MISS-Detail (Zeilen 1132-1177):
+  Alle MISSes auf layer=1 (BG2), src=fallback oder src=winner
+  VRAM-Adressen: 0x4300-0x6990 (BG2 Tilemap-Bereich)
+  Alle pal=1
+```
+
+### Analyse
+- **~1962 notInPack pro Frame:** BG2-Tiles, die nicht im HD-Pack sind
+  → Diese BG2-Tiles wurden beim Export nicht erfasst (fehlende Tiles im Viewer-Container)
+- **BG3=1861 (Frame 10) → BG3=0 (ab Frame 11):** BG3 nur im ersten Frame aktiv,
+  danach deaktiviert. Das könnte der Wasseroberflächen-Effekt sein (kurzes BG3-Window)
+- **cmDelta=51743 (Frame 10) → cmDelta=0 (ab Frame 11):** Color-Math nur im
+  Einblend-Frame, danach aus. Die falsche Wasserfarbe könnte mit fehlendem cmDelta
+  zusammenhängen
+- **fb=20960 (Frame 10):** Extrem viele Fallback-Pixel im ersten Frame — Übergang
+- **BG2-MISS auf fallback-Quelle:** Tiles die über den Fallback-Pfad (nicht Winner)
+  gesucht wurden → VRAM-Layout-Mismatch zwischen Export und Runtime
+
+### Nächste Schritte
+1. **(a)** Viewer: VRAM Ground Truth für Lockjaw's Locker gfxset prüfen — ist die
+   Wand überhaupt im Export enthalten? Tilemap-Offset prüfen
+2. **(b)** HDMA-Parallax-Effekt auf BG2-Scroll-Register prüfen (DKC2 nutzt HDMA
+   auf $210D/$210E für Parallax-Scrolling in Höhlen-Leveln)
+3. **(c)** BG3-Wassereffekt: Sub-Screen-Blend oder Window-Effekt? ppuConfig analysieren
+
+---
+
+## Issue N: Hot Head Hop — Bubble-Artefakte + Tile Seams (2026-07-05)
+
+### Symptom
+**(a) Bubble-Artefakte im unteren Bildschirmfünftel:**
+- Derselbe Bereich, der in M5.14 (Issue H) gefixt wurde
+- Trotz Fix noch vereinzelte Artefakte sichtbar: falsche Tiles oder Glitches
+  in den untersten Scanlines
+
+**(b) Sehr sichtbare Tile Seams:**
+- HD-Tiles schließen nicht nahtlos aneinander
+- Sichtbare Kanten/Linien zwischen benachbarten HD-Tiles
+- Besonders auffällig bei großflächigen Hintergrund-Elementen
+
+**(c) Lava-Animation statisch (= Issue F):**
+- Bereits als Issue F dokumentiert: Palette-Cycling erzeugt Lava-Animation im Original
+- HD-Tiles sind statische PNGs → kein Palette-Cycling → statische Lava
+
+### Log-Analyse (sig=02D047A001E155B7, context [other])
+```
+PAL MISMATCH (Zeilen 1390-1409, wiederholt):
+  hash=8A1303A809810035 runtime_pal=6 pack_pal=2
+  runtime_layer=1 pack_layer=0 vram=0x5000
+
+  → Tile im Pack mit pal=2, layer=0 exportiert
+  → Zur Laufzeit PPU nutzt pal=6, layer=1
+  → DOPPELTER Mismatch: Palette UND Layer falsch
+```
+
+### Analyse
+- **PAL MISMATCH runtime_pal=6 vs pack_pal=2:** Das Tile wurde beim Export mit einer
+  anderen Palette-Row gespeichert als die PPU zur Laufzeit verwendet. Hot Head Hop
+  nutzt HDMA-Palette-Cycling ($2121/$2122), das die Palette-Zuordnung dynamisch ändert.
+  Der Export-Zeitpunkt hat eine andere Phase des Palette-Cyclings erfasst.
+- **Layer Mismatch (runtime=1, pack=0):** Das Tile wurde als BG1 (layer=0) exportiert,
+  wird aber zur Laufzeit auf BG2 (layer=1) verwendet. Mögliches Tilemap-Sharing
+  zwischen Layern.
+- **Bubble-Artefakte (a):** Wahrscheinlich restliches Problem aus Issue H — der
+  HDMA-Scanline-Bereich im unteren Fünftel ändert Color-Math-Register, und die
+  Tile-Zuordnung in diesem Bereich ist nicht stabil über alle Frames.
+
+### Verwandte Issues
+- **Issue E:** Lava-Glow Color Math → cmDelta-Fix in M5.11 (teilweise gelöst)
+- **Issue F:** Bubble-Animation Frame-Mismatch → noch offen
+- **Issue H:** Unteres Fünftel ohne HD-Tiles → M5.14 Fix (teilweise)
+
+### Nächste Schritte
+1. **(a)** HDMA-Scanline-Grenze im unteren Fünftel genauer analysieren:
+   Welche Scanlines sind betroffen? Ändert sich $2131 dort?
+2. **(b)** Tile Seams: Cluster-Padding-Mechanismus prüfen — wurde das Padding
+   nach Viewer-Commit `585858e` (Revert Cluster Padding Ring) korrekt angewendet?
+   Ggf. ist individuelles Tile-Padding zu klein
+3. **(c)** Issue F bleibt offen (Palette-Cycling, benötigt Animationsframe-Support)
+
+---
+
+## Issue O: Rambi Rumble — 0% Match Rate (2026-07-05)
+
+### Symptom
+- **Nichts** wird in HD gerendert — kompletter Fallback auf native Pixel
+- Das gesamte Level zeigt nur das originale SNES-Bild
+- Kein sichtbarer HD-Effekt obwohl Tiles für gfxset 02 (Beehive) vorhanden sein sollten
+
+### Log-Analyse (sig=AD7DD09D5F515544, context [other])
+```
+Steady-State Frame (Zeile 1700):
+  bg=54163 match=0 miss=54163 notInPack=51751 palMis=2412
+  BG1=54163 BG2=0 BG3=0 BG4=0
+  sprWon=3101 mask0=80 BG1miss=54163 BG1notInPack=51751
+
+PAL MISMATCH (Zeilen 1558-1577):
+  hash=84330E8399FF5C85 runtime_pal=7 pack_pal=6
+  runtime_layer=0 pack_layer=0 vram=0x2000
+
+MISS-Detail (Zeilen 1580-1609):
+  Alle MISSes mit [DMA_RANGE] Tag
+  VRAM-Adressen: 0x2000-0x21B0
+  Paletten: pal=5, pal=6, pal=7, pal=0 (gemischt)
+```
+
+### Analyse
+- **match=0 bei bg=54163:** Null von 54163 Background-Pixeln gematched → totaler Fehlschlag
+- **BG1=54163, BG2=0, BG3=0:** Nur BG1 aktiv. Kein BG2 oder BG3.
+  Das ist ungewöhnlich für gfxset 02 (Beehive), der normalerweise BG3 für Bienenwaben hat.
+  → Entweder falsches gfxset-Mapping oder abweichende PPU-Konfiguration in diesem Level
+- **notInPack=51751:** 95% der BG1-Tiles sind nicht im HD-Pack → der Container enthält
+  diese Tiles schlicht nicht
+- **palMis=2412:** 4,5% der Tiles SIND im Pack (gleicher Hash), aber mit falscher Palette
+  (pack_pal=6, runtime_pal=7). Diese Tiles könnten gematched werden, wenn Palette-
+  tolerantes Matching aktiviert würde
+- **[DMA_RANGE] auf allen MISSes:** Alle fehlenden Tiles haben VRAM-Adressen in einem
+  DMA-Transfer-Bereich. DKC2 nutzt DMA um Tiles zur Laufzeit in VRAM zu laden
+  (Animation, Level-Streaming). Diese DMA-Tiles sind nicht im statischen Ground-Truth-
+  VRAM-Dump enthalten → beim Export nicht erfasst
+- **Nur BG1 aktiv:** Möglicherweise verwendet Rambi Rumble eine spezielle PPU-Konfiguration
+  die BG2/BG3 deaktiviert oder über Mode 7 / Window-Masking ausblendet
+
+### Vermutete Ursache (Mehrfach-Problem)
+1. **Falscher gfxset im Container:** Der Viewer exportiert gfxset 02 (Beehive) Tiles,
+   aber Rambi Rumble nutzt zur Laufzeit andere Tile-Daten (DMA-geladen)
+2. **DMA-Tiles nicht im Export:** Die VRAM-Region 0x2000-0x21B0 wird per DMA
+   zur Laufzeit überschrieben. Der statische VRAM-Dump (Ground Truth) kennt diese
+   Tiles nicht → sie sind nicht im HD-Pack
+3. **Palette-Shift:** Selbst die wenigen Tiles die per Hash matchen, haben eine
+   um +1 verschobene Palette (6→7)
+
+### Verwandte Issues
+- **Issue I** (Rambi Rumble BG3 Honig/Bienenstock): Viewer-seitige Sub-Screen-Blend-
+  Darstellung. Issue I adressiert den Viewer, Issue O das Mesen-Rendering.
+
+### Nächste Schritte
+1. VRAM-Dump von Rambi Rumble **zur Laufzeit** erstellen (nicht statischer Ground Truth)
+   — `dkc2_vram_dump.lua` während des Levels ausführen
+2. DMA-Transfer-Ziel analysieren: Welche Tiles werden dynamisch geladen?
+   Sind es animierte Tiles (Honig-Tropf) oder Level-Streaming-Tiles?
+3. Prüfen ob der Container überhaupt das richtige gfxset für Rambi Rumble enthält
+4. Palette-tolerantes Matching als Workaround testen (palMis→match statt miss)
+
+---
+
+## Issue P: Gusty Glade — Blaue Quadrate + Partieller Match (2026-07-05)
+
+### Symptom
+**(a) Blaue Quadrate auf einigen BG1-Tiles:**
+- Einzelne HD-Tiles rendern als einfarbige blaue Rechtecke
+- Statt des erwarteten HD-Bilds wird ein "Platzhalter-Blau" angezeigt
+- Betrifft spezifische Tile-Positionen, nicht den ganzen Bildschirm
+
+**(b) HD-Hintergrund funktioniert teilweise:**
+- Einige Hintergrund-Tiles werden korrekt in HD gerendert
+- Andere Bereiche sind nativ oder blau
+
+**(c) Vordergrund-Blätter nur nativ:**
+- Die animierten Blätter/Laub im Vordergrund haben keine HD-Tiles
+- Nur native Pixel sichtbar
+
+### Log-Analyse (rotierende Signaturen ab Zeile 1731, context [other])
+```
+Erste Rotation sig=02DABED78E3BD21D (Zeile 1731):
+  bg=55633 match=55633 miss=0 notInPack=0
+  BG1=28779 BG2=50957 BG3=25823 lRetry=25542 cmDelta=41906
+
+Zweite Rotation sig=F80DE612F5578AB7 (Zeile 1761):
+  bg=52966 match=52649 miss=317 layerMis=317 notInPack=0
+  BG1=26449 BG2=48646 BG3=25112 lRetry=25289
+
+Spätere Rotationen (Zeilen 1897-1987):
+  miss=256-363 layerMis=256-363 notInPack=0
+  lRetry=25243-25254
+
+Beobachtungen:
+  - 8 rotierende Signaturen (HDMA-Parallax-Effekt)
+  - lRetry≈25000 pro Frame → ~25000 Pixel nutzen Layer-Retry-Mechanismus
+  - layerMis=256-363 → Tiles mit falschem Layer-Attribut
+  - notInPack=0 → Alle Tiles sind im Pack (Hash bekannt)
+  - Erste Rotation: 100% match. Folgende: 99.4% match
+  - BG1≈27000, BG2≈49000-51000, BG3≈25000 → alle drei Layer aktiv
+```
+
+### Analyse
+- **Blaue Quadrate (a):** `notInPack=0` bedeutet alle Tile-Hashes sind im Pack.
+  Die blauen Quadrate könnten von **beschädigten/leeren PNG-Daten** kommen: der Hash
+  matcht, aber die zugehörige PNG-Datei enthält ungültige oder leere Pixel (Fallback-Blau).
+  Alternativ: falsche HD-Tile-Zuordnung — ein Hash zeigt auf das falsche PNG.
+- **layerMis=256-363:** Tiles die im Pack mit einem anderen Layer exportiert wurden
+  als die PPU zur Laufzeit nutzt. Diese Tiles werden nicht gematched (→ native Pixel).
+  Konsistent mit "teilweiser HD-Hintergrund" — die layer-mismatch-Tiles fallen auf nativ zurück.
+- **lRetry=25000:** Der Layer-Retry-Mechanismus greift massiv. Dies bedeutet, der
+  HD-Filter versucht Tiles zunächst mit dem "Winner"-Layer, scheitert, und probiert
+  den Fallback-Layer. ~25000 Pixel brauchen diesen zweiten Versuch.
+  → Performance-Impact (Issue D)
+- **Vordergrund-Blätter (c):** Möglicherweise BG3-Tiles (BG3≈25000 aktiv), die als
+  Foreground-Overlay gerendert werden, aber im Container fehlen oder als falscher
+  Layer exportiert wurden
+
+### Verbleibende Sub-Issues (b, c)
+1. **(b)** layerMis=256-363 → Tiles mit falschem Layer-Attribut. Export mit
+   erweitertem Layer-Matching oder layer-agnostischem Matching testen
+2. **(c)** BG3-Tiles im Container für Gusty Glade gfxset prüfen —
+   sind die Blätter-Tiles überhaupt enthalten?
+3. **lRetry-Optimierung:** 25000 Retries pro Frame ist sehr hoch —
+   direktes Layer-agnostisches Matching statt Retry könnte Performance verbessern
+
+### Root Cause (a) — Blaue Quadrate: GEFUNDEN UND BEHOBEN (2026-07-06)
+
+Die blauen Quadrate entstanden durch **asymmetrisches Clamping bei Color Math
+Subtract** im HD-Filter (`SnesHdVideoFilter.cpp`).
+
+**Mechanismus:**
+- Gusty Glade nutzt Color Math **SUBTRACT** Modus ($2131 bit 7)
+- Die SNES subtrahiert eine FixedColor (hoher R/G-Wert, niedriger/null B-Wert)
+  → erzeugt Sturm-Verdunkelung
+- Das additive cmDelta-System wendete dies als absolute Offsets auf HD-Pixel an
+- Ergebnis: R- und G-Kanäle wurden auf 0 geclampt, B blieb unverändert → blaues Erscheinungsbild
+
+**Beispiel (5-bit Werte):**
+```
+MainScreenColor (pre):  R=18 G=20 B=12
+FixedColor subtract:    R=-15 G=-15 B=-2
+ppuOutput (post):       R=3  G=5  B=10
+cmDelta (additive):     R=-15 G=-15 B=-2  (als 8-bit: -120, -120, -16)
+
+HD-Pixel z.B.:          R=200 G=180 B=50
+Nach additivem Delta:   R=80  G=60  B=34   ← akzeptabel
+
+Aber bei HD-Pixel:      R=100 G=80  B=50
+Nach additivem Delta:   R=0*  G=0*  B=34   ← BLAU! (* = geclampt)
+```
+
+**Fix: 3 Änderungen in 3 Dateien**
+
+1. **`SnesPpuTypes.h`** — Neues Flag `IsSubtractMode = 0x20` im `PixelFlags` Enum.
+   Nutzt freies Bit zwischen Priority (0x0F) und IsSpritePixel (0x40).
+
+2. **`SnesPpu.cpp`** — `IsSubtractMode` Flag wird an 4 Stellen gesetzt wo auch
+   `AllowColorMath` gesetzt wird (RenderBgColor, RenderSprites, BG-Layer-Template,
+   Mode 7). Zusätzlich: **Brightness-Inline** — `MainScreenColor` wird jetzt mit
+   `channel * ScreenBrightness / 15` skaliert bevor es gespeichert wird, damit
+   Pre- und Post-Math-Werte die gleiche Brightness-Basis haben (verhindert dass
+   der Brightness-Faktor die cmDelta-Ratio kontaminiert).
+
+3. **`SnesHdVideoFilter.cpp`** — Neuer `if(cmSubtractMode)` Branch:
+   - **Multiplikative Skalierung** für Subtract: `hdR * cmPostR / cmPreR`
+     → bewahrt Farbverhältnisse, kein asymmetrisches Clamping
+   - **Additives Delta** beibehalten für Add-Modus (Nebel, Glow-Effekte)
+   - Beide Pfade (opaque + alpha-blend) aktualisiert
+   - **Delta-Skalierung** korrigiert: `val*8 + val/4` (= val*255/31) statt nur `val*8`
+     (3% Unter-Anwendung eliminiert)
+
+**Status: (a) BEHOBEN — (b, c) weiterhin OFFEN**
+
+---
+
+## Zusammenfassung: Issue-Status nach Fix-Session 2026-07-06
+
+| Issue | Level | Schwere | Kategorie | Status |
+|-------|-------|---------|-----------|--------|
+| J | Pirate Panic | Mittel | Compositing (BG3+OBJ) | OFFEN |
+| K | Gangplank Galleon | Mittel | HDMA Palette | OFFEN |
+| L | Mainbrace Mayhem | Hoch | Sub-Screen BG3 Fog | OFFEN |
+| M | Lockjaw's Locker | Hoch | Multi (Tilemap+Scroll+Color) | OFFEN |
+| N | Hot Head Hop | Mittel | Artefakte+Seams | OFFEN (teilw. E/F/H) |
+| O | Rambi Rumble | Kritisch | 0% Match (DMA-Tiles) | OFFEN |
+| P(a) | Gusty Glade | Hoch | Blaue Quadrate (CM Subtract) | **BEHOBEN** |
+| P(b,c) | Gusty Glade | Mittel | Layer-Mismatch+Blätter | OFFEN |
+| D | Alle Level | Mittel | Performance | OFFEN |
+
+### Priorisierung (empfohlen)
+1. **Issue O** (Rambi Rumble 0%): Grundlegendster Fehler — kein einziges Tile rendert
+2. **Issue L** (Mainbrace Mayhem Fog): Sehr sichtbar, BG3-Nebel-Compositing
+3. **Issue M** (Lockjaw's Locker): Drei Sub-Issues, teilweise fehlende Tiles
+4. **Issue J** (Pirate Panic BG3): Subtil, nur bei Sprite-Überlappung
+5. **Issue K** (Gangplank Galleon): Kosmetisch, Sunset-Palette-Effekt
+6. **Issue N** (Hot Head Hop): Artefakte/Seams, teilweise bereits adressiert (E/F/H)
+7. **Issue P(b,c)** (Gusty Glade Rest): Layer-Mismatch + fehlende Blätter-Tiles
+8. **Issue D** (Performance): Tile-Level-Caching noch nicht implementiert

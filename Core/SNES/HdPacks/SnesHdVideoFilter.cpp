@@ -643,20 +643,26 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// (both BGR555), then scaled to 8-bit for HD tile application.
 				int cmDeltaR = 0, cmDeltaG = 0, cmDeltaB = 0;
 				bool applyColorMathDelta = false;
+				bool cmSubtractMode = false;
+				int cmPreR = 0, cmPreG = 0, cmPreB = 0;
+				int cmPostR = 0, cmPostG = 0, cmPostB = 0;
 				if(!bg3FogBlend && (pixelInfo.MainScreenFlags & 0x80)) {
 					uint16_t preMath = pixelInfo.MainScreenColor & 0x7FFF;
 					uint16_t postMath = ppuOutputBuffer[ppuIndex] & 0x7FFF;
-					int preR = preMath & 0x1F;
-					int preG = (preMath >> 5) & 0x1F;
-					int preB = (preMath >> 10) & 0x1F;
-					int postR = postMath & 0x1F;
-					int postG = (postMath >> 5) & 0x1F;
-					int postB = (postMath >> 10) & 0x1F;
-					cmDeltaR = (postR - preR) * 8;
-					cmDeltaG = (postG - preG) * 8;
-					cmDeltaB = (postB - preB) * 8;
+					cmPreR = preMath & 0x1F;
+					cmPreG = (preMath >> 5) & 0x1F;
+					cmPreB = (preMath >> 10) & 0x1F;
+					cmPostR = postMath & 0x1F;
+					cmPostG = (postMath >> 5) & 0x1F;
+					cmPostB = (postMath >> 10) & 0x1F;
+					// Accurate 5-bit→8-bit scaling: val*8 + val/4 (= val*255/31)
+					// instead of just val*8 (3% under-application).
+					cmDeltaR = (cmPostR * 8 + (cmPostR >> 2)) - (cmPreR * 8 + (cmPreR >> 2));
+					cmDeltaG = (cmPostG * 8 + (cmPostG >> 2)) - (cmPreG * 8 + (cmPreG >> 2));
+					cmDeltaB = (cmPostB * 8 + (cmPostB >> 2)) - (cmPreB * 8 + (cmPreB >> 2));
 					if(cmDeltaR != 0 || cmDeltaG != 0 || cmDeltaB != 0) {
 						applyColorMathDelta = true;
+						cmSubtractMode = (pixelInfo.MainScreenFlags & 0x20) != 0;
 					}
 				}
 
@@ -683,17 +689,27 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 										uint8_t outG = (uint8_t)((hdG * 4 + fogG) / 5);
 										uint8_t outB = (uint8_t)((hdB * 4 + fogB) / 5);
 										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
-									} else if(applyColorMathDelta) {
-										// Winner pixel had color math applied by PPU
-										// (e.g. HDMA subtract-fixedColor for lava glow).
-										// Replicate the same delta on the HD tile.
-										uint8_t hdR = (hdColor >> 16) & 0xFF;
-										uint8_t hdG = (hdColor >> 8) & 0xFF;
-										uint8_t hdB = hdColor & 0xFF;
-										uint8_t outR = (uint8_t)std::clamp((int)hdR + cmDeltaR, 0, 255);
-										uint8_t outG = (uint8_t)std::clamp((int)hdG + cmDeltaG, 0, 255);
-										uint8_t outB = (uint8_t)std::clamp((int)hdB + cmDeltaB, 0, 255);
-										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+								} else if(applyColorMathDelta) {
+									// Winner pixel had color math applied by PPU.
+									// Replicate the effect on the HD tile.
+									uint8_t hdR = (hdColor >> 16) & 0xFF;
+									uint8_t hdG = (hdColor >> 8) & 0xFF;
+									uint8_t hdB = hdColor & 0xFF;
+									uint8_t outR, outG, outB;
+									if(cmSubtractMode) {
+										// Multiplicative scaling for subtract mode:
+										// preserves color ratios, prevents asymmetric
+										// clamping that causes blue squares (Issue P).
+										outR = cmPreR > 0 ? (uint8_t)std::clamp(hdR * cmPostR / cmPreR, 0, 255) : hdR;
+										outG = cmPreG > 0 ? (uint8_t)std::clamp(hdG * cmPostG / cmPreG, 0, 255) : hdG;
+										outB = cmPreB > 0 ? (uint8_t)std::clamp(hdB * cmPostB / cmPreB, 0, 255) : hdB;
+									} else {
+										// Additive delta for add mode (fog, glow effects)
+										outR = (uint8_t)std::clamp((int)hdR + cmDeltaR, 0, 255);
+										outG = (uint8_t)std::clamp((int)hdG + cmDeltaG, 0, 255);
+										outB = (uint8_t)std::clamp((int)hdB + cmDeltaB, 0, 255);
+									}
+									outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
 									} else {
 										outputBuffer[outIndex] = hdColor;
 									}
@@ -716,12 +732,18 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 										blendR = (uint8_t)((blendR * 4 + fogR) / 5);
 										blendG = (uint8_t)((blendG * 4 + fogG) / 5);
 										blendB = (uint8_t)((blendB * 4 + fogB) / 5);
-									} else if(applyColorMathDelta) {
-										// Apply color math delta on alpha-blended result
+								} else if(applyColorMathDelta) {
+									// Apply color math on alpha-blended result
+									if(cmSubtractMode) {
+										blendR = cmPreR > 0 ? (uint8_t)std::clamp((int)blendR * cmPostR / cmPreR, 0, 255) : blendR;
+										blendG = cmPreG > 0 ? (uint8_t)std::clamp((int)blendG * cmPostG / cmPreG, 0, 255) : blendG;
+										blendB = cmPreB > 0 ? (uint8_t)std::clamp((int)blendB * cmPostB / cmPreB, 0, 255) : blendB;
+									} else {
 										blendR = (uint8_t)std::clamp((int)blendR + cmDeltaR, 0, 255);
 										blendG = (uint8_t)std::clamp((int)blendG + cmDeltaG, 0, 255);
 										blendB = (uint8_t)std::clamp((int)blendB + cmDeltaB, 0, 255);
 									}
+								}
 									outputBuffer[outIndex] = 0xFF000000 | (blendR << 16) | (blendG << 8) | blendB;
 								} else {
 									outputBuffer[outIndex] = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];

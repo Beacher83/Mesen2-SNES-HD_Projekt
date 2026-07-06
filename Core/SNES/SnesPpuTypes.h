@@ -192,6 +192,7 @@ struct SnesPpuState : public BaseState
 
 enum PixelFlags
 {
+	IsSubtractMode = 0x20,  // Set when color math uses subtract (vs add) mode
 	IsSpritePixel = 0x40,   // Set when a sprite wins the main screen pixel
 	AllowColorMath = 0x80,
 };
