@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-06 | Mesen Build: M5.17 (TEST PENDING) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED | Issue O: BG1 Overlay-Blend M5.16 VERIFIED | Issue L: BG3 Fog-Winner Gate + BG1 Overlay Fix M5.17 IMPLEMENTED
+Stand: 2026-07-06 | Mesen Build: M5.19 (TEST PENDING) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED | Issue O: BG1 Overlay-Blend M5.16 VERIFIED → M5.17 REGRESSION → M5.19 FIX | Issue L: BG3 Fog-Winner Gate M5.17 + Fog Contour M5.18 VERIFIED
 
 ---
 
@@ -2074,7 +2074,8 @@ uint8_t outR = (uint8_t)((hdR * 4 + fogR) / 5);  // 80/20 wie bisher
 ### Regressions-Check: Beehive-Level
 Die Änderungen dürfen Issue O (Rambi Rumble) NICHT brechen:
 - Fix 1 (bg3FogWinner): Beehive hat `winLayer == 0` (BG1 gewinnt, nicht BG3) → Gate greift nicht ✓
-- Fix 2 (bg1OverlayWinner): Beehive hat BG3-Tiles vorhanden → `mask & 0x04` = true → Overlay ✓
+- Fix 2 (bg1OverlayWinner M5.17): `mask & 0x04` — **REGRESSED** (BG3 nur 56% Coverage) ⛔
+- Fix 3 (bg1OverlayWinner M5.19): `frameBg3FogSkip == 0` — Fix für Regression, TEST PENDING
 
 ### Verwandte Issues
 - **Issue B** (BG3 Fog blockiert HD BG1): Gleicher Grundmechanismus
@@ -2347,6 +2348,50 @@ plus 7 Bonus-Räume — 13 Varianten total.
 - Animierte Hintergrundelemente (kleine Bienen, Larven) zeigen dieselben Darstellungsfehler
   wie Bubbles in Hot-Head Hop (→ Issue F: Frame-Mismatch bei VBlank-DMA-animierten Tiles).
   Bekannte Limitation, betrifft alle Level mit animierten BG-Sprites.
+
+### Update (2026-07-06d) — M5.17 REGRESSION + M5.19 Fix
+
+**Regression in M5.17:** Die `BgLayerMask & 0x04`-Prüfung (M5.17) war zu restriktiv:
+
+```
+M5.18 Log (Beehive frame):
+  bg=56056 match=31636 ovBlend=31636 miss=24420
+  BG1=56056 BG2=39084 BG3=31636
+  lRetry=21527
+  → BG3 deckt nur 56% der Pixel ab (31636/56056)
+  → 24420 BG1-Pixel ohne BG3 fallen auf nativen Pfad zurück → Regression
+```
+
+**Analyse:** Die `mask & 0x04`-Prüfung in `bg1OverlayWinner` erforderte BG3-Präsenz an
+jedem Pixel, um Overlay von Terrain zu unterscheiden. Aber BG3 deckt nicht die gesamte
+Beehive-Szene ab — nur ~56%. Pixel ohne BG3 (24420) wurden als nicht-overlay klassifiziert
+und fielen durch Step 2 (fallback) → MISS (kein Layer-Retry dort).
+
+**Verteilung der 31636 overlay-eligiblen Pixel (Step 3b):**
+- `lRetry=21527` → BG2-Terrain via Layer-Retry gefunden (LayerIndex 1→0) ✓
+- 10109 → BG3-Hintergrund als Fallback (kein BG2 an diesen Pixeln — transparent areas) ✓
+- BG2-Retry funktioniert korrekt — Fix 2 (BG2 retry investigation) ist NICHT nötig
+
+**M5.19 Fix:** `BgLayerMask & 0x04` ersetzt durch `frameBg3FogSkip == 0`:
+```cpp
+// M5.18 (broken):
+bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)
+                         && (pixelInfo.BgLayerMask & 0x04));
+// M5.19 (fixed):
+bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)
+                         && frameBg3FogSkip == 0);
+```
+
+**Warum das funktioniert:**
+- `frameBg3FogSkip` zählt BG3-Fog-Pixel im aktuellen Frame (Step 1 Gate, M5.17)
+- **Beehive:** `frameBg3FogSkip == 0` immer (kein Fog-Gate feuert) → Overlay auf ALLEN BG1 ✓
+- **Mainbrace:** `frameBg3FogSkip >> 0` (tausende Fog-Pixel) → kein Overlay → korrekt ✓
+- Frame-Level-Entscheidung statt Per-Pixel-Mask → keine Coverage-Lücken
+
+**Neue Diagnostik (M5.19):** WINNERS-Log enthält jetzt `ovBg2=X ovBg3=Y ovMiss=Z`
+für detaillierte BG2/BG3/Miss-Aufschlüsselung im Overlay-Blend-Pfad.
+
+### Status: **M5.19 — TEST PENDING**
 
 ---
 

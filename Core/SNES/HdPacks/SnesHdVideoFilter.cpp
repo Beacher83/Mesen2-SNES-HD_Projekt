@@ -12,7 +12,7 @@
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
 // Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.18"
+#define SNES_HD_BUILD_VERSION "M5.19"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -208,6 +208,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameBg3BgFallback = 0;       // BG3 bg won w/o colorMath → BG1 HD rendered plain (M5.12 Issue H)
 	uint32_t frameLayerRetry = 0;          // BG1↔BG2 layer-agnostic retry matches (M5.13 Issue H)
 	uint32_t frameBg1OverlayBlend = 0;     // BG1 overlay-blend: HD terrain under honey/overlay (M5.16 Issue O)
+	uint32_t frameBg1OvBg2 = 0;            // M5.19: overlay-blend found BG2 terrain tile
+	uint32_t frameBg1OvBg3 = 0;            // M5.19: overlay-blend found BG3 background tile (fallback)
+	uint32_t frameBg1OvMiss = 0;           // M5.19: overlay-blend found neither BG2 nor BG3
 	uint32_t frameBg3FogSkip = 0;          // BG3 fog winner: HD tile lookup skipped, deferred to step 3 (M5.17 Issue L)
 	bool frameHasBg1ColorMath = false;     // Any BG1-winning pixel had AllowColorMath this frame (M5.12)
 	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
@@ -343,7 +346,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 			}
 
-			// 1c) BG1 overlay detection (M5.16, Issue O; refined M5.17, Issue L):
+			// 1c) BG1 overlay detection (M5.16, Issue O; refined M5.19):
 			//     BG1 won compositing WITH AllowColorMath but has no HD tile.
 			//     This indicates a semi-transparent foreground overlay (e.g. honey
 			//     in DKC2 beehive levels: Rambi Rumble, Hornet Hole, Parrot Chute
@@ -351,13 +354,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			//     Skip the generic fallback (step 2) because applyColorMathDelta
 			//     uses wrong math for overlay-under-terrain rendering.
 			//     Step 3b handles this with proper overlay blending.
-			//     M5.17: Also require BG3 to have a tile at this pixel.
-			//     In beehive levels, BG1 wins OVER BG3 (both present → overlay).
-			//     In Mainbrace Mayhem, BG1 only wins where BG3 has NO tile
-			//     (fog gap → BG1 is terrain, not overlay). The BG3 presence
-			//     check (BgLayerMask & 0x04) distinguishes these two cases.
+			//     M5.19: Use frameBg3FogSkip instead of BgLayerMask & 0x04 to
+			//     distinguish overlay from fog-gap terrain.
+			//     - Beehive: frameBg3FogSkip==0 (no fog at all) → overlay ✓
+			//     - Mainbrace: frameBg3FogSkip>0 (fog present) → not overlay ✓
+			//     The M5.17 mask & 0x04 check was too restrictive: BG3 only
+			//     covers ~56% of beehive pixels, so 44% missed overlay blend.
 			bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)
-			                         && (pixelInfo.BgLayerMask & 0x04));
+			                         && frameBg3FogSkip == 0);
 
 			// 2) Fallback: try other layers if winner has no HD tile
 				//    GATE: Skip fallback when BG3 (layer 2) wins compositing
@@ -463,6 +467,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					if(hdTile) {
 						tileInfo = &pixelInfo.BgTiles[1];
 						bg1OverlayBlend = true;
+						frameBg1OvBg2++;
 					}
 				}
 				// If no BG2 match, try BG3 (layer 2) — background
@@ -471,7 +476,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					if(hdTile) {
 						tileInfo = &pixelInfo.BgTiles[2];
 						bg1OverlayBlend = true;
+						frameBg1OvBg3++;
 					}
+				}
+				// M5.19 diag: track overlay-eligible pixels that found nothing
+				if(!hdTile) {
+					frameBg1OvMiss++;
 				}
 			}
 
@@ -914,9 +924,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		DiagLog(buf);
 		// M5.15: Second log line with per-winner-layer breakdown
 		snprintf(buf, sizeof(buf),
-			"[SNES HD diag]   WINNERS: wn0=%u wn1=%u wn2=%u wn3=%u | acm0=%u acm1=%u acm2=%u acm3=%u",
+			"[SNES HD diag]   WINNERS: wn0=%u wn1=%u wn2=%u wn3=%u | acm0=%u acm1=%u acm2=%u acm3=%u"
+			" | ovBg2=%u ovBg3=%u ovMiss=%u",
 			frameWin[0], frameWin[1], frameWin[2], frameWin[3],
-			frameWinACM[0], frameWinACM[1], frameWinACM[2], frameWinACM[3]);
+			frameWinACM[0], frameWinACM[1], frameWinACM[2], frameWinACM[3],
+			frameBg1OvBg2, frameBg1OvBg3, frameBg1OvMiss);
 		DiagLog(buf);
 		diagFrameCount++;
 		if(frameBgPixels > 0) {

@@ -5,6 +5,41 @@ Für Änderungen am DKC2-HD-Tools Viewer siehe `DKC2-HD-Tools/CHANGELOG.md`.
 
 ---
 
+## [2026-07-06f] — M5.19: Beehive Regression Fix — frameBg3FogSkip statt BgLayerMask (Issue O)
+
+### Fix: bg1OverlayWinner Kriterium korrigiert
+
+**Problem:** M5.17 fügte `BgLayerMask & 0x04` als Bedingung für `bg1OverlayWinner` hinzu,
+um Beehive-Overlay (BG1 über BG3) von Mainbrace-Terrain (BG1 ohne BG3) zu unterscheiden.
+Aber BG3 deckt in Beehive-Leveln nur ~56% der Pixel ab (31636/56056). Die restlichen 44%
+(24420 Pixel) wurden fälschlich als nicht-overlay klassifiziert → Fallback auf native
+Rendering → Regression ("wilder Mix aus HD und nativem Muster").
+
+**Root Cause:** Per-Pixel BG3-Masken-Check ist zu granular. Nicht alle Beehive-Pixel haben
+BG3 (transparente Bereiche), aber ALLE brauchen Overlay-Blend-Rendering.
+
+**Lösung:** Frame-Level-Entscheidung statt Per-Pixel-Mask:
+```cpp
+// M5.17-M5.18 (broken): Per-Pixel BG3 check
+bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)
+                         && (pixelInfo.BgLayerMask & 0x04));
+// M5.19 (fixed): Frame-Level Fog-Erkennung
+bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)
+                         && frameBg3FogSkip == 0);
+```
+
+- **Beehive:** `frameBg3FogSkip == 0` (kein Fog-Gate feuert jemals) → Overlay auf ALLEN Pixeln ✓
+- **Mainbrace:** `frameBg3FogSkip > 0` (tausende Fog-Pixel ab erster Scanline) → kein Overlay ✓
+
+### Diagnostik-Erweiterung: Overlay-Blend Aufschlüsselung
+
+Neue Counter im WINNERS-Log: `ovBg2=X ovBg3=Y ovMiss=Z`
+- `ovBg2`: Overlay-Pixel die BG2-Terrain via Layer-Retry fanden (korrekt)
+- `ovBg3`: Overlay-Pixel die BG3-Hintergrund als Fallback fanden (kein BG2 vorhanden)
+- `ovMiss`: Overlay-eligible Pixel die weder BG2 noch BG3 fanden
+
+---
+
 ## [2026-07-06e] — M5.18: Fog Contour Fix — ADD Color Math für BG3 Fog (Issue L)
 
 ### Fix: Native ADD statt gewichtetem Blend für BG3-Fog
