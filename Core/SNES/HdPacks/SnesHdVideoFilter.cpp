@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P2.0"
+#define SNES_HD_BUILD_VERSION "P2.1"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -108,18 +108,23 @@ OverscanDimensions SnesHdVideoFilter::GetOverscan()
 }
 
 // =========================================================================
-// Phase 2: Multi-Layer HD Compositing Engine
+// Phase 2.1: Winner-Only HD Compositing with CM-Skip
 // =========================================================================
 // Replaces the M5.19 heuristic cascade (fog-blend, overlay-blend,
-// colorMathDelta, bg3-fallback) with a general-purpose multi-layer approach:
+// colorMathDelta, bg3-fallback) with a PPU register-driven approach:
 //
-//   1. Look up HD tiles for ALL layers that have content (BgLayerMask)
-//   2. Sort by SNES Mode 1 priority (back to front)
-//   3. Composite HD tiles over native PPU pixel as base
+//   1. Identify the PPU compositing winner (BgWinnerLayer)
+//   2. If the winner has AllowColorMath → skip HD, use native pixel
+//   3. Otherwise, look up HD tile for the winner layer only
+//   4. Render single HD tile over native PPU pixel as base
 //
-// Color math is NOT applied in Phase 2 — that's Phase 3.
-// Levels with fog/honey/lava effects will look different (effects missing)
-// until Phase 3 adds register-based color math using ScanlineInfo.
+// Winner-only: without Color Math, the winner fully occludes lower layers,
+// so only the winner's HD tile matters. Fixes P2.0 bugs where lower-
+// priority HD tiles composited over higher-priority non-HD content (e.g.
+// shop text, BG3 beehives rendering in foreground).
+//
+// CM-skip: pixels with Color Math use the native PPU pixel (which already
+// has correct color math applied). Phase 3 will apply HD color math.
 // =========================================================================
 
 void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
@@ -181,9 +186,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// Per-frame counters
 	uint32_t frameTotalPixels = 0;
 	uint32_t frameBgPixels = 0;
-	uint32_t frameHdMatch = 0;       // pixels where at least one HD tile found
-	uint32_t frameHdMiss = 0;        // BG pixels where NO HD tile found for any layer
-	uint32_t frameMultiLayer = 0;    // pixels where >1 HD tile found (multi-layer compositing)
+	uint32_t frameHdMatch = 0;       // pixels where HD tile found for winner layer
+	uint32_t frameHdMiss = 0;        // BG pixels where NO HD tile found for winner
+	uint32_t frameCmSkip = 0;        // pixels where Color Math skipped HD lookup
 	uint32_t frameLayerRetry = 0;    // BG1↔BG2 layer-agnostic retry matches
 	uint32_t frameSpriteWon = 0;     // pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;      // non-sprite pixels with BgLayerMask == 0
@@ -195,12 +200,6 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// Main pixel loop
 	// =====================================================================
 	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
-
-		// Per-scanline: read Mode1Bg3Priority from ScanlineInfo
-		bool mode1Bg3Prio = false;
-		if(y < SnesHdScreenInfo::ScreenHeight) {
-			mode1Bg3Prio = hdScreen->ScanlineInfo[y].Mode1Bg3Priority;
-		}
 
 		for(uint32_t x = overscan.Left; x < baseWidth - overscan.Right; x++) {
 			uint32_t srcIndex = y * SnesHdScreenInfo::ScreenWidth + x;
@@ -220,17 +219,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 
 			// =============================================================
-			// Phase 2: Multi-layer HD tile lookup
+			// Phase 2.1: Winner-only HD tile lookup with CM-skip
 			// =============================================================
-			// Look up HD tiles for ALL layers that have content.
-			// No heuristics — just check every layer in BgLayerMask.
-			// BG1↔BG2 layer retry is structural (not a heuristic): it
-			// handles genuine layer index mismatches between HD pack export
-			// and runtime PPU layer assignment.
+			// Only look up HD tile for the PPU compositing winner.
+			// Without Color Math, the winner fully occludes lower layers.
+			// CM-skip: if winner has AllowColorMath, use native pixel.
+			// BG1↔BG2 layer retry is structural (not a heuristic).
 
-			SnesHdPackTileInfo* layerHdTiles[4] = {};
-			SnesHdPpuTileInfo* layerTileInfos[4] = {};
-			int layerHdCount = 0;
+			SnesHdPackTileInfo* hdTile = nullptr;
+			SnesHdPpuTileInfo* hdTileInfo = nullptr;
 
 			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
 				frameBgPixels++;
@@ -238,86 +235,82 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				uint8_t winLayer = pixelInfo.BgWinnerLayer;
 				if(winLayer < 4) frameWin[winLayer]++;
 
+				// Count per-layer content bits (diagnostic only)
 				for(int li = 0; li < 4; li++) {
-					if(!(pixelInfo.BgLayerMask & (1 << li))) continue;
-					frameLayerBits[li]++;
+					if(pixelInfo.BgLayerMask & (1 << li)) frameLayerBits[li]++;
+				}
 
-					layerHdTiles[li] = _hdData->GetMatchingTile(
-						pixelInfo.BgTiles[li].Key, hdScreen->Vram);
+				// CM-skip: if the winner pixel has AllowColorMath set, the
+				// native PPU pixel already has correct color math applied.
+				// Skip HD lookup entirely → native pixel used.
+				// Phase 3 will implement HD color math to replace this.
+				bool cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
+
+				if(cmActive) {
+					frameCmSkip++;
+					// No HD lookup — use native pixel
+				} else if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+					// Look up HD tile for the winner layer only
+					hdTile = _hdData->GetMatchingTile(
+						pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
 
 					// BG1↔BG2 layer retry: same tile content may be exported
 					// as layer 0 but appear on layer 1 at runtime (or vice versa).
 					// Safe because BG1 and BG2 are both 4bpp in Mode 1.
-					if(!layerHdTiles[li] && (li == 0 || li == 1)) {
-						SnesHdTileKey altKey = pixelInfo.BgTiles[li].Key;
-						altKey.LayerIndex = (li == 0) ? 1 : 0;
-						layerHdTiles[li] = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-						if(layerHdTiles[li]) frameLayerRetry++;
+					if(!hdTile && (winLayer == 0 || winLayer == 1)) {
+						SnesHdTileKey altKey = pixelInfo.BgTiles[winLayer].Key;
+						altKey.LayerIndex = (winLayer == 0) ? 1 : 0;
+						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+						if(hdTile) frameLayerRetry++;
 					}
 
-					if(layerHdTiles[li]) {
-						layerTileInfos[li] = &pixelInfo.BgTiles[li];
-						layerHdCount++;
-						frameHdLayers[li]++;
-					}
-				}
+					if(hdTile) {
+						hdTileInfo = &pixelInfo.BgTiles[winLayer];
+						frameHdMatch++;
+						frameHdLayers[winLayer]++;
 
-				if(layerHdCount > 0) {
-					frameHdMatch++;
-					if(layerHdCount > 1) frameMultiLayer++;
-
-					// DIAGNOSTIC: Log first 5 unique matches per context
-					if(diagMatchCount < 5) {
-						for(int li = 0; li < 4; li++) {
-							if(!layerHdTiles[li]) continue;
-							auto& key = pixelInfo.BgTiles[li].Key;
+						// DIAGNOSTIC: Log first 5 unique matches per context
+						if(diagMatchCount < 5) {
+							auto& key = pixelInfo.BgTiles[winLayer].Key;
 							if(key.ContentHash != 0
 								&& diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
 								diagLoggedHashes.insert(key.ContentHash);
 								char buf[320];
 								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d",
-									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex);
+									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d win=%d",
+									(unsigned long long)key.ContentHash, key.PaletteIndex,
+									key.LayerIndex, winLayer);
 								DiagLog(buf);
 								diagMatchCount++;
-								break;
+							}
+						}
+					} else {
+						frameHdMiss++;
+
+						// DIAGNOSTIC: Log first 60 unique misses per context
+						if(diagMissCount < 60) {
+							SnesHdPpuTileInfo* missInfo = &pixelInfo.BgTiles[winLayer];
+							if(missInfo->Key.ContentHash != 0
+								&& diagLoggedHashes.find(missInfo->Key.ContentHash) == diagLoggedHashes.end()) {
+								diagLoggedHashes.insert(missInfo->Key.ContentHash);
+								bool inDmaRange = (missInfo->VramWordAddr >= 0x2000
+									&& missInfo->VramWordAddr <= 0x21D0);
+								char buf[512];
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d vram=0x%04X%s "
+									"mask=0x%02X win=%d",
+									(unsigned long long)missInfo->Key.ContentHash,
+									missInfo->Key.PaletteIndex, missInfo->Key.LayerIndex,
+									missInfo->VramWordAddr, inDmaRange ? " [DMA_RANGE]" : "",
+									pixelInfo.BgLayerMask, winLayer);
+								DiagLog(buf);
+								diagMissCount++;
 							}
 						}
 					}
 				} else {
+					// Winner is sprite/backdrop (0xFF) or winner layer not in mask
 					frameHdMiss++;
-
-					// DIAGNOSTIC: Log first 60 unique misses per context
-					if(diagMissCount < 60) {
-						// Analyze winner layer (or first layer with content)
-						SnesHdPpuTileInfo* missInfo = nullptr;
-						if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
-							missInfo = &pixelInfo.BgTiles[winLayer];
-						} else {
-							for(int li = 0; li < 4; li++) {
-								if(pixelInfo.BgLayerMask & (1 << li)) {
-									missInfo = &pixelInfo.BgTiles[li];
-									break;
-								}
-							}
-						}
-						if(missInfo && missInfo->Key.ContentHash != 0
-							&& diagLoggedHashes.find(missInfo->Key.ContentHash) == diagLoggedHashes.end()) {
-							diagLoggedHashes.insert(missInfo->Key.ContentHash);
-							bool inDmaRange = (missInfo->VramWordAddr >= 0x2000
-								&& missInfo->VramWordAddr <= 0x21D0);
-							char buf[512];
-							snprintf(buf, sizeof(buf),
-								"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d vram=0x%04X%s "
-								"mask=0x%02X win=%d",
-								(unsigned long long)missInfo->Key.ContentHash,
-								missInfo->Key.PaletteIndex, missInfo->Key.LayerIndex,
-								missInfo->VramWordAddr, inDmaRange ? " [DMA_RANGE]" : "",
-								pixelInfo.BgLayerMask, winLayer);
-							DiagLog(buf);
-							diagMissCount++;
-						}
-					}
 				}
 			}
 
@@ -327,60 +320,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			uint32_t outX = (x - overscan.Left) * hdScale;
 			uint32_t outY = (y - overscan.Top) * hdScale;
 
-			if(layerHdCount > 0) {
-				// ---------------------------------------------------------
-				// Build priority-sorted render order (back to front)
-				// ---------------------------------------------------------
-				// SNES Mode 1 BG priority (back-to-front = render order):
-				//   Without Bg3Priority: BG3p0, BG2p0, BG1p0, BG3p1, BG2p1, BG1p1
-				//   With Bg3Priority:    BG3p0, BG2p0, BG1p0, BG2p1, BG1p1, BG3p1
-				// BG4 is not used in Mode 1 (excluded with prio = -1).
-				struct LayerEntry { int li; int prio; };
-				LayerEntry order[4];
-				int orderCount = 0;
-
-				for(int li = 0; li < 4; li++) {
-					if(!layerHdTiles[li] || !layerTileInfos[li]) continue;
-					if(layerHdTiles[li]->HdTileData.empty()) continue;
-
-					bool prioHigh = pixelInfo.BgTiles[li].Priority != 0;
-					int prio = -1;
-
-					if(li == 3) {
-						// BG4: not used in Mode 1, skip
-						continue;
-					} else if(!prioHigh) {
-						// Low tile priority: BG3=0, BG2=1, BG1=2
-						prio = (li == 2) ? 0 : (li == 1) ? 1 : 2;
-					} else if(!mode1Bg3Prio) {
-						// High tile priority (normal): BG3=3, BG2=4, BG1=5
-						prio = (li == 2) ? 3 : (li == 1) ? 4 : 5;
-					} else {
-						// High tile priority (Bg3Priority): BG2=3, BG1=4, BG3=5
-						prio = (li == 1) ? 3 : (li == 0) ? 4 : 5;
-					}
-
-					order[orderCount++] = { li, prio };
-				}
-
-				// Insertion sort ascending (lowest prio first = background)
-				for(int i = 1; i < orderCount; i++) {
-					LayerEntry tmp = order[i];
-					int j = i - 1;
-					while(j >= 0 && order[j].prio > tmp.prio) {
-						order[j + 1] = order[j];
-						j--;
-					}
-					order[j + 1] = tmp;
-				}
-
-				// ---------------------------------------------------------
-				// Render HD sub-pixels: back-to-front compositing
-				// ---------------------------------------------------------
-				// Base = native PPU pixel (includes sprites, backdrop, non-HD
-				// layers, and PPU color math). HD tiles composite over it.
-				// Phase 3 will add register-based color math on top.
-
+			if(hdTile && hdTileInfo && !hdTile->HdTileData.empty()) {
+				// Render single HD tile over native PPU pixel base
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
 					for(uint32_t dx = 0; dx < hdScale; dx++) {
 						uint32_t outIndex = (outY + dy) * frameInfo.Width + (outX + dx);
@@ -389,45 +330,38 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						// Start with native PPU pixel as base
 						uint32_t result = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
 
-						// Composite each HD layer (back to front)
-						for(int ri = 0; ri < orderCount; ri++) {
-							int li = order[ri].li;
-							SnesHdPackTileInfo* tile = layerHdTiles[li];
-							SnesHdPpuTileInfo* info = layerTileInfos[li];
+						// Compute HD sub-pixel coordinates within tile
+						uint8_t rawX = hdTileInfo->OffsetX;
+						uint8_t rawY = hdTileInfo->OffsetY;
+						bool hFlip = hdTileInfo->HorizontalMirror;
+						bool vFlip = hdTileInfo->VerticalMirror;
+						uint8_t srcTileX = hFlip ? (7 - rawX) : rawX;
+						uint8_t srcTileY = vFlip ? (7 - rawY) : rawY;
+						uint32_t hdPX = srcTileX * hdScale + (hFlip ? (hdScale - 1 - dx) : dx);
+						uint32_t hdPY = srcTileY * hdScale + (vFlip ? (hdScale - 1 - dy) : dy);
 
-							// Compute HD sub-pixel coordinates within tile
-							uint8_t rawX = info->OffsetX;
-							uint8_t rawY = info->OffsetY;
-							bool hFlip = info->HorizontalMirror;
-							bool vFlip = info->VerticalMirror;
-							uint8_t srcTileX = hFlip ? (7 - rawX) : rawX;
-							uint8_t srcTileY = vFlip ? (7 - rawY) : rawY;
-							uint32_t hdPX = srcTileX * hdScale + (hFlip ? (hdScale - 1 - dx) : dx);
-							uint32_t hdPY = srcTileY * hdScale + (vFlip ? (hdScale - 1 - dy) : dy);
+						if(hdPX >= hdTile->Width || hdPY >= hdTile->Height) continue;
 
-							if(hdPX >= tile->Width || hdPY >= tile->Height) continue;
+						uint32_t hdColor = hdTile->HdTileData[hdPY * hdTile->Width + hdPX];
+						uint8_t alpha = (hdColor >> 24) & 0xFF;
 
-							uint32_t hdColor = tile->HdTileData[hdPY * tile->Width + hdPX];
-							uint8_t alpha = (hdColor >> 24) & 0xFF;
-
-							if(alpha == 0xFF) {
-								// Fully opaque — replace
-								result = hdColor;
-							} else if(alpha > 0) {
-								// Semi-transparent — alpha blend over current result
-								uint8_t srcR = (result >> 16) & 0xFF;
-								uint8_t srcG = (result >> 8) & 0xFF;
-								uint8_t srcB = result & 0xFF;
-								uint8_t hdR = (hdColor >> 16) & 0xFF;
-								uint8_t hdG = (hdColor >> 8) & 0xFF;
-								uint8_t hdB = hdColor & 0xFF;
-								uint8_t blR = hdR + ((srcR * (255 - alpha)) / 255);
-								uint8_t blG = hdG + ((srcG * (255 - alpha)) / 255);
-								uint8_t blB = hdB + ((srcB * (255 - alpha)) / 255);
-								result = 0xFF000000 | (blR << 16) | (blG << 8) | blB;
-							}
-							// alpha == 0: transparent — skip, lower layer shows through
+						if(alpha == 0xFF) {
+							// Fully opaque — replace
+							result = hdColor;
+						} else if(alpha > 0) {
+							// Semi-transparent — alpha blend over native base
+							uint8_t srcR = (result >> 16) & 0xFF;
+							uint8_t srcG = (result >> 8) & 0xFF;
+							uint8_t srcB = result & 0xFF;
+							uint8_t hdR = (hdColor >> 16) & 0xFF;
+							uint8_t hdG = (hdColor >> 8) & 0xFF;
+							uint8_t hdB = hdColor & 0xFF;
+							uint8_t blR = hdR + ((srcR * (255 - alpha)) / 255);
+							uint8_t blG = hdG + ((srcG * (255 - alpha)) / 255);
+							uint8_t blB = hdB + ((srcB * (255 - alpha)) / 255);
+							result = 0xFF000000 | (blR << 16) | (blG << 8) | blB;
 						}
+						// alpha == 0: transparent — native pixel shows through
 
 						outputBuffer[outIndex] = result;
 					}
@@ -457,15 +391,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u multi=%u miss=%u lRetry=%u"
+			": total=%u bg=%u match=%u miss=%u cmSkip=%u lRetry=%u"
 			" sprWon=%u mask0=%u"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
 			" (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount, ctxLabel,
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameMultiLayer,
-			frameHdMiss, frameLayerRetry,
+			frameTotalPixels, frameBgPixels, frameHdMatch,
+			frameHdMiss, frameCmSkip, frameLayerRetry,
 			frameSpriteWon, frameMaskZero,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],

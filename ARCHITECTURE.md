@@ -463,7 +463,7 @@ special cases needed.
 | Phase | What | Status | Risk |
 |-------|------|--------|------|
 | **1** | `SnesHdScanlineInfo` struct + PPU fills per scanline | **DONE** | Low |
-| **2** | Multi-layer tile lookup in `ApplyFilter()` | **CODE DONE — BUILD+TEST PENDING** | Medium |
+| **2** | Winner-only HD compositing with CM-skip | **P2.1 CODE DONE — BUILD+TEST PENDING** | Medium |
 | **3** | General color math on HD pixels (ADD/SUB/HALF) | Pending | High |
 | **4** | Color window + brightness at HD resolution | Pending | Medium |
 | **5** | Remove old special-case paths, update diagnostics | Pending | Low |
@@ -479,47 +479,64 @@ special cases needed.
 **No behavioral change** — existing filter continues to work unchanged.
 The new data is available but not yet consumed.
 
-### Phase 2: Multi-Layer Tile Lookup (CODE DONE — BUILD+TEST PENDING)
+### Phase 2: Winner-Only HD Compositing with CM-Skip (P2.1 CODE DONE — BUILD+TEST PENDING)
 
-**Implementation complete (2026-07-07).** Full rewrite of `ApplyFilter()` from
-~947 lines of heuristic cascade to ~320 lines of clean multi-layer compositing.
+**P2.0 (2026-07-07):** Full rewrite of `ApplyFilter()` from ~947 lines of
+heuristic cascade to ~320 lines of multi-layer compositing. Tested — 6 bugs found.
+
+**P2.1 (2026-07-07):** Fixes P2.0 bugs by switching from multi-layer to
+winner-only compositing with Color Math skip. ~280 lines of clean code.
 
 **Decision:** Old color math heuristics (fog-blend, overlay-blend, colorMathDelta)
 are REMOVED, not kept as temporary bridge. Expected visual regression on color-math
 levels until Phase 3. ("nein lass uns das nicht mitschleppen")
 
-**What changed:**
+**P2.0 test results (6 bugs found):**
+1. NPC Shop text invisible — lower-priority HD tiles over higher-priority text
+2. Rambi Rumble — BG3 beehives in foreground (BG3 Bg3Priority=true)
+3. Hot Head Hop — BG3 lava background in foreground (same mechanism)
+4. Mainbrace Mayhem — opaque HD fog (no Color Math → HD tile rendered solid)
+5. Pirate Panic — sea color missing (colorMathDelta removed, expected)
+6. Lockjaw's Locker — water clipping (minor, low priority)
+
+**P2.1 fix — winner-only + CM-skip:**
+- **Winner-only:** Only look up HD tile for `BgWinnerLayer` (the PPU compositing
+  winner). Without Color Math, the winner fully occludes lower layers, so only
+  the winner's HD tile matters. Fixes bugs 1-3.
+- **CM-skip:** If `MainScreenFlags & 0x80` (AllowColorMath), skip HD lookup
+  entirely → native PPU pixel used. Native pixel already has correct color math.
+  Fixes bug 4, handles bug 5 correctly.
+- **Removed:** Multi-layer loop, priority sorting, `frameMultiLayer` counter
+- **Added:** `frameCmSkip` counter
+- **Kept:** BG1↔BG2 layer retry (structural, not heuristic)
+
+**What changed across P2.0+P2.1 (3 files):**
 
 1. **`SnesHdData.h`:** Added `BgMode` + `Mode1Bg3Priority` fields to
-   `SnesHdScanlineInfo` (Phase 1 extension needed for Phase 2 priority sorting).
+   `SnesHdScanlineInfo` (Phase 1 extension for Phase 2).
 
 2. **`SnesPpu.cpp`:** Two new lines in scanline snapshot block (~line 929-930)
    populating `sl.BgMode` and `sl.Mode1Bg3Priority`.
 
 3. **`SnesHdVideoFilter.cpp`:** Complete rewrite of `ApplyFilter()`:
-   - **Multi-layer lookup** (~line 182-250): Iterates `BgLayerMask`, calls
-     `GetMatchingTile()` for ALL layers with content (not just winner).
-     BG1↔BG2 layer retry kept (structural, not heuristic).
-   - **Priority sorting** (~line 258-295): Sorts found HD layers by SNES Mode 1
-     priority order (back-to-front). Uses `BgMode` + `Mode1Bg3Priority` +
-     per-tile priority bit from tilemap data.
-   - **Back-to-front compositing** (~line 300-340): Native PPU pixel as base,
-     then HD layers composite over it with alpha blending.
-   - **Diagnostics:** Removed ~15 old heuristic counters. Added `frameMultiLayer`,
-     `frameHdLayers[4]`. Build version `P2.0`.
+   - **Winner-only lookup** (~line 229-315): Checks CM-skip, then looks up
+     HD tile for `BgWinnerLayer` only. BG1↔BG2 layer retry kept.
+   - **Single-tile rendering** (~line 323-380): Native PPU pixel as base,
+     single HD tile composited over with alpha blending.
+   - **Diagnostics:** `frameCmSkip` counter. Build version `P2.1`.
 
 4. **Removed code:**
    - `bg3FogBlend` / `bg3FogSkip` / `frameBg3FogSkip`
    - `bg1OverlayBlend` / `bg1OverlayWinner`
    - `colorMathDelta` / `colorMathRatio`
    - `bg3BgFallback` / `frameHasBg1ColorMath`
-   - All old diagnostic counters for these paths
+   - Multi-layer arrays (`layerHdTiles[4]`, `layerTileInfos[4]`, `layerHdCount`)
+   - Priority sorting (`LayerEntry`, `order[]`, insertion sort)
+   - `mode1Bg3Prio` per-scanline read (not needed without priority sorting)
+   - `frameMultiLayer` counter
+   - All old diagnostic counters
 
-**Known limitation:** If a low-priority layer has an HD tile but the high-priority
-winner doesn't, the HD tile may show through where it shouldn't. In practice this
-is rare due to BG1↔BG2 layer retry.
-
-**Build version:** `P2.0`
+**Build version:** `P2.1`
 
 ### Phase 3: HD Color Math (NEXT)
 
@@ -675,19 +692,24 @@ Remove old special-case paths and update diagnostics.
 
 ## Checkliste: Nächste Session
 
-### Phase 2: Build + Test (JETZT)
+### Phase 2: Build + Test
 
-- [ ] In Visual Studio bauen (Windows, x64, Debug oder Release)
-- [ ] Erwartung: Kompiliert ohne Fehler/Warnings in den 3 geänderten Dateien
-- [ ] DKC2 starten, **Pirate Panic** (normales Level, kein Color Math)
-- [ ] Erwartung: Identisch zu M5.19 — BG1+BG2 HD, BG3 Taue nativ sichtbar
-- [ ] DKC2, **Mainbrace Mayhem** (fog level)
-- [ ] Erwartung: Layering korrekt, aber Fog-Effekt FEHLT (expected regression)
-- [ ] DKC2, **Rambi Rumble** (beehive/honey level)
-- [ ] Erwartung: BG2 Terrain über BG3, Honey-Overlay FEHLT (expected regression)
-- [ ] DKC2, **Hot-Head Hop** (lava level)
-- [ ] Erwartung: BG1 HD sichtbar, Lava-Glow FEHLT (expected regression)
-- [ ] Wenn Build oder Laufzeit-Fehler: hier dokumentieren, dann fixen
+**P2.0 (tested, 6 bugs found → fixed in P2.1):**
+- [x] In Visual Studio bauen — Kompiliert ohne Fehler
+- [x] DKC2 starten, Pirate Panic — Meer-Farbe fehlt (expected, colorMathDelta entfernt)
+- [x] Mainbrace Mayhem — HD Fog opak statt semi-transparent (BUG → P2.1 fix)
+- [x] Rambi Rumble — BG3 Bienenstöcke im Vordergrund (BUG → P2.1 fix)
+- [x] Hot Head Hop — BG3 Lava-Hintergrund im Vordergrund (BUG → P2.1 fix)
+- [x] NPC Shop Text unsichtbar (BUG → P2.1 fix)
+
+**P2.1 (BUILD+TEST PENDING):**
+- [ ] In Visual Studio bauen (Windows, x64)
+- [ ] DKC2, **Pirate Panic** — HD tiles + native Meer-Farbe (CM-skip auf Meer-Pixels)
+- [ ] DKC2, **NPC Shop** (Cranky/Funky) — Text sichtbar
+- [ ] DKC2, **Mainbrace Mayhem** — Nativer Fog (korrekt semi-transparent)
+- [ ] DKC2, **Rambi Rumble** — BG3 Bienenstöcke im HINTERGRUND
+- [ ] DKC2, **Hot Head Hop** — HD wo kein CM, nativ wo CM (mixed)
+- [ ] Diagnostik prüfen: `cmSkip=` Counter im Diag-Log sichtbar
 - [ ] Git commit nach erfolgreichem Test
 
 ### Phase 2 → Phase 3 Übergang
@@ -712,7 +734,7 @@ Remove old special-case paths and update diagnostics.
   (`ApplyColorMathToPixel()`) — Referenz für Phase 3 HD-Reimplementierung
 - **PPU Window Evaluation:** `SnesPpuTypes.h` Zeile 108-124
   (`WindowConfig::PixelNeedsMasking()`) — Referenz für Phase 4
-- **Phase 2 HD Filter:** `SnesHdVideoFilter.cpp` ~320 Zeilen —
-  `ApplyFilter()` komplett neu geschrieben (Phase 2). Build version `P2.0`.
+- **Phase 2 HD Filter:** `SnesHdVideoFilter.cpp` ~280 Zeilen —
+  `ApplyFilter()` winner-only + CM-skip (Phase 2.1). Build version `P2.1`.
 - **Tag für Rollback:** `v0.1-sonderfall-m5.19` — falls die neue Engine
   Probleme macht, kann jederzeit auf den alten Ansatz zurückgewechselt werden

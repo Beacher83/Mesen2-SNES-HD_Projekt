@@ -2596,4 +2596,71 @@ sl.Mode1Bg3Priority = _state.Mode1Bg3Priority;
 | O (Rambi Rumble) | Regression erwartet (Overlay-Blend entfernt) → Phase 3 löst |
 | P (Gusty Glade Blau) | Gelöst (Color Math Delta entfernt, war Root Cause) |
 
-### Status: **P2.0 — BUILD + TEST PENDING**
+### Status: **P2.0 — TESTED, 6 BUGS → FIXED IN P2.1**
+
+---
+
+## Phase 2.1: Winner-Only HD Compositing + CM-Skip (2026-07-07)
+
+### P2.0 Test-Ergebnisse (User getestet auf separatem PC)
+
+Build kompilierte sauber. 6 Issues gefunden:
+
+| # | Level | Problem | Root Cause | Fix |
+|---|-------|---------|------------|-----|
+| 1 | NPC Shops | Text komplett unsichtbar | Lower-prio HD tile composited OVER higher-prio text (kein HD match) | Winner-only |
+| 2 | Rambi Rumble | BG3 Bienenstöcke im Vordergrund | BG3 prio-1 tiles mit Bg3Priority=true sortieren ganz nach vorne | Winner-only |
+| 3 | Hot Head Hop | BG3 Lava-Hintergrund im Vordergrund | Gleicher Mechanismus wie #2 | Winner-only |
+| 4 | Mainbrace Mayhem | HD Fog opak (dunkel, nicht durchsichtig) | BG3 fog HD tiles gefunden aber opak gerendert (kein Color Math) | CM-skip |
+| 5 | Pirate Panic | Meer-Farbe fehlt | colorMathDelta entfernt (expected) | CM-skip |
+| 6 | Lockjaw's Locker | Wasser-Höhe/Clipping | Minor, low priority | — |
+
+### Root Cause: Fundamentaler Multi-Layer Bug
+
+Back-to-front multi-layer compositing hat grundlegenden Fehler ohne Color Math:
+
+**Wenn ein higher-priority Layer Content hat (BgLayerMask) aber KEIN HD tile,
+compositen lower-priority HD tiles ÜBER den nativen PPU Pixel und VERDECKEN
+den higher-priority Layer.** Der native PPU Pixel enthält korrekt den higher-
+priority Layer, aber der lower-priority HD tile ersetzt ihn.
+
+Beispiel: BG1 (Text, prio 5) gewinnt Compositing. BG2 (Background, prio 4) hat
+HD tile. Compositing: BG2 HD tile ersetzt native Base → BG1 hat kein HD tile →
+composited nicht → Text weg.
+
+### P2.1 Fix
+
+**Teil 1: Winner-only rendering.** Statt ALLE Layer zu compositen, nur den
+HD tile für den PPU Compositing Winner (`BgWinnerLayer`) rendern. Ohne Color
+Math verdeckt der Winner alle lower-priority layers vollständig. Fixt Bugs 1-3.
+
+**Teil 2: CM-skip.** Wenn der Winner `AllowColorMath` Flag hat
+(`MainScreenFlags & 0x80`), HD lookup komplett skippen → nativer PPU Pixel.
+Nativer Pixel hat bereits korrektes Color Math. Fixt Bug 4, handhabt Bug 5.
+
+### Code-Änderungen (nur `SnesHdVideoFilter.cpp`)
+
+| Aktion | Was |
+|--------|-----|
+| Entfernt | Multi-Layer Arrays (`layerHdTiles[4]`, `layerTileInfos[4]`, `layerHdCount`) |
+| Entfernt | Priority Sorting (`LayerEntry`, `order[]`, insertion sort) |
+| Entfernt | `mode1Bg3Prio` per-scanline read |
+| Entfernt | `frameMultiLayer` counter |
+| Hinzugefügt | CM-skip Check (`MainScreenFlags & 0x80`) |
+| Hinzugefügt | `frameCmSkip` counter |
+| Geändert | Multi-layer loop → single winner lookup |
+| Geändert | Multi-tile compositing → single-tile rendering |
+| Beibehalten | BG1↔BG2 layer retry (strukturell) |
+| Beibehalten | Diagnostik (MATCH/MISS logs, angepasst für winner-only) |
+
+### Erwartete P2.1 Test-Ergebnisse
+
+| Level | Erwartung |
+|-------|-----------|
+| Pirate Panic | HD tiles + native Meer-Farbe (CM-skip auf Meer-Pixels) |
+| NPC Shops | Text sichtbar (Winner hat kein HD match → nativ) |
+| Mainbrace Mayhem | Nativer Fog (korrekt semi-transparent, kein HD) |
+| Rambi Rumble | Nativ (BG1 Honig gewinnt mit CM → nativ) |
+| Hot Head Hop | HD wo kein CM, nativ wo CM (mixed) |
+
+### Status: **P2.1 — BUILD + TEST PENDING**
