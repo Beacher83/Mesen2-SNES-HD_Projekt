@@ -163,6 +163,10 @@ struct SnesHdPpuPixelInfo
 
 struct SnesHdScanlineInfo
 {
+	// --- BG Mode ($2105) ---
+	uint8_t BgMode = 0;                    // $2105 bits 0-2: BG mode (0-7)
+	bool Mode1Bg3Priority = false;         // $2105 bit 3: BG3 priority=1 above all (Mode 1 only)
+
 	// --- Color Math ($2130, $2131) ---
 	uint8_t ColorMathEnabled = 0;          // $2131 bits 0-5: bitmask of layers that participate
 	                                       //   bit 0 = BG1, 1 = BG2, 2 = BG3, 3 = BG4,

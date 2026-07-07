@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-06 | Mesen Build: M5.19 (TEST PENDING) | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issue I: Sub-Screen-Blend v3 CONFIRMED | Issue O: BG1 Overlay-Blend M5.16 VERIFIED → M5.17 REGRESSION → M5.19 FIX | Issue L: BG3 Fog-Winner Gate M5.17 + Fog Contour M5.18 VERIFIED
+Stand: 2026-07-07 | Mesen Build: P2.0 (BUILD+TEST PENDING) | Phase 2 Multi-Layer Compositing: CODE DONE — replaces M5.19 heuristic cascade | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issues J-P: Expected to be SUPERSEDED by Phase 2-4 engine
 
 ---
 
@@ -2531,3 +2531,69 @@ Nach additivem Delta:   R=0*  G=0*  B=34   ← BLAU! (* = geclampt)
 6. **Issue N** (Hot Head Hop): Artefakte/Seams, teilweise bereits adressiert (E/F/H)
 7. **Issue P(b,c)** (Gusty Glade Rest): Layer-Mismatch + fehlende Blätter-Tiles
 8. **Issue D** (Performance): Tile-Level-Caching noch nicht implementiert
+
+---
+
+## Phase 2: HD Compositing Engine — Multi-Layer Compositing (2026-07-07)
+
+### Architektur-Entscheidung
+
+**Alle alten Heuristiken entfernt.** Die M5.1–M5.19 Sonderfall-Kaskade (fog-blend,
+overlay-blend, colorMathDelta, bg3FogSkip, frameHasBg1ColorMath, etc.) wurde komplett
+durch einen generischen PPU-Register-gesteuerten Multi-Layer-Compositing-Ansatz ersetzt.
+
+**Entscheidung des Users:** "Nein, lass uns das nicht mitschleppen" — alte Heuristiken
+sind NICHT als Fallback/Bridge beibehalten. Erwartete visuelle Regression auf allen
+Color-Math-Leveln bis Phase 3 (HD Color Math) implementiert ist.
+
+### Was geändert wurde (3 Dateien)
+
+**1. `SnesHdData.h`** — 2 neue Felder in `SnesHdScanlineInfo`:
+- `BgMode` (uint8_t) — SNES BG Mode (0-7), für Prioritätssortierung
+- `Mode1Bg3Priority` (bool) — $2105 bit 3, für BG3-Prioritätsposition
+
+**2. `SnesPpu.cpp`** — 2 Zeilen im Scanline-Snapshot-Block (~Zeile 929-930):
+```cpp
+sl.BgMode = _state.BgMode;
+sl.Mode1Bg3Priority = _state.Mode1Bg3Priority;
+```
+
+**3. `SnesHdVideoFilter.cpp`** — Komplette Neufassung von `ApplyFilter()`:
+
+| Sektion | Zeilen | Beschreibung |
+|---------|--------|-------------|
+| Multi-Layer Lookup | ~182-250 | Iteriert `BgLayerMask`, `GetMatchingTile()` pro Layer |
+| BG1↔BG2 Layer Retry | ~210-230 | Strukturell (nicht heuristisch), für Layer-Index-Mismatch |
+| Priority Sorting | ~258-295 | SNES Mode 1 Prioritätsreihenfolge (back-to-front) |
+| Compositing | ~300-340 | Native PPU als Base, HD-Layer darüber mit Alpha |
+| Diagnostik | ~350-380 | `frameMultiLayer`, `frameHdLayers[4]` |
+
+**Entfernte Variablen/Counter (~15):**
+`bg3FogBlend`, `bg3FogSkip`, `frameBg3FogSkip`, `bg1OverlayBlend`, `bg1OverlayWinner`,
+`colorMathDelta`, `colorMathRatio`, `bg3BgFallback`, `frameHasBg1ColorMath`,
+`frameBg1OvBg2`, `frameBg1OvBg3`, `frameBg1OvMiss`, `layerRetryHd`, `layerRetryNative`,
+`layerRetryMiss`, `fogB`, `fogNat`, `ovBlend`, `cmDelta`
+
+### Erwartete Test-Ergebnisse
+
+| Level | Erwartung | Warum |
+|-------|-----------|-------|
+| Pirate Panic | Identisch zu M5.19 | Kein Color Math → neuer Code produziert gleichen Output |
+| Mainbrace Mayhem | Layering korrekt, Fog FEHLT | Color Math nicht implementiert (Phase 3) |
+| Rambi Rumble | BG2 Terrain über BG3, Honig FEHLT | Color Math nicht implementiert |
+| Hot Head Hop | BG1 HD sichtbar, Lava-Glow FEHLT | Color Math nicht implementiert |
+| Gusty Glade | Layering korrekt, Verdunkelung FEHLT | Color Math nicht implementiert |
+
+### Impact auf offene Issues
+
+| Issue | Erwarteter Status nach Phase 2 |
+|-------|-------------------------------|
+| J (BG3 Bleed-Through) | Möglicherweise gelöst durch korrektes Multi-Layer-Compositing |
+| K (Sunset) | Unverändert (Palette-Problem, nicht Color-Math) |
+| L (Mainbrace Fog) | Regression erwartet (Fog-Blend entfernt) → Phase 3 löst |
+| M (Lockjaw) | Teilweise gelöst (Multi-Layer), Color Math fehlt |
+| N (Hot Head Artefakte) | Teilweise (Seams + Bubbles bleiben) |
+| O (Rambi Rumble) | Regression erwartet (Overlay-Blend entfernt) → Phase 3 löst |
+| P (Gusty Glade Blau) | Gelöst (Color Math Delta entfernt, war Root Cause) |
+
+### Status: **P2.0 — BUILD + TEST PENDING**

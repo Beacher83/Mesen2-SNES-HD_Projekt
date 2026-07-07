@@ -925,6 +925,9 @@ void SnesPpu::RenderScanline()
 		// scanlines, never mid-line, so all partial calls see the same state.
 		if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight) {
 			SnesHdScanlineInfo& sl = _hdActiveScreen->ScanlineInfo[hdScanline];
+			// BG mode ($2105)
+			sl.BgMode                = _state.BgMode;
+			sl.Mode1Bg3Priority      = _state.Mode1Bg3Priority;
 			// Color math registers ($2130, $2131)
 			sl.ColorMathEnabled      = _state.ColorMathEnabled;
 			sl.ColorMathSubtractMode = _state.ColorMathSubtractMode;

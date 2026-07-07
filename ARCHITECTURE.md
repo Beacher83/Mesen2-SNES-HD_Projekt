@@ -463,7 +463,7 @@ special cases needed.
 | Phase | What | Status | Risk |
 |-------|------|--------|------|
 | **1** | `SnesHdScanlineInfo` struct + PPU fills per scanline | **DONE** | Low |
-| **2** | Multi-layer tile lookup in `ApplyFilter()` | Pending | Medium |
+| **2** | Multi-layer tile lookup in `ApplyFilter()` | **CODE DONE — BUILD+TEST PENDING** | Medium |
 | **3** | General color math on HD pixels (ADD/SUB/HALF) | Pending | High |
 | **4** | Color window + brightness at HD resolution | Pending | Medium |
 | **5** | Remove old special-case paths, update diagnostics | Pending | Low |
@@ -479,45 +479,49 @@ special cases needed.
 **No behavioral change** — existing filter continues to work unchanged.
 The new data is available but not yet consumed.
 
-### Phase 2: Multi-Layer Tile Lookup (NEXT)
+### Phase 2: Multi-Layer Tile Lookup (CODE DONE — BUILD+TEST PENDING)
 
-Current `ApplyFilter()` only looks up HD tiles for `BgWinnerLayer` (the
-compositing winner). Phase 2 will look up HD tiles for ALL layers that have
-content (`BgLayerMask`), maintaining correct SNES priority order.
+**Implementation complete (2026-07-07).** Full rewrite of `ApplyFilter()` from
+~947 lines of heuristic cascade to ~320 lines of clean multi-layer compositing.
 
-**Konkrete Schritte:**
+**Decision:** Old color math heuristics (fog-blend, overlay-blend, colorMathDelta)
+are REMOVED, not kept as temporary bridge. Expected visual regression on color-math
+levels until Phase 3. ("nein lass uns das nicht mitschleppen")
 
-1. In `ApplyFilter()` (SnesHdVideoFilter.cpp), den bestehenden Single-Layer-
-   Lookup-Code identifizieren — aktuell wird nur `pixelInfo.BgTiles[winLayer]`
-   nachgeschlagen.
+**What changed:**
 
-2. Stattdessen: Für jedes Pixel `BgLayerMask` auswerten und HD-Tiles für
-   ALLE Layer mit Content nachschlagen (`GetMatchingTile()` pro Layer).
+1. **`SnesHdData.h`:** Added `BgMode` + `Mode1Bg3Priority` fields to
+   `SnesHdScanlineInfo` (Phase 1 extension needed for Phase 2 priority sorting).
 
-3. Die gefundenen HD-Tiles in SNES-Prioritätsreihenfolge compositen:
-   - Mode 1 Prioritätsreihenfolge (von hinten nach vorne):
-     BG3 prio=0, BG2 prio=0, BG1 prio=0, BG3 prio=1 (wenn Mode1Bg3Priority),
-     Sprites (je nach OAM Priority 0-3), BG2 prio=1, BG1 prio=1
-   - Jede Schicht wird mit Alpha-Blending über die darunter liegenden gelegt
-   - Transparente HD-Pixel → Layer wird übersprungen
+2. **`SnesPpu.cpp`:** Two new lines in scanline snapshot block (~line 929-930)
+   populating `sl.BgMode` and `sl.Mode1Bg3Priority`.
 
-4. Fallback: Wenn kein HD-Tile für einen Layer gefunden wird, den nativen
-   SNES-Pixel (`MainScreenColor`) verwenden oder Layer überspringen.
+3. **`SnesHdVideoFilter.cpp`:** Complete rewrite of `ApplyFilter()`:
+   - **Multi-layer lookup** (~line 182-250): Iterates `BgLayerMask`, calls
+     `GetMatchingTile()` for ALL layers with content (not just winner).
+     BG1↔BG2 layer retry kept (structural, not heuristic).
+   - **Priority sorting** (~line 258-295): Sorts found HD layers by SNES Mode 1
+     priority order (back-to-front). Uses `BgMode` + `Mode1Bg3Priority` +
+     per-tile priority bit from tilemap data.
+   - **Back-to-front compositing** (~line 300-340): Native PPU pixel as base,
+     then HD layers composite over it with alpha blending.
+   - **Diagnostics:** Removed ~15 old heuristic counters. Added `frameMultiLayer`,
+     `frameHdLayers[4]`. Build version `P2.0`.
 
-5. **Noch KEINE Color Math in Phase 2** — nur die korrekte Schichtung.
-   Color Math kommt in Phase 3.
+4. **Removed code:**
+   - `bg3FogBlend` / `bg3FogSkip` / `frameBg3FogSkip`
+   - `bg1OverlayBlend` / `bg1OverlayWinner`
+   - `colorMathDelta` / `colorMathRatio`
+   - `bg3BgFallback` / `frameHasBg1ColorMath`
+   - All old diagnostic counters for these paths
 
-**Dateien:** `SnesHdVideoFilter.cpp`, `SnesHdVideoFilter.h`
+**Known limitation:** If a low-priority layer has an HD tile but the high-priority
+winner doesn't, the HD tile may show through where it shouldn't. In practice this
+is rare due to BG1↔BG2 layer retry.
 
-**Risiko:** Mittel — die Prioritätsreihenfolge muss exakt stimmen, sonst
-erscheinen Layer in falscher Reihenfolge (z.B. Terrain vor Hintergrund).
+**Build version:** `P2.0`
 
-**Testfälle:**
-- Beehive-Level: BG2 (Terrain) muss über BG3 (Hintergrund) liegen
-- Mainbrace Mayhem: BG1 (Masten/Taue) über BG2 (Deck)
-- Normales Level ohne Color Math: identische Ausgabe wie M5.19
-
-### Phase 3: HD Color Math
+### Phase 3: HD Color Math (NEXT)
 
 Re-implement `ApplyColorMathToPixel()` logic but operating on HD-resolution
 ARGB8888 pixels instead of native BGR555. Uses `ScanlineInfo` to determine:
@@ -649,10 +653,10 @@ Remove old special-case paths and update diagnostics.
 
 | File | Phase | Change |
 |------|-------|--------|
-| `Core/SNES/HdPacks/SnesHdData.h` | 1 | `SnesHdScanlineInfo` struct, `ScanlineInfo[]` in `SnesHdScreenInfo` |
-| `Core/SNES/SnesPpu.cpp` | 1 | Scanline snapshot + memset clearing |
-| `Core/SNES/HdPacks/SnesHdVideoFilter.cpp` | 2-5 | `ApplyFilter()` rewrite |
-| `Core/SNES/HdPacks/SnesHdVideoFilter.h` | 2-5 | New helper methods |
+| `Core/SNES/HdPacks/SnesHdData.h` | 1+2 | `SnesHdScanlineInfo` struct + `BgMode`/`Mode1Bg3Priority` fields |
+| `Core/SNES/SnesPpu.cpp` | 1+2 | Scanline snapshot + memset clearing + BgMode/Mode1Bg3Priority |
+| `Core/SNES/HdPacks/SnesHdVideoFilter.cpp` | 2-5 | `ApplyFilter()` rewrite (Phase 2 DONE) |
+| `Core/SNES/HdPacks/SnesHdVideoFilter.h` | 3-5 | New helper methods (Phase 3+) |
 
 ---
 
@@ -671,34 +675,36 @@ Remove old special-case paths and update diagnostics.
 
 ## Checkliste: Nächste Session
 
-### Sofort nach Build-Test (Phase 1d)
+### Phase 2: Build + Test (JETZT)
 
-- [ ] Branch `feature/hd-compositing-engine` pullen
 - [ ] In Visual Studio bauen (Windows, x64, Debug oder Release)
 - [ ] Erwartung: Kompiliert ohne Fehler/Warnings in den 3 geänderten Dateien
-- [ ] DKC2 starten, beliebiges Level laden
-- [ ] Erwartung: Identisches Verhalten wie M5.19 (kein sichtbarer Unterschied)
+- [ ] DKC2 starten, **Pirate Panic** (normales Level, kein Color Math)
+- [ ] Erwartung: Identisch zu M5.19 — BG1+BG2 HD, BG3 Taue nativ sichtbar
+- [ ] DKC2, **Mainbrace Mayhem** (fog level)
+- [ ] Erwartung: Layering korrekt, aber Fog-Effekt FEHLT (expected regression)
+- [ ] DKC2, **Rambi Rumble** (beehive/honey level)
+- [ ] Erwartung: BG2 Terrain über BG3, Honey-Overlay FEHLT (expected regression)
+- [ ] DKC2, **Hot-Head Hop** (lava level)
+- [ ] Erwartung: BG1 HD sichtbar, Lava-Glow FEHLT (expected regression)
 - [ ] Wenn Build oder Laufzeit-Fehler: hier dokumentieren, dann fixen
+- [ ] Git commit nach erfolgreichem Test
 
-### Phase 2 starten (nach erfolgreichem Build-Test)
+### Phase 2 → Phase 3 Übergang
 
-- [ ] `SnesHdVideoFilter.cpp` analysieren: aktuellen ApplyFilter()-Flow verstehen
-- [ ] Identifizieren wo aktuell `BgWinnerLayer` → `GetMatchingTile()` passiert
-- [ ] Multi-Layer-Lookup implementieren (alle Layer aus `BgLayerMask`)
-- [ ] SNES Mode 1 Prioritätsreihenfolge korrekt abbilden
-- [ ] Testen: Level ohne Color Math (z.B. Pirate Panic) muss identisch aussehen
-- [ ] Testen: Beehive-Level — BG2-Terrain über BG3-Hintergrund korrekt geschichtet
+- [ ] Phase 2 commit erstellen
+- [ ] Phase 3 starten: `ApplyHdColorMath()` Hilfsfunktion implementieren
+- [ ] Color Math auf HD ARGB8888 Pixel anwenden (ADD/SUB/HALF)
+- [ ] FixedColor (BGR555→ARGB8888) als zweiten Operanden verwenden
+- [ ] Sub-Screen als alternativen zweiten Operanden unterstützen
+- [ ] Testen: alle 6 ppuConfig-Typen ($03, $24, $29, $2C, $31, $35)
 
 ### Offene Punkte (nicht vergessen)
 
-- [ ] M5.19 Test-Verifikation: Beehive-Level auf Master-Branch wurde noch nicht
-      final getestet (Build lief, aber User hatte noch nicht verifiziert)
-- [ ] Gusty Glade Datenanalyse: Log-Datei mit Daten liegt vor
-      (`snes_hd_diag MM abends und hony.txt`, 54488 Zeilen), wurde noch nicht
-      ausgewertet — wird durch neue Engine möglicherweise obsolet
 - [ ] DEBUG_JOURNAL Issues J, K, M, N, P: Status prüfen nach Phase 3/4
 - [ ] 14 alte .ps1 Temp-Scripts im Repo-Root aufräumen (Phase 5)
 - [ ] Viewer: `cmFg`-Hack entfernen nach Phase 5
+- [ ] Performance-Optimierung (Tile-Level Caching) — nach Phase 5
 
 ### Wichtige Referenzen
 
@@ -706,7 +712,7 @@ Remove old special-case paths and update diagnostics.
   (`ApplyColorMathToPixel()`) — Referenz für Phase 3 HD-Reimplementierung
 - **PPU Window Evaluation:** `SnesPpuTypes.h` Zeile 108-124
   (`WindowConfig::PixelNeedsMasking()`) — Referenz für Phase 4
-- **Aktueller HD Filter:** `SnesHdVideoFilter.cpp` ~947 Zeilen —
-  `ApplyFilter()` ist die Hauptfunktion die in Phase 2-4 umgebaut wird
+- **Phase 2 HD Filter:** `SnesHdVideoFilter.cpp` ~320 Zeilen —
+  `ApplyFilter()` komplett neu geschrieben (Phase 2). Build version `P2.0`.
 - **Tag für Rollback:** `v0.1-sonderfall-m5.19` — falls die neue Engine
   Probleme macht, kann jederzeit auf den alten Ansatz zurückgewechselt werden

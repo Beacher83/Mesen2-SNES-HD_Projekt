@@ -7,18 +7,17 @@
 #include "Shared/ColorUtilities.h"
 #include "Shared/MessageManager.h"
 #include <unordered_set>
-#include <algorithm>  // std::clamp (for color math delta clamping)
-#include <cstdlib>    // getenv (for DiagLog file path)
+#include <algorithm>
+#include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-// Increment this on every push to catch stale-build issues.
-#define SNES_HD_BUILD_VERSION "M5.19"
+#define SNES_HD_BUILD_VERSION "P2.0"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
 // File is created once per session at %USERPROFILE%\Downloads\snes_hd_diag.txt
 // (or $HOME/Downloads/ on non-Windows). Flushed after every write so crash
-// won't lose data. The user can open the file after the session.
+// won't lose data.
 // ---------------------------------------------------------------------------
 static void DiagLog(const char* msg)
 {
@@ -93,8 +92,6 @@ void SnesHdVideoFilter::OnBeforeApplyFilter()
 
 FrameInfo SnesHdVideoFilter::GetFrameInfo()
 {
-	// Output is scaled by HD pack scale factor
-	// Base SNES resolution: 256x239 (no overscan adjustments for now)
 	OverscanDimensions overscan = GetOverscan();
 	uint32_t baseWidth = 256;
 	uint32_t baseHeight = 239;
@@ -110,6 +107,21 @@ OverscanDimensions SnesHdVideoFilter::GetOverscan()
 	return BaseVideoFilter::GetOverscan();
 }
 
+// =========================================================================
+// Phase 2: Multi-Layer HD Compositing Engine
+// =========================================================================
+// Replaces the M5.19 heuristic cascade (fog-blend, overlay-blend,
+// colorMathDelta, bg3-fallback) with a general-purpose multi-layer approach:
+//
+//   1. Look up HD tiles for ALL layers that have content (BgLayerMask)
+//   2. Sort by SNES Mode 1 priority (back to front)
+//   3. Composite HD tiles over native PPU pixel as base
+//
+// Color math is NOT applied in Phase 2 — that's Phase 3.
+// Levels with fog/honey/lava effects will look different (effects missing)
+// until Phase 3 adds register-based color math using ScanlineInfo.
+// =========================================================================
+
 void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 {
 	if(_frameData == nullptr) {
@@ -121,57 +133,36 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	FrameInfo frameInfo = _frameInfo;
 	OverscanDimensions overscan = GetOverscan();
 
-	// DISABLED (Phase 1 fix): DetectActiveGfxset() is fundamentally broken for
-	// DKC2 because VBlank DMA overwrites the VRAM regions where fingerprint
-	// reference tiles were stored (pre-DMA snapshot). Result: ActiveGfxset is
-	// always -1, blocking all gfxset-scoped HD tiles.
-	// The corresponding scoping check in GetMatchingTile() is also disabled.
-	// See SnesHdData.h for full explanation.
-	//
-	// _hdData->DetectActiveGfxset(hdScreen->Vram);
-
 	uint32_t hdScale = _hdScale;
 	uint32_t baseWidth = 256;
-	
+
 	// The PPU output buffer width depends on hi-res mode
 	uint32_t ppuWidth = _baseFrameInfo.Width;
 	bool isHiRes = (ppuWidth == 512);
 
 	// =====================================================================
 	// DIAGNOSTIC: Context-aware logging with VRAM-based level/worldmap detection
-	// =========================================================================
-	// Reference tiles (stable, outside VBlank DMA range 0x2000-0x21D0):
-	//   gfxset_37 (Level 2): VRAM 0x32E0 → hash 0x1585855B0633F405
-	//   gfxset_07 (Level 1): VRAM 0x2080 → hash 0xF33C58BA8611DF5D
-	// Combined vramSig = sigA ^ (sigB << 1) — unique per screen context.
-	// Worldmap: stable sig 0xDBF342F9932FD251 (verified across multiple sessions).
-	// =========================================================================
-
+	// =====================================================================
 	static uint64_t diagPrevVramSig = 0;
-	static int diagFrameCount = 0;     // all frames (incl. loading, limit 10)
-	static int diagBgFrameCount = 0;   // gameplay frames only (bg>0, limit 60)
+	static int diagFrameCount = 0;
+	static int diagBgFrameCount = 0;
 	static int diagMissCount = 0;
-	static int diagPalMismatchCount = 0;
-	static int diagLayerMismatchCount = 0;
 	static int diagMatchCount = 0;
-	static int diagPalFallbackCount = 0;
-	static int diagDetailCount = 0;
 	static std::unordered_set<uint64_t> diagLoggedHashes;
-	static int diagBg3WinSampleCount = 0;  // M5.15: log first few BG3-winning pixel details
 
 	// Compute VRAM context signature from two stable reference tiles
 	uint64_t sigA = 0, sigB = 0;
 	bool isLevel2 = false;
 	bool isWorldmap = false;
 	if(hdScreen->Vram) {
-		sigA = ComputeTileContentHash(hdScreen->Vram, 0x32E0);  // gfxset_37 ref tile
-		sigB = ComputeTileContentHash(hdScreen->Vram, 0x2080);  // gfxset_07 ref tile
-		isLevel2  = (sigA == 0x1585855B0633F405ULL);
+		sigA = ComputeTileContentHash(hdScreen->Vram, 0x32E0);
+		sigB = ComputeTileContentHash(hdScreen->Vram, 0x2080);
+		isLevel2 = (sigA == 0x1585855B0633F405ULL);
 	}
 	uint64_t vramSig = sigA ^ (sigB << 1);
 	isWorldmap = (vramSig == 0xDBF342F9932FD251ULL);
 
-	// Detect context change (level transition) → reset all diagnostic counters
+	// Detect context change (level transition) → reset diagnostic counters
 	if(vramSig != diagPrevVramSig && diagPrevVramSig != 0) {
 		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
 		char buf[256];
@@ -182,46 +173,35 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagFrameCount = 0;
 		diagBgFrameCount = 0;
 		diagMissCount = 0;
-		diagPalMismatchCount = 0;
-		diagLayerMismatchCount = 0;
 		diagMatchCount = 0;
-		diagPalFallbackCount = 0;
-		diagDetailCount = 0;
 		diagLoggedHashes.clear();
-		diagBg3WinSampleCount = 0;
 	}
 	diagPrevVramSig = vramSig;
 
-	// Per-frame counters (reset each frame, not static)
+	// Per-frame counters
+	uint32_t frameTotalPixels = 0;
 	uint32_t frameBgPixels = 0;
-	uint32_t frameHdMatch = 0;
-	uint32_t frameHdMiss = 0;
-	uint32_t framePalMismatch = 0;
-	uint32_t frameLayerMismatch = 0;
-	uint32_t frameNotInPack = 0;           // Hashes not found with ANY pal×layer combo
-	uint32_t frameBg1MissPixels = 0;       // BG1 miss pixel count
-	uint32_t frameBg1NotInPack = 0;        // BG1 unique hashes not in pack at all
-	uint32_t frameFallback = 0;
-	uint32_t frameBg3FogBlend = 0;         // BG3 fog + color math → HD BG1 rendered with fog blend
-	uint32_t frameBg3FogNative = 0;        // BG3 fog won → native pixel preserved (no fallback)
-	uint32_t frameColorMathDelta = 0;      // HD pixels with color math delta applied (M5.11)
-	uint32_t frameBg3BgFallback = 0;       // BG3 bg won w/o colorMath → BG1 HD rendered plain (M5.12 Issue H)
-	uint32_t frameLayerRetry = 0;          // BG1↔BG2 layer-agnostic retry matches (M5.13 Issue H)
-	uint32_t frameBg1OverlayBlend = 0;     // BG1 overlay-blend: HD terrain under honey/overlay (M5.16 Issue O)
-	uint32_t frameBg1OvBg2 = 0;            // M5.19: overlay-blend found BG2 terrain tile
-	uint32_t frameBg1OvBg3 = 0;            // M5.19: overlay-blend found BG3 background tile (fallback)
-	uint32_t frameBg1OvMiss = 0;           // M5.19: overlay-blend found neither BG2 nor BG3
-	uint32_t frameBg3FogSkip = 0;          // BG3 fog winner: HD tile lookup skipped, deferred to step 3 (M5.17 Issue L)
-	bool frameHasBg1ColorMath = false;     // Any BG1-winning pixel had AllowColorMath this frame (M5.12)
-	uint32_t frameSpriteWon = 0;           // Pixels where sprite won (HD BG skipped)
-	uint32_t frameMaskZero = 0;            // Non-sprite pixels with BgLayerMask == 0
-	uint32_t frameLayerBits[4] = {};       // Per-layer pixel counts (bit N set in mask)
-	uint32_t frameTotalPixels = 0;         // Total pixels iterated
-	uint32_t frameWin[4] = {};             // Per-layer: pixels where layer N wins compositing (M5.15)
-	uint32_t frameWinACM[4] = {};          // Per-layer: winner pixels with AllowColorMath flag (M5.15)
+	uint32_t frameHdMatch = 0;       // pixels where at least one HD tile found
+	uint32_t frameHdMiss = 0;        // BG pixels where NO HD tile found for any layer
+	uint32_t frameMultiLayer = 0;    // pixels where >1 HD tile found (multi-layer compositing)
+	uint32_t frameLayerRetry = 0;    // BG1↔BG2 layer-agnostic retry matches
+	uint32_t frameSpriteWon = 0;     // pixels where sprite won (HD BG skipped)
+	uint32_t frameMaskZero = 0;      // non-sprite pixels with BgLayerMask == 0
+	uint32_t frameLayerBits[4] = {}; // per-layer: pixels where layer has content
+	uint32_t frameWin[4] = {};       // per-layer: pixels where layer wins compositing
+	uint32_t frameHdLayers[4] = {};  // per-layer: HD tile found count
 
-	// For each pixel in the original SNES frame (always 256x239 for HD info)
+	// =====================================================================
+	// Main pixel loop
+	// =====================================================================
 	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
+
+		// Per-scanline: read Mode1Bg3Priority from ScanlineInfo
+		bool mode1Bg3Prio = false;
+		if(y < SnesHdScreenInfo::ScreenHeight) {
+			mode1Bg3Prio = hdScreen->ScanlineInfo[y].Mode1Bg3Priority;
+		}
+
 		for(uint32_t x = overscan.Left; x < baseWidth - overscan.Right; x++) {
 			uint32_t srcIndex = y * SnesHdScreenInfo::ScreenWidth + x;
 			SnesHdPpuPixelInfo& pixelInfo = hdScreen->ScreenTiles[srcIndex];
@@ -231,656 +211,225 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 			frameTotalPixels++;
 
-			// -----------------------------------------------------------------
-			// Multi-layer HD tile lookup with fallback
-			// -----------------------------------------------------------------
-			// BgLayerMask is a bitmask of which BG layers have non-transparent
-			// tiles at this pixel. BgWinnerLayer is the compositing winner.
-			// Strategy: try the winner layer first. If no HD tile exists for
-			// the winner, try other layers (e.g. BG1 under BG3 fog in DKC2).
-			SnesHdPackTileInfo* hdTile = nullptr;
-			SnesHdPpuTileInfo* tileInfo = nullptr;
-			bool usedFallbackLayer = false;
-			bool bg3FogBlend = false;  // true when rendering HD BG1 under semi-transparent BG3 fog
-			bool bg1OverlayBlend = false;  // true when rendering HD BG2 under semi-transparent BG1 overlay (honey, M5.16)
-			int fallbackStopLayer = -1;  // Which layer stopped the fallback loop (for miss diagnostics)
-
-			// Only attempt HD BG tile replacement when:
-			// 1) At least one BG layer has a non-transparent tile at this pixel
-			// 2) A sprite did NOT win compositing
-			// 3) We are NOT on the Worldmap — Worldmap tiles are unique to that
-			//    context but share gfxset_7 CHR data with Level 1, causing false
-			//    matches. Gate off entirely so native rendering is always used there.
-			// Two cases for sprite: wins main screen (IsSpritePixel in MainScreenFlags),
-			// or wins sub-screen only (SubScreenHasSprite). In DKC2 Level 2,
-			// BG3 fog wins main screen while sprites contribute via color math from
-			// sub-screen — IsSpritePixel is never set there, but SubScreenHasSprite is.
+			// Sprite detection: sprite won main screen or sub-screen
 			bool spriteWon = (pixelInfo.MainScreenFlags & 0x40) != 0 || pixelInfo.SubScreenHasSprite;
-
-			// Track pixel classification for diagnostics
 			if(spriteWon) {
 				frameSpriteWon++;
 			} else if(pixelInfo.BgLayerMask == 0) {
 				frameMaskZero++;
 			}
 
+			// =============================================================
+			// Phase 2: Multi-layer HD tile lookup
+			// =============================================================
+			// Look up HD tiles for ALL layers that have content.
+			// No heuristics — just check every layer in BgLayerMask.
+			// BG1↔BG2 layer retry is structural (not a heuristic): it
+			// handles genuine layer index mismatches between HD pack export
+			// and runtime PPU layer assignment.
+
+			SnesHdPackTileInfo* layerHdTiles[4] = {};
+			SnesHdPpuTileInfo* layerTileInfos[4] = {};
+			int layerHdCount = 0;
+
 			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
 				frameBgPixels++;
 
-				// Count which layers are present at BG pixels
+				uint8_t winLayer = pixelInfo.BgWinnerLayer;
+				if(winLayer < 4) frameWin[winLayer]++;
+
 				for(int li = 0; li < 4; li++) {
-					if(pixelInfo.BgLayerMask & (1 << li)) frameLayerBits[li]++;
-				}
+					if(!(pixelInfo.BgLayerMask & (1 << li))) continue;
+					frameLayerBits[li]++;
 
-		// 1) Try the compositing winner first
-			uint8_t winLayer = pixelInfo.BgWinnerLayer;
+					layerHdTiles[li] = _hdData->GetMatchingTile(
+						pixelInfo.BgTiles[li].Key, hdScreen->Vram);
 
-				// M5.15: Track per-layer winner counts and AllowColorMath
-				if(winLayer < 4) {
-					frameWin[winLayer]++;
-					if(pixelInfo.MainScreenFlags & 0x80) frameWinACM[winLayer]++;
-				}
-
-				// M5.15: Log first 3 BG3-winning pixel details per context
-				if(winLayer == 2 && diagBg3WinSampleCount < 3) {
-					char buf[384];
-					snprintf(buf, sizeof(buf),
-						"[SNES HD diag] BG3WIN sample: MSFlags=0x%02X MSColor=0x%04X ppuOut=0x%04X "
-						"mask=0x%02X win=%d bg3hash=%016llX bg3pal=%d bg3layer=%d bg3vram=0x%04X "
-						"x=%u y=%u",
-						pixelInfo.MainScreenFlags,
-						pixelInfo.MainScreenColor & 0x7FFF,
-						ppuOutputBuffer[ppuIndex] & 0x7FFF,
-						pixelInfo.BgLayerMask,
-						winLayer,
-						(unsigned long long)pixelInfo.BgTiles[2].Key.ContentHash,
-						pixelInfo.BgTiles[2].Key.PaletteIndex,
-						pixelInfo.BgTiles[2].Key.LayerIndex,
-						pixelInfo.BgTiles[2].VramWordAddr,
-						x, y);
-					DiagLog(buf);
-					diagBg3WinSampleCount++;
-				}
-
-			// Track if BG1 ever wins with color math this frame (M5.12 Issue H).
-				// In HDMA-animated levels (Hot-Head Hop), BG1 has AllowColorMath on
-				// upper scanlines. This flag enables the BG3-background fallback
-				// path on lower scanlines where BG3 wins without color math.
-				if(winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)) {
-					frameHasBg1ColorMath = true;
-				}
-
-			if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
-				// M5.17 Issue L: Skip BG3 winner HD tile lookup when AllowColorMath
-				// is set (fog/overlay). BG3 fog HD tiles would render opaquely and
-				// block terrain underneath. Defer to step 3 (bg3FogBlend) which
-				// finds BG1/BG2 terrain HD tiles and renders with fog tint.
-				bool bg3FogWinner = (winLayer == 2 && (pixelInfo.MainScreenFlags & 0x80));
-				if(!bg3FogWinner) {
-					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
-					if(hdTile) {
-						tileInfo = &pixelInfo.BgTiles[winLayer];
+					// BG1↔BG2 layer retry: same tile content may be exported
+					// as layer 0 but appear on layer 1 at runtime (or vice versa).
+					// Safe because BG1 and BG2 are both 4bpp in Mode 1.
+					if(!layerHdTiles[li] && (li == 0 || li == 1)) {
+						SnesHdTileKey altKey = pixelInfo.BgTiles[li].Key;
+						altKey.LayerIndex = (li == 0) ? 1 : 0;
+						layerHdTiles[li] = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+						if(layerHdTiles[li]) frameLayerRetry++;
 					}
-				} else {
-					frameBg3FogSkip++;
-				}
-			}
 
-			// 1b) Layer-agnostic retry for 4bpp layers (BG1↔BG2 in Mode 1).
-			//     In DKC2, identical tile content can appear on BG1 in one
-			//     screen area and BG2 in another (e.g. Hot-Head Hop: upper
-			//     area uses BG1, lower area uses BG2 for the same graphics).
-			//     The HD pack exports each tile with a fixed layer index.
-			//     When the runtime winner layer differs, retry with the
-			//     other 4bpp layer's index.
-			//     Safe: BG1 and BG2 are both 4bpp in Mode 1 — same tile
-			//     data + same palette = identical visuals.
-			//     BG3 (2bpp) is excluded from interchange.
-			if(!hdTile && (winLayer == 0 || winLayer == 1)) {
-				SnesHdTileKey altKey = pixelInfo.BgTiles[winLayer].Key;
-				altKey.LayerIndex = (winLayer == 0) ? 1 : 0;
-				hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-				if(hdTile) {
-					tileInfo = &pixelInfo.BgTiles[winLayer];
-					frameLayerRetry++;
-				}
-			}
-
-			// 1c) BG1 overlay detection (M5.16, Issue O; refined M5.19):
-			//     BG1 won compositing WITH AllowColorMath but has no HD tile.
-			//     This indicates a semi-transparent foreground overlay (e.g. honey
-			//     in DKC2 beehive levels: Rambi Rumble, Hornet Hole, Parrot Chute
-			//     Panic, King Zing Sting — all ppuConfig $03).
-			//     Skip the generic fallback (step 2) because applyColorMathDelta
-			//     uses wrong math for overlay-under-terrain rendering.
-			//     Step 3b handles this with proper overlay blending.
-			//     M5.19: Use frameBg3FogSkip instead of BgLayerMask & 0x04 to
-			//     distinguish overlay from fog-gap terrain.
-			//     - Beehive: frameBg3FogSkip==0 (no fog at all) → overlay ✓
-			//     - Mainbrace: frameBg3FogSkip>0 (fog present) → not overlay ✓
-			//     The M5.17 mask & 0x04 check was too restrictive: BG3 only
-			//     covers ~56% of beehive pixels, so 44% missed overlay blend.
-			bool bg1OverlayWinner = (!hdTile && winLayer == 0 && (pixelInfo.MainScreenFlags & 0x80)
-			                         && frameBg3FogSkip == 0);
-
-			// 2) Fallback: try other layers if winner has no HD tile
-				//    GATE: Skip fallback when BG3 (layer 2) wins compositing
-				//    WITHOUT color math (opaque foreground — Issue A fix).
-				//    Also skip when BG1 overlay is detected (bg1OverlayWinner) —
-				//    step 3b provides proper blend rendering for that case.
-			if(!hdTile && winLayer != 2 && !bg1OverlayWinner) {
-				for(int i = 0; i < 4; i++) {
-					if(i == (int)winLayer) continue;
-					if(pixelInfo.BgLayerMask & (1 << i)) {
-			hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[i].Key, hdScreen->Vram);
-						// NOTE (M5.14): Layer retry REMOVED from fallback loop.
-						// M5.13 added BG1↔BG2 retry here, but this caused a
-						// regression: when BG2's DMA-animated bubble tile had no
-						// match, the fallback tried BG1 with layer retry and found
-						// BG1's static HD tile — rendering BG1 content instead of
-						// native DMA bubbles. This created visible "holes" in the
-						// lava where the level background showed through.
-						// Layer retry remains in step 1b (winner tile only).
-						// To restore: uncomment the 4 lines below.
-						// if(!hdTile && (i == 0 || i == 1)) {
-						// 	SnesHdTileKey altKey = pixelInfo.BgTiles[i].Key;
-						// 	altKey.LayerIndex = (i == 0) ? 1 : 0;
-						// 	hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-						// 	if(hdTile) frameLayerRetry++;
-						// }
-						if(hdTile) {
-								tileInfo = &pixelInfo.BgTiles[i];
-								usedFallbackLayer = true;
-							} else {
-								fallbackStopLayer = i;  // Track for miss diagnostics
-							}
-							// Stop here: this layer has data. Either we found
-							// an HD tile and will use it, or we didn't and the
-							// pixel should fall through to native rendering.
-							// Continuing would let a lower-priority layer's HD
-							// tile incorrectly cover this pixel.
-							break;
-						}
+					if(layerHdTiles[li]) {
+						layerTileInfos[li] = &pixelInfo.BgTiles[li];
+						layerHdCount++;
+						frameHdLayers[li]++;
 					}
 				}
 
-				// 3) BG3 fog-blend path: BG3 won compositing WITH color math
-				//    (semi-transparent effect like fog/honey/water in DKC2).
-				//    Try to find an HD tile on BG1 or BG2 underneath and render
-				//    it with the BG3 color blended on top (replicating color math).
-			if(!hdTile && winLayer == 2 && (pixelInfo.MainScreenFlags & 0x80)) {
-				// Try BG1 (layer 0) first — highest priority background
-				if(pixelInfo.BgLayerMask & 0x01) {
-					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
-					// Layer retry: try with BG2's layer index (M5.13)
-					if(!hdTile) {
-						SnesHdTileKey altKey = pixelInfo.BgTiles[0].Key;
-						altKey.LayerIndex = 1;
-						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-						if(hdTile) frameLayerRetry++;
-					}
-					if(hdTile) {
-						tileInfo = &pixelInfo.BgTiles[0];
-						bg3FogBlend = true;
-					}
-				}
-				// If no BG1 HD tile, try BG2 (layer 1) — parallax background
-				if(!hdTile && (pixelInfo.BgLayerMask & 0x02)) {
-					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[1].Key, hdScreen->Vram);
-					// Layer retry: try with BG1's layer index (M5.13)
-					if(!hdTile) {
-						SnesHdTileKey altKey = pixelInfo.BgTiles[1].Key;
-						altKey.LayerIndex = 0;
-						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-						if(hdTile) frameLayerRetry++;
-					}
-					if(hdTile) {
-						tileInfo = &pixelInfo.BgTiles[1];
-						bg3FogBlend = true;
-					}
-				}
-			}
-
-			// 3b) BG1 overlay-blend path (M5.16, Issue O):
-			//     BG1 won compositing WITH AllowColorMath but has no HD tile.
-			//     This is a semi-transparent foreground overlay (honey in DKC2
-			//     beehive levels: Rambi Rumble, Hornet Hole, Parrot Chute Panic,
-			//     King Zing Sting — all ppuConfig $03).
-			//     BG2 carries the actual terrain underneath.  Find the BG2 HD tile
-			//     and render it with BG1's overlay color blended on top — same
-			//     approach as BG3 fog-blend (80% HD + 20% overlay color).
-			//     MainScreenColor holds the raw BG1 overlay pixel color (pre-math),
-			//     which serves as the tint, just like fog color in step 3.
-			if(!hdTile && bg1OverlayWinner) {
-				// Try BG2 (layer 1) first — terrain under honey overlay
-				if(pixelInfo.BgLayerMask & 0x02) {
-					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[1].Key, hdScreen->Vram);
-					// Layer retry: try with BG1's layer index (terrain tiles may be
-					// exported as layer 0 from other levels where the same gfxset
-					// renders terrain on BG1 instead of BG2)
-					if(!hdTile) {
-						SnesHdTileKey altKey = pixelInfo.BgTiles[1].Key;
-						altKey.LayerIndex = 0;
-						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-						if(hdTile) frameLayerRetry++;
-					}
-					if(hdTile) {
-						tileInfo = &pixelInfo.BgTiles[1];
-						bg1OverlayBlend = true;
-						frameBg1OvBg2++;
-					}
-				}
-				// If no BG2 match, try BG3 (layer 2) — background
-				if(!hdTile && (pixelInfo.BgLayerMask & 0x04)) {
-					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[2].Key, hdScreen->Vram);
-					if(hdTile) {
-						tileInfo = &pixelInfo.BgTiles[2];
-						bg1OverlayBlend = true;
-						frameBg1OvBg3++;
-					}
-				}
-				// M5.19 diag: track overlay-eligible pixels that found nothing
-				if(!hdTile) {
-					frameBg1OvMiss++;
-				}
-			}
-
-				// 4) BG3 background fallback (Issue H, M5.12):
-				//    BG3 won compositing WITHOUT color math on this scanline, but
-				//    earlier scanlines showed BG1 WITH color math — indicating
-				//    HDMA-animated color math (e.g. Hot-Head Hop lava glow).
-				//    BG3 here is a background layer, not meaningful foreground.
-				//    Fall back to BG1/BG2 HD tile and render plain (no fog tint).
-				//    Safety: frameHasBg1ColorMath is only true when BG1 actually
-				//    won compositing with AllowColorMath set. Levels where BG1
-				//    never has color math (Pirate Panic $2131=02, Level 2 fog
-				//    $2131=44) are completely unaffected.
-			if(!hdTile && winLayer == 2 && !(pixelInfo.MainScreenFlags & 0x80)
-			   && frameHasBg1ColorMath) {
-				// Try BG1 (layer 0) first
-				if(pixelInfo.BgLayerMask & 0x01) {
-					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[0].Key, hdScreen->Vram);
-					// Layer retry: try with BG2's layer index (M5.13)
-					if(!hdTile) {
-						SnesHdTileKey altKey = pixelInfo.BgTiles[0].Key;
-						altKey.LayerIndex = 1;
-						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-						if(hdTile) frameLayerRetry++;
-					}
-					if(hdTile) {
-						tileInfo = &pixelInfo.BgTiles[0];
-						frameBg3BgFallback++;
-					}
-				}
-				// If no BG1, try BG2 (layer 1)
-				if(!hdTile && (pixelInfo.BgLayerMask & 0x02)) {
-					hdTile = _hdData->GetMatchingTile(pixelInfo.BgTiles[1].Key, hdScreen->Vram);
-					// Layer retry: try with BG1's layer index (M5.13)
-					if(!hdTile) {
-						SnesHdTileKey altKey = pixelInfo.BgTiles[1].Key;
-						altKey.LayerIndex = 0;
-						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-						if(hdTile) frameLayerRetry++;
-					}
-					if(hdTile) {
-						tileInfo = &pixelInfo.BgTiles[1];
-						frameBg3BgFallback++;
-					}
-				}
-			}
-
-				if(hdTile) {
+				if(layerHdCount > 0) {
 					frameHdMatch++;
-					if(usedFallbackLayer) {
-						frameFallback++;
-					}
-				if(bg3FogBlend) {
-					frameBg3FogBlend++;
-				}
-				if(bg1OverlayBlend) {
-					frameBg1OverlayBlend++;
-				}
-				// Track color math delta application (M5.11)
-				if(!bg3FogBlend && !bg1OverlayBlend && (pixelInfo.MainScreenFlags & 0x80)) {
-						uint16_t pre = pixelInfo.MainScreenColor & 0x7FFF;
-						uint16_t post = ppuOutputBuffer[ppuIndex] & 0x7FFF;
-						if(pre != post) {
-							frameColorMathDelta++;
-						}
-					}
+					if(layerHdCount > 1) frameMultiLayer++;
 
-					// DIAGNOSTIC: Log first 5 unique MATCHES
+					// DIAGNOSTIC: Log first 5 unique matches per context
 					if(diagMatchCount < 5) {
-						auto& key = tileInfo->Key;
-						if(key.ContentHash != 0 && diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
-							diagLoggedHashes.insert(key.ContentHash);
-							char buf[320];
-							{
+						for(int li = 0; li < 4; li++) {
+							if(!layerHdTiles[li]) continue;
+							auto& key = pixelInfo.BgTiles[li].Key;
+							if(key.ContentHash != 0
+								&& diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
+								diagLoggedHashes.insert(key.ContentHash);
+								char buf[320];
 								snprintf(buf, sizeof(buf),
-								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d%s%s%s",
-								(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex,
-								usedFallbackLayer ? " (FALLBACK)" : "",
-								bg3FogBlend ? " (FOG-BLEND)" : "",
-								bg1OverlayBlend ? " (OV-BLEND)" : "");
+									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d",
+									(unsigned long long)key.ContentHash, key.PaletteIndex, key.LayerIndex);
 								DiagLog(buf);
-							}
-							diagMatchCount++;
-						}
-					}
-				} else if(winLayer == 2) {
-					// BG3 fog won compositing — no HD tile for fog (expected).
-					// The native composited pixel is correct (contains underlying
-					// BG layers + BG3 fog blend).  Do NOT count as a miss.
-					frameBg3FogNative++;
-				} else {
-					frameHdMiss++;
-
-					// DIAGNOSTIC: Enhanced miss analysis with layer-mismatch and VRAM address
-					//
-					// KEY FIX (M5.5f): When the fallback loop stopped at a layer
-					// (has data but no HD tile), analyze THAT layer's tile info.
-					// Previously we always analyzed the winner layer, which meant
-					// BG3 fog (winner) was checked instead of BG1 (fallback stop).
-					// This made BG1miss always 0 and hid palette mismatches.
-					//
-					// Priority: fallbackStopLayer > winner > first layer with data
-					SnesHdPpuTileInfo* missLayerInfo = nullptr;
-					const char* missSource = "unknown";
-
-					if(fallbackStopLayer >= 0 && fallbackStopLayer < 4) {
-						// Fallback loop stopped at this layer — it's the actual
-						// failing lookup we care about (e.g. BG1 under BG3 fog)
-						missLayerInfo = &pixelInfo.BgTiles[fallbackStopLayer];
-						missSource = "fallback";
-					} else if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
-						// No fallback layers had data — only the winner missed
-						missLayerInfo = &pixelInfo.BgTiles[winLayer];
-						missSource = "winner";
-					} else {
-						for(int mi = 0; mi < 4; mi++) {
-							if(pixelInfo.BgLayerMask & (1 << mi)) {
-								missLayerInfo = &pixelInfo.BgTiles[mi];
-								missSource = "first";
+								diagMatchCount++;
 								break;
 							}
 						}
 					}
+				} else {
+					frameHdMiss++;
 
-					if(missLayerInfo && missLayerInfo->Key.ContentHash != 0) {
-						auto& key = missLayerInfo->Key;
-						bool isBg1Miss = (key.LayerIndex == 0);
-						if(isBg1Miss) frameBg1MissPixels++;
-
-						// Exhaustive search: check all palette × layer combinations
-						bool foundWithOtherPal = false;
-						bool foundWithOtherLayer = false;
-						uint8_t foundPal = 0;
-						uint8_t foundLayer = 0;
-
-						for(int tryLayer = 0; tryLayer < 4; tryLayer++) {
-							for(int tryPal = 0; tryPal < 8; tryPal++) {
-								if(tryPal == key.PaletteIndex && tryLayer == key.LayerIndex) continue;
-								SnesHdTileKey tryKey;
-								tryKey.ContentHash = key.ContentHash;
-								tryKey.PaletteIndex = (uint8_t)tryPal;
-								tryKey.LayerIndex = (uint8_t)tryLayer;
-								auto it = _hdData->TileByKey.find(tryKey);
-								if(it != _hdData->TileByKey.end()) {
-									foundPal = (uint8_t)tryPal;
-									foundLayer = (uint8_t)tryLayer;
-									if(tryPal != key.PaletteIndex) {
-										foundWithOtherPal = true;
-									} else {
-										foundWithOtherLayer = true;
-									}
-									goto foundMatch;
+					// DIAGNOSTIC: Log first 60 unique misses per context
+					if(diagMissCount < 60) {
+						// Analyze winner layer (or first layer with content)
+						SnesHdPpuTileInfo* missInfo = nullptr;
+						if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+							missInfo = &pixelInfo.BgTiles[winLayer];
+						} else {
+							for(int li = 0; li < 4; li++) {
+								if(pixelInfo.BgLayerMask & (1 << li)) {
+									missInfo = &pixelInfo.BgTiles[li];
+									break;
 								}
 							}
 						}
-						foundMatch:
-
-						if(foundWithOtherPal) {
-							framePalMismatch++;
-							if(diagPalMismatchCount < 20) {
-								char buf[320];
-								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] PAL MISMATCH hash=%016llX runtime_pal=%d pack_pal=%d "
-									"runtime_layer=%d pack_layer=%d vram=0x%04X",
-									(unsigned long long)key.ContentHash, key.PaletteIndex, foundPal,
-									key.LayerIndex, foundLayer, missLayerInfo->VramWordAddr);
-								DiagLog(buf);
-								diagPalMismatchCount++;
-							}
-						} else if(foundWithOtherLayer) {
-							frameLayerMismatch++;
-							if(diagLayerMismatchCount < 20) {
-								char buf[320];
-								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] LAYER MISMATCH hash=%016llX pal=%d runtime_layer=%d "
-									"pack_layer=%d vram=0x%04X",
-									(unsigned long long)key.ContentHash, key.PaletteIndex,
-									key.LayerIndex, foundLayer, missLayerInfo->VramWordAddr);
-								DiagLog(buf);
-								diagLayerMismatchCount++;
-							}
-						} else {
-							// Hash not found in pack with ANY key combination
-							frameNotInPack++;
-							if(isBg1Miss) frameBg1NotInPack++;
-
-							if(diagMissCount < 60) {
-								if(diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
-									diagLoggedHashes.insert(key.ContentHash);
-									bool inDmaRange = (missLayerInfo->VramWordAddr >= 0x2000
-										&& missLayerInfo->VramWordAddr <= 0x21D0);
-									char buf[512];
-									snprintf(buf, sizeof(buf),
-										"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d vram=0x%04X%s "
-										"mask=0x%02X win=%d src=%s",
-										(unsigned long long)key.ContentHash, key.PaletteIndex,
-										key.LayerIndex, missLayerInfo->VramWordAddr,
-										inDmaRange ? " [DMA_RANGE]" : "",
-										pixelInfo.BgLayerMask, pixelInfo.BgWinnerLayer,
-										missSource);
-									DiagLog(buf);
-									diagMissCount++;
-
-									// For first 5 misses, dump all layer hashes with VRAM addr
-									if(diagDetailCount < 5) {
-										for(int dli = 0; dli < 4; dli++) {
-											if(pixelInfo.BgLayerMask & (1 << dli)) {
-												auto& dk = pixelInfo.BgTiles[dli].Key;
-												bool dInDma = (pixelInfo.BgTiles[dli].VramWordAddr >= 0x2000
-													&& pixelInfo.BgTiles[dli].VramWordAddr <= 0x21D0);
-												snprintf(buf, sizeof(buf),
-													"[SNES HD diag]   -> BgTiles[%d]: hash=%016llX pal=%d "
-													"layer=%d vram=0x%04X%s",
-													dli, (unsigned long long)dk.ContentHash, dk.PaletteIndex,
-													dk.LayerIndex, pixelInfo.BgTiles[dli].VramWordAddr,
-													dInDma ? " [DMA_RANGE]" : "");
-												DiagLog(buf);
-											}
-										}
-										diagDetailCount++;
-									}
-								}
-							}
+						if(missInfo && missInfo->Key.ContentHash != 0
+							&& diagLoggedHashes.find(missInfo->Key.ContentHash) == diagLoggedHashes.end()) {
+							diagLoggedHashes.insert(missInfo->Key.ContentHash);
+							bool inDmaRange = (missInfo->VramWordAddr >= 0x2000
+								&& missInfo->VramWordAddr <= 0x21D0);
+							char buf[512];
+							snprintf(buf, sizeof(buf),
+								"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d vram=0x%04X%s "
+								"mask=0x%02X win=%d",
+								(unsigned long long)missInfo->Key.ContentHash,
+								missInfo->Key.PaletteIndex, missInfo->Key.LayerIndex,
+								missInfo->VramWordAddr, inDmaRange ? " [DMA_RANGE]" : "",
+								pixelInfo.BgLayerMask, winLayer);
+							DiagLog(buf);
+							diagMissCount++;
 						}
 					}
 				}
-			} // end if(pixelInfo.BgLayerMask != 0)
+			}
 
+			// =============================================================
+			// Rendering
+			// =============================================================
 			uint32_t outX = (x - overscan.Left) * hdScale;
 			uint32_t outY = (y - overscan.Top) * hdScale;
 
-			if(hdTile && tileInfo && !hdTile->HdTileData.empty()) {
-				uint8_t rawX = tileInfo->OffsetX;
-				uint8_t rawY = tileInfo->OffsetY;
-				bool hFlip = tileInfo->HorizontalMirror;
-				bool vFlip = tileInfo->VerticalMirror;
-				uint8_t srcTileX = hFlip ? (7 - rawX) : rawX;
-				uint8_t srcTileY = vFlip ? (7 - rawY) : rawY;
+			if(layerHdCount > 0) {
+				// ---------------------------------------------------------
+				// Build priority-sorted render order (back to front)
+				// ---------------------------------------------------------
+				// SNES Mode 1 BG priority (back-to-front = render order):
+				//   Without Bg3Priority: BG3p0, BG2p0, BG1p0, BG3p1, BG2p1, BG1p1
+				//   With Bg3Priority:    BG3p0, BG2p0, BG1p0, BG2p1, BG1p1, BG3p1
+				// BG4 is not used in Mode 1 (excluded with prio = -1).
+				struct LayerEntry { int li; int prio; };
+				LayerEntry order[4];
+				int orderCount = 0;
 
-			// Pre-compute fog/overlay color if this pixel uses BG3 fog
-				// blending or BG1 overlay blending (honey in beehive levels).
-				// MainScreenColor holds the raw overlay layer color captured
-				// before the PPU applied color math.
-				//
-				// bg3FogBlend (Mainbrace fog): Uses native ADD color math —
-				//   result = min(255, hdPixel + fogColor).  The fog color
-				//   varies per scanline via HDMA, creating contour/wisps.
-				//   MSFlags bit 6 (0x40) = half-add: result = min(255, hd + fog/2).
-				// bg1OverlayBlend (beehive honey): Uses weighted blend —
-				//   result = 80% HD + 20% overlay.  Preserves HD art quality
-				//   while conveying the honey tint.
-				uint32_t fogColorRGB = 0;
-				uint8_t fogR = 0, fogG = 0, fogB = 0;
-				if(bg3FogBlend || bg1OverlayBlend) {
-					fogColorRGB = _calculatedPalette[pixelInfo.MainScreenColor & 0x7FFF];
-					fogR = (fogColorRGB >> 16) & 0xFF;
-					fogG = (fogColorRGB >> 8) & 0xFF;
-					fogB = fogColorRGB & 0xFF;
-				}
+				for(int li = 0; li < 4; li++) {
+					if(!layerHdTiles[li] || !layerTileInfos[li]) continue;
+					if(layerHdTiles[li]->HdTileData.empty()) continue;
 
-				// Pre-compute color math delta for winner pixels where the PPU
-				// applied color math (subtract/add via fixedColor or sub-screen).
-				// This captures HDMA-animated effects like lava glow in DKC2
-				// Hot-Head Hop where $2131 enables BG1 color math per-scanline
-				// and $2132 (fixedColor) is animated via HDMA.
-				// Delta is computed from the PPU's pre-math vs post-math colors
-				// (both BGR555), then scaled to 8-bit for HD tile application.
-				int cmDeltaR = 0, cmDeltaG = 0, cmDeltaB = 0;
-				bool applyColorMathDelta = false;
-				bool cmSubtractMode = false;
-				int cmPreR = 0, cmPreG = 0, cmPreB = 0;
-				int cmPostR = 0, cmPostG = 0, cmPostB = 0;
-				if(!bg3FogBlend && !bg1OverlayBlend && (pixelInfo.MainScreenFlags & 0x80)) {
-					uint16_t preMath = pixelInfo.MainScreenColor & 0x7FFF;
-					uint16_t postMath = ppuOutputBuffer[ppuIndex] & 0x7FFF;
-					cmPreR = preMath & 0x1F;
-					cmPreG = (preMath >> 5) & 0x1F;
-					cmPreB = (preMath >> 10) & 0x1F;
-					cmPostR = postMath & 0x1F;
-					cmPostG = (postMath >> 5) & 0x1F;
-					cmPostB = (postMath >> 10) & 0x1F;
-					// Accurate 5-bit→8-bit scaling: val*8 + val/4 (= val*255/31)
-					// instead of just val*8 (3% under-application).
-					cmDeltaR = (cmPostR * 8 + (cmPostR >> 2)) - (cmPreR * 8 + (cmPreR >> 2));
-					cmDeltaG = (cmPostG * 8 + (cmPostG >> 2)) - (cmPreG * 8 + (cmPreG >> 2));
-					cmDeltaB = (cmPostB * 8 + (cmPostB >> 2)) - (cmPreB * 8 + (cmPreB >> 2));
-					if(cmDeltaR != 0 || cmDeltaG != 0 || cmDeltaB != 0) {
-						applyColorMathDelta = true;
-						cmSubtractMode = (pixelInfo.MainScreenFlags & 0x20) != 0;
+					bool prioHigh = pixelInfo.BgTiles[li].Priority != 0;
+					int prio = -1;
+
+					if(li == 3) {
+						// BG4: not used in Mode 1, skip
+						continue;
+					} else if(!prioHigh) {
+						// Low tile priority: BG3=0, BG2=1, BG1=2
+						prio = (li == 2) ? 0 : (li == 1) ? 1 : 2;
+					} else if(!mode1Bg3Prio) {
+						// High tile priority (normal): BG3=3, BG2=4, BG1=5
+						prio = (li == 2) ? 3 : (li == 1) ? 4 : 5;
+					} else {
+						// High tile priority (Bg3Priority): BG2=3, BG1=4, BG3=5
+						prio = (li == 1) ? 3 : (li == 0) ? 4 : 5;
 					}
+
+					order[orderCount++] = { li, prio };
 				}
+
+				// Insertion sort ascending (lowest prio first = background)
+				for(int i = 1; i < orderCount; i++) {
+					LayerEntry tmp = order[i];
+					int j = i - 1;
+					while(j >= 0 && order[j].prio > tmp.prio) {
+						order[j + 1] = order[j];
+						j--;
+					}
+					order[j + 1] = tmp;
+				}
+
+				// ---------------------------------------------------------
+				// Render HD sub-pixels: back-to-front compositing
+				// ---------------------------------------------------------
+				// Base = native PPU pixel (includes sprites, backdrop, non-HD
+				// layers, and PPU color math). HD tiles composite over it.
+				// Phase 3 will add register-based color math on top.
 
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
 					for(uint32_t dx = 0; dx < hdScale; dx++) {
-						uint32_t hdPixelX = srcTileX * hdScale + (hFlip ? (hdScale - 1 - dx) : dx);
-						uint32_t hdPixelY = srcTileY * hdScale + (vFlip ? (hdScale - 1 - dy) : dy);
+						uint32_t outIndex = (outY + dy) * frameInfo.Width + (outX + dx);
+						if(outIndex >= frameInfo.Width * frameInfo.Height) continue;
 
-						if(hdPixelX < hdTile->Width && hdPixelY < hdTile->Height) {
-							uint32_t hdColor = hdTile->HdTileData[hdPixelY * hdTile->Width + hdPixelX];
-							uint32_t outIndex = (outY + dy) * frameInfo.Width + (outX + dx);
+						// Start with native PPU pixel as base
+						uint32_t result = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
 
-							if(outIndex < frameInfo.Width * frameInfo.Height) {
-								uint8_t alpha = (hdColor >> 24) & 0xFF;
+						// Composite each HD layer (back to front)
+						for(int ri = 0; ri < orderCount; ri++) {
+							int li = order[ri].li;
+							SnesHdPackTileInfo* tile = layerHdTiles[li];
+							SnesHdPpuTileInfo* info = layerTileInfos[li];
+
+							// Compute HD sub-pixel coordinates within tile
+							uint8_t rawX = info->OffsetX;
+							uint8_t rawY = info->OffsetY;
+							bool hFlip = info->HorizontalMirror;
+							bool vFlip = info->VerticalMirror;
+							uint8_t srcTileX = hFlip ? (7 - rawX) : rawX;
+							uint8_t srcTileY = vFlip ? (7 - rawY) : rawY;
+							uint32_t hdPX = srcTileX * hdScale + (hFlip ? (hdScale - 1 - dx) : dx);
+							uint32_t hdPY = srcTileY * hdScale + (vFlip ? (hdScale - 1 - dy) : dy);
+
+							if(hdPX >= tile->Width || hdPY >= tile->Height) continue;
+
+							uint32_t hdColor = tile->HdTileData[hdPY * tile->Width + hdPX];
+							uint8_t alpha = (hdColor >> 24) & 0xFF;
+
 							if(alpha == 0xFF) {
-							if(bg3FogBlend) {
-										// BG3 fog: native ADD color math.  fogColor
-										// varies per scanline via HDMA → fog contour.
-										// Half-add (MSFlags bit 6) halves the addend.
-										uint8_t hdR = (hdColor >> 16) & 0xFF;
-										uint8_t hdG = (hdColor >> 8) & 0xFF;
-										uint8_t hdB = hdColor & 0xFF;
-										bool halfAdd = (pixelInfo.MainScreenFlags & 0x40) != 0;
-										int fR = halfAdd ? fogR / 2 : fogR;
-										int fG = halfAdd ? fogG / 2 : fogG;
-										int fB = halfAdd ? fogB / 2 : fogB;
-										uint8_t outR = (uint8_t)std::min(255, (int)hdR + fR);
-										uint8_t outG = (uint8_t)std::min(255, (int)hdG + fG);
-										uint8_t outB = (uint8_t)std::min(255, (int)hdB + fB);
-										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
-								} else if(bg1OverlayBlend) {
-										// BG1 overlay (honey): weighted blend.
-										// 80% HD + 20% overlay preserves art quality.
-										uint8_t hdR = (hdColor >> 16) & 0xFF;
-										uint8_t hdG = (hdColor >> 8) & 0xFF;
-										uint8_t hdB = hdColor & 0xFF;
-										uint8_t outR = (uint8_t)((hdR * 4 + fogR) / 5);
-										uint8_t outG = (uint8_t)((hdG * 4 + fogG) / 5);
-										uint8_t outB = (uint8_t)((hdB * 4 + fogB) / 5);
-										outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
-								} else if(applyColorMathDelta) {
-									// Winner pixel had color math applied by PPU.
-									// Replicate the effect on the HD tile.
-									uint8_t hdR = (hdColor >> 16) & 0xFF;
-									uint8_t hdG = (hdColor >> 8) & 0xFF;
-									uint8_t hdB = hdColor & 0xFF;
-									uint8_t outR, outG, outB;
-									if(cmSubtractMode) {
-										// Multiplicative scaling for subtract mode:
-										// preserves color ratios, prevents asymmetric
-										// clamping that causes blue squares (Issue P).
-										outR = cmPreR > 0 ? (uint8_t)std::clamp(hdR * cmPostR / cmPreR, 0, 255) : hdR;
-										outG = cmPreG > 0 ? (uint8_t)std::clamp(hdG * cmPostG / cmPreG, 0, 255) : hdG;
-										outB = cmPreB > 0 ? (uint8_t)std::clamp(hdB * cmPostB / cmPreB, 0, 255) : hdB;
-									} else {
-										// Additive delta for add mode (fog, glow effects)
-										outR = (uint8_t)std::clamp((int)hdR + cmDeltaR, 0, 255);
-										outG = (uint8_t)std::clamp((int)hdG + cmDeltaG, 0, 255);
-										outB = (uint8_t)std::clamp((int)hdB + cmDeltaB, 0, 255);
-									}
-									outputBuffer[outIndex] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
-									} else {
-										outputBuffer[outIndex] = hdColor;
-									}
-								} else if(alpha > 0) {
-									// Alpha blend with sub-screen (BG2/backdrop) as background.
-									// Using main-screen would blend HD tile with native BG1 itself,
-									// creating a doubled appearance for semi-transparent tiles.
-									uint32_t bgColor = _calculatedPalette[pixelInfo.SubScreenColor & 0x7FFF];
-									uint8_t srcR = (bgColor >> 16) & 0xFF;
-									uint8_t srcG = (bgColor >> 8) & 0xFF;
-									uint8_t srcB = bgColor & 0xFF;
-									uint8_t hdR = (hdColor >> 16) & 0xFF;
-									uint8_t hdG = (hdColor >> 8) & 0xFF;
-									uint8_t hdB = hdColor & 0xFF;
-									uint8_t blendR = hdR + ((srcR * (255 - alpha)) / 255);
-									uint8_t blendG = hdG + ((srcG * (255 - alpha)) / 255);
-									uint8_t blendB = hdB + ((srcB * (255 - alpha)) / 255);
-								if(bg3FogBlend) {
-									// ADD fog on top of alpha-blended result
-									bool halfAdd = (pixelInfo.MainScreenFlags & 0x40) != 0;
-									int fR = halfAdd ? fogR / 2 : fogR;
-									int fG = halfAdd ? fogG / 2 : fogG;
-									int fB = halfAdd ? fogB / 2 : fogB;
-									blendR = (uint8_t)std::min(255, (int)blendR + fR);
-									blendG = (uint8_t)std::min(255, (int)blendG + fG);
-									blendB = (uint8_t)std::min(255, (int)blendB + fB);
-								} else if(bg1OverlayBlend) {
-									// Weighted overlay on top of alpha-blended result (80/20)
-										blendR = (uint8_t)((blendR * 4 + fogR) / 5);
-										blendG = (uint8_t)((blendG * 4 + fogG) / 5);
-										blendB = (uint8_t)((blendB * 4 + fogB) / 5);
-								} else if(applyColorMathDelta) {
-									// Apply color math on alpha-blended result
-									if(cmSubtractMode) {
-										blendR = cmPreR > 0 ? (uint8_t)std::clamp((int)blendR * cmPostR / cmPreR, 0, 255) : blendR;
-										blendG = cmPreG > 0 ? (uint8_t)std::clamp((int)blendG * cmPostG / cmPreG, 0, 255) : blendG;
-										blendB = cmPreB > 0 ? (uint8_t)std::clamp((int)blendB * cmPostB / cmPreB, 0, 255) : blendB;
-									} else {
-										blendR = (uint8_t)std::clamp((int)blendR + cmDeltaR, 0, 255);
-										blendG = (uint8_t)std::clamp((int)blendG + cmDeltaG, 0, 255);
-										blendB = (uint8_t)std::clamp((int)blendB + cmDeltaB, 0, 255);
-									}
-								}
-									outputBuffer[outIndex] = 0xFF000000 | (blendR << 16) | (blendG << 8) | blendB;
-								} else {
-									outputBuffer[outIndex] = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
-								}
+								// Fully opaque — replace
+								result = hdColor;
+							} else if(alpha > 0) {
+								// Semi-transparent — alpha blend over current result
+								uint8_t srcR = (result >> 16) & 0xFF;
+								uint8_t srcG = (result >> 8) & 0xFF;
+								uint8_t srcB = result & 0xFF;
+								uint8_t hdR = (hdColor >> 16) & 0xFF;
+								uint8_t hdG = (hdColor >> 8) & 0xFF;
+								uint8_t hdB = hdColor & 0xFF;
+								uint8_t blR = hdR + ((srcR * (255 - alpha)) / 255);
+								uint8_t blG = hdG + ((srcG * (255 - alpha)) / 255);
+								uint8_t blB = hdB + ((srcB * (255 - alpha)) / 255);
+								result = 0xFF000000 | (blR << 16) | (blG << 8) | blB;
 							}
+							// alpha == 0: transparent — skip, lower layer shows through
 						}
+
+						outputBuffer[outIndex] = result;
 					}
 				}
 			} else {
@@ -898,9 +447,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		} // end for(x)
 	} // end for(y)
 
-	// DIAGNOSTIC: Log per-frame summary.
-	// Always log first 10 frames (loading screens included) — catches stale builds.
-	// Additionally log up to 60 gameplay frames (frameBgPixels > 0) per context.
+	// =====================================================================
+	// DIAGNOSTIC: Per-frame summary
+	// =====================================================================
 	bool logThisFrame = frameTotalPixels > 0 &&
 		(diagFrameCount < 10 || (frameBgPixels > 0 && diagBgFrameCount < 60));
 	if(logThisFrame) {
@@ -908,27 +457,21 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u (fb=%u fogB=%u fogSkip=%u ovBlend=%u bgFb=%u cmDelta=%u lRetry=%u) miss=%u fogNat=%u palMis=%u layerMis=%u notInPack=%u"
-			" sprWon=%u mask0=%u BG1=%u BG2=%u BG3=%u BG4=%u"
-			" BG1miss=%u BG1notInPack=%u (TileByKey=%zu, sig=%016llX)",
-			diagFrameCount, diagBgFrameCount,
-			ctxLabel,
-			frameTotalPixels, frameBgPixels, frameHdMatch, frameFallback, frameBg3FogBlend, frameBg3FogSkip, frameBg1OverlayBlend, frameBg3BgFallback, frameColorMathDelta, frameLayerRetry,
-			frameHdMiss, frameBg3FogNative,
-			framePalMismatch, frameLayerMismatch, frameNotInPack,
+			": total=%u bg=%u match=%u multi=%u miss=%u lRetry=%u"
+			" sprWon=%u mask0=%u"
+			" BG1=%u BG2=%u BG3=%u BG4=%u"
+			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
+			" wn0=%u wn1=%u wn2=%u wn3=%u"
+			" (TileByKey=%zu, sig=%016llX)",
+			diagFrameCount, diagBgFrameCount, ctxLabel,
+			frameTotalPixels, frameBgPixels, frameHdMatch, frameMultiLayer,
+			frameHdMiss, frameLayerRetry,
 			frameSpriteWon, frameMaskZero,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
-			frameBg1MissPixels, frameBg1NotInPack,
+			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
+			frameWin[0], frameWin[1], frameWin[2], frameWin[3],
 			_hdData->TileByKey.size(),
 			(unsigned long long)vramSig);
-		DiagLog(buf);
-		// M5.15: Second log line with per-winner-layer breakdown
-		snprintf(buf, sizeof(buf),
-			"[SNES HD diag]   WINNERS: wn0=%u wn1=%u wn2=%u wn3=%u | acm0=%u acm1=%u acm2=%u acm3=%u"
-			" | ovBg2=%u ovBg3=%u ovMiss=%u",
-			frameWin[0], frameWin[1], frameWin[2], frameWin[3],
-			frameWinACM[0], frameWinACM[1], frameWinACM[2], frameWinACM[3],
-			frameBg1OvBg2, frameBg1OvBg3, frameBg1OvMiss);
 		DiagLog(buf);
 		diagFrameCount++;
 		if(frameBgPixels > 0) {
