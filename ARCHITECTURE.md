@@ -464,7 +464,7 @@ special cases needed.
 |-------|------|--------|------|
 | **1** | `SnesHdScanlineInfo` struct + PPU fills per scanline | **DONE** | Low |
 | **2** | Winner-only HD compositing with CM-skip | **P2.1 CODE DONE — BUILD+TEST PENDING** | Medium |
-| **3** | General color math on HD pixels (ADD/SUB/HALF) | Pending | High |
+| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **P3.1 DONE** | High |
 | **4** | Color window + brightness at HD resolution | Pending | Medium |
 | **5** | Remove old special-case paths, update diagnostics | Pending | Low |
 

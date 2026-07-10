@@ -21,6 +21,43 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-07-10] — Phase 3.1: Winner-First + Bottom-Layer Enhancement (P3.1)
+
+### Winner-Only bleibt Top-Layer, Multi-Layer nur für Bottom
+
+**Datei:** `Core/SNES/HdPacks/SnesHdVideoFilter.cpp`
+
+P3.0 war rein Winner-Only. P3.1 erweitert das sicher um Bottom-Layer-
+Compositing für HD Tiles mit Transparenz:
+
+**Ansatz (P2.0-Bug-sicher):**
+1. PPU-Winner ist IMMER der Top-Layer (keine Priority-Walk-Ersetzung!)
+2. HD Lookup für Winner (+BG1↔BG2 Retry) — wie bisher
+3. Kein HD-Match für Winner → natives Pixel (Winner ist opak, fertig)
+4. HD-Match gefunden → Top-Layer rendern
+5. Wenn Top-Layer transparente Pixel hat: Nächsten Layer darunter
+   (Mode 1 Prioritätsreihenfolge) als Bottom-Layer suchen
+6. Bottom-Layer wird hinter transparenten Top-Pixeln compositet
+
+**Sicherheitsgarantien:**
+- Winner ohne HD Tile → natives Pixel (kein Lower-Priority-Tile-Durchscheinen)
+- Bottom-Layer-Suche filtert nach MainScreenLayers (Sub-Screen ausgeschlossen)
+- Sprites → natives Pixel (spriteWon unverändert)
+
+**Änderungen gegenüber P3.0:**
+- Prioritätsreihenfolge wird NUR für Bottom-Layer-Suche berechnet (nicht für Top)
+- Neuer Diagnosezähler `multi=` zeigt Pixel mit Bottom-Layer-Match
+- MainScreenLayers-Check verhindert Sub-Screen-Layer als Bottom
+- Build-Version: `P3.1`
+
+**Erwartetes Verhalten:**
+- Pirate Panic: BG2 gewinnt (Winner) → HD Tile. BG3 als Bottom falls transparent.
+- Mainbrace: BG3 gewinnt (Nebel) → HD Tile + Color Math (SUBTRACT FixedColor)
+- NPC-Text: Sprite gewinnt → natives Pixel → kein Bug
+- BG3 vor BG1: Unmöglich, da Winner=BG1 (PPU korrekt)
+
+---
+
 ## [2026-07-10] — Phase 3: HD Color Math (P3.0)
 
 ### CM-Skip entfernt, echte HD Color Math implementiert
