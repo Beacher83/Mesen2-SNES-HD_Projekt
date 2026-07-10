@@ -21,6 +21,33 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-07-10] — Phase 3: HD Color Math (P3.0)
+
+### CM-Skip entfernt, echte HD Color Math implementiert
+
+**Datei:** `Core/SNES/HdPacks/SnesHdVideoFilter.cpp`
+
+Phase 2.1 übersprang HD-Tile-Rendering komplett wenn `AllowColorMath` aktiv war
+(CM-Skip). Das war zu aggressiv — in HDMA-Leveln (Mainbrace, Hot Head Hop, Rambi
+Rumble) war AllowColorMath auf ALLEN Pixeln gesetzt → 100% native Fallback.
+
+**Phase 3 ersetzt CM-Skip durch echte HD Color Math:**
+
+1. HD-Tile-Lookup erfolgt IMMER, unabhängig von AllowColorMath
+2. Wenn HD-Tile gefunden UND AllowColorMath aktiv → Color Math auf HD-Pixel anwenden
+3. Color Math Quelle: `FixedColor` (aus ScanlineInfo) oder `SubScreenColor` (per-pixel),
+   abhängig von `ColorMathAddSubscreen`
+4. Operationen: ADD oder SUBTRACT, mit optionalem HALVE
+5. Brightness (0-15) wird NACH Color Math angewendet (wie die PPU)
+6. Gilt für opaque und semi-transparent Alpha-Pfade
+
+**Build-Version:** `P3.0`
+
+**Diagnostik:** `frameCmSkip` Counter umbenannt zu `frameHdCm` (zählt Pixel mit
+angewandter HD Color Math statt übersprungener)
+
+---
+
 ## [2026-07-06] — Phase 1: Per-Scanline PPU Register Snapshot
 
 ### Neue Datenstruktur: SnesHdScanlineInfo

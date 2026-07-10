@@ -538,7 +538,7 @@ levels until Phase 3. ("nein lass uns das nicht mitschleppen")
 
 **Build version:** `P2.1`
 
-### Phase 3: HD Color Math (NEXT)
+### Phase 3: HD Color Math (IMPLEMENTED — P3.0)
 
 Re-implement `ApplyColorMathToPixel()` logic but operating on HD-resolution
 ARGB8888 pixels instead of native BGR555. Uses `ScanlineInfo` to determine:

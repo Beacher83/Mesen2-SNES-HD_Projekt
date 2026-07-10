@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P2.1"
+#define SNES_HD_BUILD_VERSION "P3.0"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -108,23 +108,26 @@ OverscanDimensions SnesHdVideoFilter::GetOverscan()
 }
 
 // =========================================================================
-// Phase 2.1: Winner-Only HD Compositing with CM-Skip
+// Phase 3: Winner-Only HD Compositing with HD Color Math
 // =========================================================================
-// Replaces the M5.19 heuristic cascade (fog-blend, overlay-blend,
-// colorMathDelta, bg3-fallback) with a PPU register-driven approach:
+// Builds on Phase 2.1 by REMOVING the CM-skip and instead applying color
+// math directly to HD pixels using ScanlineInfo register state.
 //
 //   1. Identify the PPU compositing winner (BgWinnerLayer)
-//   2. If the winner has AllowColorMath → skip HD, use native pixel
-//   3. Otherwise, look up HD tile for the winner layer only
-//   4. Render single HD tile over native PPU pixel as base
+//   2. Look up HD tile for the winner layer (regardless of Color Math)
+//   3. If HD tile found AND AllowColorMath is set:
+//      → Apply color math to the HD pixel using ScanlineInfo
+//   4. If no Color Math: render HD tile directly (as before)
 //
-// Winner-only: without Color Math, the winner fully occludes lower layers,
-// so only the winner's HD tile matters. Fixes P2.0 bugs where lower-
-// priority HD tiles composited over higher-priority non-HD content (e.g.
-// shop text, BG3 beehives rendering in foreground).
+// Color Math implementation:
+//   - Source: FixedColor (from ScanlineInfo, HDMA-animated per scanline)
+//             or SubScreenColor (from per-pixel data)
+//   - Operations: ADD or SUBTRACT, with optional HALVE
+//   - Clip-to-black and Prevent handled via Color Window (Phase 4 stub)
+//   - Brightness applied after color math
 //
-// CM-skip: pixels with Color Math use the native PPU pixel (which already
-// has correct color math applied). Phase 3 will apply HD color math.
+// This replaces the "native pixel for CM pixels" approach of P2.1 and
+// renders HD tiles even in fog, lava, honey, and ice levels.
 // =========================================================================
 
 void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
@@ -188,7 +191,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameBgPixels = 0;
 	uint32_t frameHdMatch = 0;       // pixels where HD tile found for winner layer
 	uint32_t frameHdMiss = 0;        // BG pixels where NO HD tile found for winner
-	uint32_t frameCmSkip = 0;        // pixels where Color Math skipped HD lookup
+	uint32_t frameHdCm = 0;         // HD pixels that had color math applied
 	uint32_t frameLayerRetry = 0;    // BG1↔BG2 layer-agnostic retry matches
 	uint32_t frameSpriteWon = 0;     // pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;      // non-sprite pixels with BgLayerMask == 0
@@ -219,15 +222,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 
 			// =============================================================
-			// Phase 2.1: Winner-only HD tile lookup with CM-skip
+			// Phase 3: Winner-only HD tile lookup (no CM-skip)
 			// =============================================================
-			// Only look up HD tile for the PPU compositing winner.
-			// Without Color Math, the winner fully occludes lower layers.
-			// CM-skip: if winner has AllowColorMath, use native pixel.
-			// BG1↔BG2 layer retry is structural (not a heuristic).
+			// Always look up HD tile for the PPU compositing winner.
+			// If Color Math is active, it will be applied to the HD pixel
+			// in the rendering step below.
 
 			SnesHdPackTileInfo* hdTile = nullptr;
 			SnesHdPpuTileInfo* hdTileInfo = nullptr;
+			bool applyColorMath = false;
 
 			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
 				frameBgPixels++;
@@ -240,17 +243,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					if(pixelInfo.BgLayerMask & (1 << li)) frameLayerBits[li]++;
 				}
 
-				// CM-skip: if the winner pixel has AllowColorMath set, the
-				// native PPU pixel already has correct color math applied.
-				// Skip HD lookup entirely → native pixel used.
-				// Phase 3 will implement HD color math to replace this.
+				// Check if Color Math is active for this pixel
 				bool cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
 
-				if(cmActive) {
-					frameCmSkip++;
-					// No HD lookup — use native pixel
-				} else if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
-					// Look up HD tile for the winner layer only
+				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+					// Look up HD tile for the winner layer
 					hdTile = _hdData->GetMatchingTile(
 						pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
 
@@ -268,6 +265,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						hdTileInfo = &pixelInfo.BgTiles[winLayer];
 						frameHdMatch++;
 						frameHdLayers[winLayer]++;
+						if(cmActive) {
+							applyColorMath = true;
+							frameHdCm++;
+						}
 
 						// DIAGNOSTIC: Log first 5 unique matches per context
 						if(diagMatchCount < 5) {
@@ -277,9 +278,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 								diagLoggedHashes.insert(key.ContentHash);
 								char buf[320];
 								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d win=%d",
+									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d win=%d cm=%d",
 									(unsigned long long)key.ContentHash, key.PaletteIndex,
-									key.LayerIndex, winLayer);
+									key.LayerIndex, winLayer, cmActive ? 1 : 0);
 								DiagLog(buf);
 								diagMatchCount++;
 							}
@@ -315,13 +316,37 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 
 			// =============================================================
-			// Rendering
+			// Rendering with HD Color Math
 			// =============================================================
 			uint32_t outX = (x - overscan.Left) * hdScale;
 			uint32_t outY = (y - overscan.Top) * hdScale;
 
 			if(hdTile && hdTileInfo && !hdTile->HdTileData.empty()) {
-				// Render single HD tile over native PPU pixel base
+				// Get scanline info for color math parameters
+				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
+
+				// Pre-compute color math second operand (BGR555 → RGB888)
+				// Used only if applyColorMath is true
+				uint8_t cmR = 0, cmG = 0, cmB = 0;
+				if(applyColorMath) {
+					uint16_t cmColor;
+					if(sl.ColorMathAddSubscreen) {
+						// Use sub-screen pixel as second operand
+						cmColor = pixelInfo.SubScreenColor;
+					} else {
+						// Use fixed color (HDMA-animated per scanline)
+						cmColor = sl.FixedColor;
+					}
+					// BGR555 → 8-bit RGB
+					cmR = ColorUtilities::Convert5BitTo8Bit(cmColor & 0x1F);
+					cmG = ColorUtilities::Convert5BitTo8Bit((cmColor >> 5) & 0x1F);
+					cmB = ColorUtilities::Convert5BitTo8Bit((cmColor >> 10) & 0x1F);
+				}
+
+				// Brightness from scanline info (0-15, applied after color math)
+				uint8_t brightness = sl.ScreenBrightness;
+
+				// Render HD tile
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
 					for(uint32_t dx = 0; dx < hdScale; dx++) {
 						uint32_t outIndex = (outY + dy) * frameInfo.Width + (outX + dx);
@@ -346,8 +371,37 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						uint8_t alpha = (hdColor >> 24) & 0xFF;
 
 						if(alpha == 0xFF) {
-							// Fully opaque — replace
-							result = hdColor;
+							// Fully opaque HD pixel
+							uint8_t hdR = (hdColor >> 16) & 0xFF;
+							uint8_t hdG = (hdColor >> 8) & 0xFF;
+							uint8_t hdB = hdColor & 0xFF;
+
+							// Apply color math to HD pixel
+							if(applyColorMath) {
+								if(sl.ColorMathSubtractMode) {
+									hdR = (hdR > cmR) ? (hdR - cmR) : 0;
+									hdG = (hdG > cmG) ? (hdG - cmG) : 0;
+									hdB = (hdB > cmB) ? (hdB - cmB) : 0;
+								} else {
+									hdR = (uint8_t)std::min(255, (int)hdR + (int)cmR);
+									hdG = (uint8_t)std::min(255, (int)hdG + (int)cmG);
+									hdB = (uint8_t)std::min(255, (int)hdB + (int)cmB);
+								}
+								if(sl.ColorMathHalveResult) {
+									hdR >>= 1;
+									hdG >>= 1;
+									hdB >>= 1;
+								}
+							}
+
+							// Apply brightness (after color math, like the PPU)
+							if(brightness < 15) {
+								hdR = (uint8_t)(hdR * brightness / 15);
+								hdG = (uint8_t)(hdG * brightness / 15);
+								hdB = (uint8_t)(hdB * brightness / 15);
+							}
+
+							result = 0xFF000000 | (hdR << 16) | (hdG << 8) | hdB;
 						} else if(alpha > 0) {
 							// Semi-transparent — alpha blend over native base
 							uint8_t srcR = (result >> 16) & 0xFF;
@@ -356,6 +410,33 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							uint8_t hdR = (hdColor >> 16) & 0xFF;
 							uint8_t hdG = (hdColor >> 8) & 0xFF;
 							uint8_t hdB = hdColor & 0xFF;
+
+							// Apply color math to the HD pixel before alpha blend
+							if(applyColorMath) {
+								if(sl.ColorMathSubtractMode) {
+									hdR = (hdR > cmR) ? (hdR - cmR) : 0;
+									hdG = (hdG > cmG) ? (hdG - cmG) : 0;
+									hdB = (hdB > cmB) ? (hdB - cmB) : 0;
+								} else {
+									hdR = (uint8_t)std::min(255, (int)hdR + (int)cmR);
+									hdG = (uint8_t)std::min(255, (int)hdG + (int)cmG);
+									hdB = (uint8_t)std::min(255, (int)hdB + (int)cmB);
+								}
+								if(sl.ColorMathHalveResult) {
+									hdR >>= 1;
+									hdG >>= 1;
+									hdB >>= 1;
+								}
+							}
+
+							// Apply brightness
+							if(brightness < 15) {
+								hdR = (uint8_t)(hdR * brightness / 15);
+								hdG = (uint8_t)(hdG * brightness / 15);
+								hdB = (uint8_t)(hdB * brightness / 15);
+							}
+
+							// Alpha blend: HD (premultiplied by alpha) over native base
 							uint8_t blR = hdR + ((srcR * (255 - alpha)) / 255);
 							uint8_t blG = hdG + ((srcG * (255 - alpha)) / 255);
 							uint8_t blB = hdB + ((srcB * (255 - alpha)) / 255);
@@ -391,7 +472,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u miss=%u cmSkip=%u lRetry=%u"
+			": total=%u bg=%u match=%u miss=%u hdCm=%u lRetry=%u"
 			" sprWon=%u mask0=%u"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
@@ -399,7 +480,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			" (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount, ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch,
-			frameHdMiss, frameCmSkip, frameLayerRetry,
+			frameHdMiss, frameHdCm, frameLayerRetry,
 			frameSpriteWon, frameMaskZero,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
