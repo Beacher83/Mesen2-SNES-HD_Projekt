@@ -21,6 +21,29 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-07-13] — Phase 3.8: CM+AddSubscreen Overlay Swap (P3.8)
+
+### Winner found + Color Math + AddSubscreen → overlay mode
+
+**Datei:** `Core/SNES/HdPacks/SnesHdVideoFilter.cpp`
+
+**Problem P3.7:** Wenn der Winner-Layer (z.B. BG3 Nebel in Mainbrace) ein
+HD-Tile hat UND Color Math mit AddSubscreen aktiv ist, wurde der Nebel
+opak gerendert und hat den darunter liegenden HD-Content (BG1/BG2)
+verdeckt. Der Overlay-Fallback (Step 3) griff nur wenn KEIN HD-Tile
+für den Winner gefunden wurde.
+
+**Lösung P3.8:** Nach der Bottom-Layer-Suche in Step 2 wird geprüft:
+wenn `cmActive && AddSubscreen && hdTileBot` gefunden, wird in den
+Overlay-Modus gewechselt — das Sub-Screen HD-Tile wird zum Primary,
+der Nebel-Tint wird aus dem nativen PPU-Output extrahiert. So wird
+HD-Content DURCH den Nebel-Effekt hindurch angezeigt.
+
+**Betroffene Level:** Mainbrace (BG3 Nebel über BG1/BG2 Content),
+potenziell alle Level mit Overlay + Color Math + AddSubscreen.
+
+---
+
 ## [2026-07-13] — Phase 3.5: Enhanced HDMA Diagnostics (P3.5)
 
 ### Per-Scanline HDMA Dump + Expanded Split Detection

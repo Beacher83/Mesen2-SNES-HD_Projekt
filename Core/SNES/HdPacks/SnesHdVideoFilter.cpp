@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.7"
+#define SNES_HD_BUILD_VERSION "P3.8"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -432,6 +432,24 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							hdTileInfoBot = &pixelInfo.BgTiles[layer];
 							frameMultiLayer++;
 						}
+					}
+
+					// --- P3.8: CM+AddSubscreen swap ---
+					// When the winner is an overlay layer (fog/honey/water) that
+					// the PPU composites via Color Math with sub-screen content,
+					// and we found HD content underneath: swap to overlay mode.
+					// This renders the sub-screen HD content as primary and
+					// applies the overlay tint extracted from the native PPU output,
+					// so HD content shows THROUGH the overlay effect.
+					if(cmActive && sl.ColorMathAddSubscreen && hdTileBot) {
+						// Swap: bottom HD becomes primary, discard winner HD tile
+						hdTile = hdTileBot;
+						hdTileInfo = hdTileInfoBot;
+						hdTileBot = nullptr;
+						hdTileInfoBot = nullptr;
+						isOverlayPixel = true;
+						// applyColorMath already true
+						frameOverlay++;
 					}
 				}
 				// --- Step 3: Winner NOT found + CM + AddSubscreen → overlay fallback ---
