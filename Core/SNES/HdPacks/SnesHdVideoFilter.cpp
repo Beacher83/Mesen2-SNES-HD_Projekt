@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.1"
+#define SNES_HD_BUILD_VERSION "P3.2"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -49,6 +49,42 @@ static void DiagLog(const char* msg)
 	if(diagFile) {
 		fprintf(diagFile, "%s\n", msg);
 		fflush(diagFile);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ContextLog — separate file for per-level PPU register snapshots.
+// Written to %USERPROFILE%\Downloads\snes_hd_context.txt
+// One entry per context change — stays small and readable.
+// ---------------------------------------------------------------------------
+static void ContextLog(const char* msg)
+{
+	static FILE* ctxFile = nullptr;
+	static bool ctxFileAttempted = false;
+
+	if(!ctxFileAttempted) {
+		ctxFileAttempted = true;
+		const char* home = getenv("USERPROFILE");
+		if(!home) home = getenv("HOME");
+		if(home) {
+			char path[512];
+#ifdef _WIN32
+			snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_context.txt", home);
+#else
+			snprintf(path, sizeof(path), "%s/Downloads/snes_hd_context.txt", home);
+#endif
+			ctxFile = fopen(path, "w");
+			if(ctxFile) {
+				fprintf(ctxFile, "=== SNES HD Context Log (build " SNES_HD_BUILD_VERSION ") ===\n");
+				fprintf(ctxFile, "One entry per level/context switch. PPU register snapshot from scanline 120.\n\n");
+				fflush(ctxFile);
+			}
+		}
+	}
+
+	if(ctxFile) {
+		fprintf(ctxFile, "%s\n", msg);
+		fflush(ctxFile);
 	}
 }
 
@@ -185,6 +221,57 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagMatchCount = 0;
 		diagLoggedHashes.clear();
 	}
+	// Log full PPU register snapshot to context file on EVERY context (including first)
+	if(vramSig != diagPrevVramSig) {
+		SnesHdScanlineInfo& slCtx = hdScreen->ScanlineInfo[120];
+		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
+
+		// Determine detected rendering mode
+		const char* renderMode = "NORMAL";
+		if(slCtx.Mode1Bg3Priority && (slCtx.ColorMathEnabled & 0x04)) {
+			renderMode = "BG3_OVERLAY";  // BG3 wins + CM on BG3 → fog/overlay
+		} else if(slCtx.ColorMathAddSubscreen && (slCtx.SubScreenLayers & 0x04)) {
+			renderMode = "SUBSCREEN_BLEND";  // BG3 on sub-screen (honey etc.)
+		} else if(!slCtx.ColorMathAddSubscreen && slCtx.FixedColor != 0x0000) {
+			renderMode = "FIXED_COLOR";  // Blend with FixedColor (mine fog etc.)
+		}
+
+		char ctxBuf[1024];
+		snprintf(ctxBuf, sizeof(ctxBuf),
+			"--- CONTEXT: sig=%016llX (%s) ---\n"
+			"  BgMode=%d  Mode1Bg3Pri=%d\n"
+			"  MainScreenLayers=$%02X  SubScreenLayers=$%02X\n"
+			"  CMEnabled=$%02X (BG1=%d BG2=%d BG3=%d BG4=%d OBJ=%d BDrop=%d)\n"
+			"  AddSubscreen=%d  SubtractMode=%d  HalveResult=%d\n"
+			"  FixedColor=$%04X  ScreenBrightness=%d\n"
+			"  ClipMode=%d  PreventMode=%d\n"
+			"  Window1: L=%d R=%d  Window2: L=%d R=%d\n"
+			"  ColorWin: active=[%d,%d] inv=[%d,%d] logic=%d\n"
+			"  → Detected mode: %s\n",
+			(unsigned long long)vramSig, ctxLabel,
+			slCtx.BgMode, slCtx.Mode1Bg3Priority ? 1 : 0,
+			slCtx.MainScreenLayers, slCtx.SubScreenLayers,
+			slCtx.ColorMathEnabled,
+			(slCtx.ColorMathEnabled & 0x01) ? 1 : 0,
+			(slCtx.ColorMathEnabled & 0x02) ? 1 : 0,
+			(slCtx.ColorMathEnabled & 0x04) ? 1 : 0,
+			(slCtx.ColorMathEnabled & 0x08) ? 1 : 0,
+			(slCtx.ColorMathEnabled & 0x10) ? 1 : 0,
+			(slCtx.ColorMathEnabled & 0x20) ? 1 : 0,
+			slCtx.ColorMathAddSubscreen ? 1 : 0,
+			slCtx.ColorMathSubtractMode ? 1 : 0,
+			slCtx.ColorMathHalveResult ? 1 : 0,
+			slCtx.FixedColor, slCtx.ScreenBrightness,
+			(int)slCtx.ColorMathClipMode, (int)slCtx.ColorMathPreventMode,
+			slCtx.Window1Left, slCtx.Window1Right,
+			slCtx.Window2Left, slCtx.Window2Right,
+			slCtx.ColorWindowActive[0] ? 1 : 0, slCtx.ColorWindowActive[1] ? 1 : 0,
+			slCtx.ColorWindowInverted[0] ? 1 : 0, slCtx.ColorWindowInverted[1] ? 1 : 0,
+			(int)slCtx.ColorWindowMaskLogic,
+			renderMode);
+		ContextLog(ctxBuf);
+		DiagLog(ctxBuf);
+	}
 	diagPrevVramSig = vramSig;
 
 	// Per-frame counters
@@ -251,8 +338,46 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// Check if Color Math is active for this pixel
 				bool cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
 
-				// Step 1: Look up HD tile for the PPU winner (top layer)
-				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+				// ---------------------------------------------------------
+				// BG3 Overlay Detection: When BG3 wins with Mode1Bg3Priority
+				// AND Color Math is active, BG3 acts as a fog/overlay effect.
+				// In this case, render the LOWER layer (BG1/BG2) in HD and
+				// apply CM to it (= HD content visible through fog tint).
+				// ---------------------------------------------------------
+				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
+				bool bg3Overlay = (winLayer == 2 && cmActive && sl.Mode1Bg3Priority);
+
+				if(bg3Overlay) {
+					// Skip BG3's tile — search BG1 then BG2 for HD content
+					for(int tryLayer = 0; tryLayer <= 1 && !hdTile; tryLayer++) {
+						if(!(pixelInfo.BgLayerMask & (1 << tryLayer))) continue;
+						if(!(sl.MainScreenLayers & (1 << tryLayer))) continue;
+
+						hdTile = _hdData->GetMatchingTile(
+							pixelInfo.BgTiles[tryLayer].Key, hdScreen->Vram);
+						// BG1↔BG2 layer retry
+						if(!hdTile) {
+							SnesHdTileKey altKey = pixelInfo.BgTiles[tryLayer].Key;
+							altKey.LayerIndex = (tryLayer == 0) ? 1 : 0;
+							hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+							if(hdTile) frameLayerRetry++;
+						}
+						if(hdTile) {
+							hdTileInfo = &pixelInfo.BgTiles[tryLayer];
+							frameHdMatch++;
+							frameHdLayers[tryLayer]++;
+							applyColorMath = true;
+							frameHdCm++;
+						}
+					}
+					if(!hdTile) {
+						frameHdMiss++;
+					}
+				}
+				// ---------------------------------------------------------
+				// Normal path: Look up HD tile for the PPU winner (top layer)
+				// ---------------------------------------------------------
+				else if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
 					hdTile = _hdData->GetMatchingTile(
 						pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
 
@@ -291,7 +416,6 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 						// Step 2: Find bottom layer (for transparency compositing)
 						// Walk layers below the winner in Mode 1 priority order.
-						SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
 						uint8_t prioOrder[6];
 						int prioCount = 0;
 
