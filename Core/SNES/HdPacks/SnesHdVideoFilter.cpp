@@ -438,10 +438,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					// When the winner is an overlay layer (fog/honey/water) that
 					// the PPU composites via Color Math with sub-screen content,
 					// and we found HD content underneath: swap to overlay mode.
+					// Only fires if the winner is NOT on the sub-screen (i.e.,
+					// it's a main-only overlay, not a content layer).
 					// This renders the sub-screen HD content as primary and
 					// applies the overlay tint extracted from the native PPU output,
 					// so HD content shows THROUGH the overlay effect.
-					if(cmActive && sl.ColorMathAddSubscreen && hdTileBot) {
+					if(cmActive && sl.ColorMathAddSubscreen && hdTileBot
+						&& !(sl.SubScreenLayers & (1 << winLayer))) {
 						// Swap: bottom HD becomes primary, discard winner HD tile
 						hdTile = hdTileBot;
 						hdTileInfo = hdTileInfoBot;
