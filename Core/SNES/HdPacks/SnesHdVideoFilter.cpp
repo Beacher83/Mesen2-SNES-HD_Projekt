@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.3"
+#define SNES_HD_BUILD_VERSION "P3.4"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -146,6 +146,7 @@ OverscanDimensions SnesHdVideoFilter::GetOverscan()
 // =========================================================================
 // Phase 3.3: Generic CM Overlay + Winner-First HD Compositing
 // =========================================================================
+// P3.4: Fix overlay CM operand (extract tint via undo-brightness + subtract sub).
 // Extends P3.2 with generic overlay detection (replaces BG3-only check):
 //
 //   1. PPU winner is ALWAYS the top layer (avoids P2.0 bugs)
@@ -238,7 +239,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		((uint64_t)(slCtx.Mode1Bg3Priority ? 1 : 0) << 27) |
 		((uint64_t)slCtx.BgMode << 28) |
 		((uint64_t)(slCtx.FixedColor & 0x7FFF) << 32) |
-		((uint64_t)slCtx.ScreenBrightness << 48);
+		((uint64_t)(slCtx.ScreenBrightness == 15 ? 15 : 0) << 48);
 
 	// On VRAM sig change, always update sig tracking
 	if(vramSig != diagPrevVramSig) {
@@ -261,6 +262,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameHdMatch = 0;       // pixels where HD tile found for winner layer
 	uint32_t frameHdMiss = 0;        // BG pixels where NO HD tile found for winner
 	uint32_t frameHdCm = 0;         // HD pixels that had color math applied
+	uint32_t frameOverlay = 0;      // HD pixels via overlay path (P3.4)
 	uint32_t frameLayerRetry = 0;    // BG1↔BG2 layer-agnostic retry matches
 	uint32_t frameSpriteWon = 0;     // pixels where sprite won (HD BG skipped)
 	uint32_t frameMaskZero = 0;      // non-sprite pixels with BgLayerMask == 0
@@ -268,11 +270,19 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameWin[4] = {};       // per-layer: pixels where layer wins compositing
 	uint32_t frameHdLayers[4] = {};  // per-layer: HD tile found count
 	uint32_t frameMultiLayer = 0;   // pixels where bottom HD layer also found
+	uint32_t frameHdmaSplit = 0;    // scanlines where MainScreenLayers differs from previous
 
 	// =====================================================================
 	// Main pixel loop
 	// =====================================================================
 	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
+
+		// HDMA split detection: track MainScreenLayers changes between scanlines
+		if(y > overscan.Top) {
+			uint8_t prevMain = hdScreen->ScanlineInfo[y - 1].MainScreenLayers;
+			uint8_t curMain = hdScreen->ScanlineInfo[y].MainScreenLayers;
+			if(curMain != prevMain) frameHdmaSplit++;
+		}
 
 		for(uint32_t x = overscan.Left; x < baseWidth - overscan.Right; x++) {
 			uint32_t srcIndex = y * SnesHdScreenInfo::ScreenWidth + x;
@@ -304,6 +314,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPackTileInfo* hdTileBot = nullptr;
 			SnesHdPpuTileInfo* hdTileInfoBot = nullptr;
 			bool applyColorMath = false;
+			bool isOverlayPixel = false;  // true when CM overlay path found HD content
 
 			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
 				frameBgPixels++;
@@ -361,7 +372,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							frameHdMatch++;
 							frameHdLayers[tryLayer]++;
 							applyColorMath = true;
+							isOverlayPixel = true;
 							frameHdCm++;
+							frameOverlay++;
 						}
 					}
 					if(!hdTile) {
@@ -496,15 +509,38 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// Pre-compute color math second operand (BGR555 → RGB888)
 				uint8_t cmR = 0, cmG = 0, cmB = 0;
 				if(applyColorMath) {
-					uint16_t cmColor;
-					if(sl.ColorMathAddSubscreen) {
-						cmColor = pixelInfo.SubScreenColor;
+					if(isOverlayPixel) {
+						// Overlay mode: extract the overlay tint from PPU output.
+						// PPU output = content + overlay (with brightness applied).
+						// SubScreenColor = raw content color (no brightness).
+						// overlay_color = undoBrightness(ppuOutput) - SubScreenColor
+						uint16_t ppuNative = ppuOutputBuffer[ppuIndex] & 0x7FFF;
+						uint8_t br = sl.ScreenBrightness;
+						int rawR, rawG, rawB;
+						if(br > 0) {
+							rawR = (int)(ppuNative & 0x1F) * 15 / br;
+							rawG = (int)((ppuNative >> 5) & 0x1F) * 15 / br;
+							rawB = (int)((ppuNative >> 10) & 0x1F) * 15 / br;
+						} else {
+							rawR = rawG = rawB = 0;
+						}
+						int subR = (int)(pixelInfo.SubScreenColor & 0x1F);
+						int subG = (int)((pixelInfo.SubScreenColor >> 5) & 0x1F);
+						int subB = (int)((pixelInfo.SubScreenColor >> 10) & 0x1F);
+						cmR = ColorUtilities::Convert5BitTo8Bit(std::max(0, std::min(31, rawR - subR)));
+						cmG = ColorUtilities::Convert5BitTo8Bit(std::max(0, std::min(31, rawG - subG)));
+						cmB = ColorUtilities::Convert5BitTo8Bit(std::max(0, std::min(31, rawB - subB)));
+					} else if(sl.ColorMathAddSubscreen) {
+						uint16_t cmColor = pixelInfo.SubScreenColor;
+						cmR = ColorUtilities::Convert5BitTo8Bit(cmColor & 0x1F);
+						cmG = ColorUtilities::Convert5BitTo8Bit((cmColor >> 5) & 0x1F);
+						cmB = ColorUtilities::Convert5BitTo8Bit((cmColor >> 10) & 0x1F);
 					} else {
-						cmColor = sl.FixedColor;
+						uint16_t cmColor = sl.FixedColor;
+						cmR = ColorUtilities::Convert5BitTo8Bit(cmColor & 0x1F);
+						cmG = ColorUtilities::Convert5BitTo8Bit((cmColor >> 5) & 0x1F);
+						cmB = ColorUtilities::Convert5BitTo8Bit((cmColor >> 10) & 0x1F);
 					}
-					cmR = ColorUtilities::Convert5BitTo8Bit(cmColor & 0x1F);
-					cmG = ColorUtilities::Convert5BitTo8Bit((cmColor >> 5) & 0x1F);
-					cmB = ColorUtilities::Convert5BitTo8Bit((cmColor >> 10) & 0x1F);
 				}
 
 				// Brightness from scanline info (0-15, applied after color math)
@@ -703,16 +739,16 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u miss=%u hdCm=%u lRetry=%u multi=%u"
-			" sprWon=%u mask0=%u"
+			": total=%u bg=%u match=%u miss=%u hdCm=%u overlay=%u lRetry=%u multi=%u"
+			" sprWon=%u mask0=%u hdmaSplit=%u"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
 			" (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount, ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch,
-			frameHdMiss, frameHdCm, frameLayerRetry, frameMultiLayer,
-			frameSpriteWon, frameMaskZero,
+			frameHdMiss, frameHdCm, frameOverlay, frameLayerRetry, frameMultiLayer,
+			frameSpriteWon, frameMaskZero, frameHdmaSplit,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
 			frameWin[0], frameWin[1], frameWin[2], frameWin[3],

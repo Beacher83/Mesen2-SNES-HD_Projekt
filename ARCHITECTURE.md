@@ -456,6 +456,83 @@ values that `SnesHdScanlineInfo` captures:
 The new engine handles ALL of these with the same code path — no per-ppuConfig
 special cases needed.
 
+### Detailed PPU Analysis: Overlay Levels (from DKC2 disassembly)
+
+Source: `p4plus2/DKC2-disassembly`, tables at `DATA_FD79E2` (58 PPU profiles),
+HDMA dispatch at `$BB9358` via `DATA_BB95BC` (27 effects indexed by `$0519`).
+
+#### Mainbrace Mayhem (Level ID $00, PPU Profile 1, HDMA $0519=$00)
+
+**Profile 1 initial state** (DATA_FD7A86):
+- $2105=$09 (Mode 1, BG3 priority)
+- $212C=$16 (Main: BG2+BG3+OBJ), $212D=$00 (Sub: none)
+- $2130=$00 (no AddSubscreen, no clip), $2131=$26 (ADD on BG2+BG3+Backdrop)
+- $2132=$00 (FixedColor = black)
+
+**Runtime state** (observed in ScanlineInfo diag log):
+- $212C=$04 (Main: BG3 only), $212D=$13 (Sub: BG1+BG2+OBJ)
+- $2130=$02 (AddSubscreen), $2131=$24 (ADD on BG3+Backdrop)
+
+**Transition:** Game code (not just HDMA) reconfigures PPU after profile load,
+switching from "BG2+BG3 + FixedColor ADD" to "BG3 overlay + Subscreen ADD".
+This creates the fog effect: BG3 = fog tiles (semi-transparent), Sub = terrain.
+
+**HDMA effect 0** (`CODE_BB9E6A`): Basic single-channel HDMA. Likely animates
+$2132 or window registers for subtle per-scanline fog density variation.
+
+**Overlay detection in our code:** BG3 sole on main ($04) + AddSubscreen →
+overlay path fires. Searches BG1/BG2 on sub-screen for HD content tiles.
+Formula: `HD_result = HD_terrain + fog_tint` where
+`fog_tint = undoBrightness(ppuOutput) - SubScreenColor`.
+
+#### Rambi Rumble (Level ID $02, PPU Profile 3, HDMA $0519=$10)
+
+**Profile 3 state** (DATA_FD7ADF):
+- $2105=$09 (Mode 1, BG3 priority)
+- $212C=$01 (Main: BG1 only), $212D=$16 (Sub: BG2+BG3+OBJ)
+- $2130=$02 (AddSubscreen), $2131=$21 (ADD on BG1+Backdrop)
+- $2132=$00 (FixedColor = black, but HDMA animates this)
+
+**Runtime behavior:** Profile 3 values apply directly (no game-code override).
+BG1 = honey/amber overlay tiles, Sub = BG2 terrain + BG3 detail.
+PPU output = BG1_honey + SubScreen_terrain (additive blend).
+
+**HDMA effect $10** (`CODE_BBA031`): Multi-channel HDMA (channels 2+5).
+Animates $2132 (FixedColor) per scanline — creates vertical honey gradient.
+Since AddSubscreen is active, FixedColor doesn't directly affect CM output,
+but HDMA may conditionally switch $2130 per-scanline for gradient zones.
+
+**Overlay detection in our code:** BG1 sole on main ($01) + AddSubscreen →
+overlay path fires. Searches BG2/BG3 on sub-screen for HD content tiles.
+Formula: `HD_result = HD_terrain + honey_tint`.
+
+#### Lockjaw's Locker (Level ID $15, PPU Profile 4, HDMA $0519=$11)
+
+**Profile 4 state** (previously researched):
+- $212C=$01 (Main: BG1 only), $212D=$06 (Sub: BG2+BG3)
+- $2130=$02 (AddSubscreen), $2131=$23 (ADD on BG1+BG2+Backdrop)
+
+**HDMA effect $11** (`CODE_BB95F2`): Per-scanline MainScreenLayers override.
+- Above water line: $212C=$13 (BG1+BG2+OBJ on main) → normal terrain
+- Below water line: $212C=$01 (BG1 only on main) → overlay mode
+
+**Overlay detection:** Below water: BG1 sole on main + AddSubscreen →
+overlay path. Above water: BG1+BG2 both on main → normal winner path.
+HDMA creates the split; our per-scanline ScanlineInfo captures it correctly.
+
+#### Summary: All Three Overlay Levels
+
+| Level | Overlay Layer | Content Layers | CM Mode | HDMA Role |
+|-------|--------------|----------------|---------|-----------|
+| Mainbrace | BG3 (fog) | BG1+BG2 (terrain) | ADD Sub | Reconfigured by game code |
+| Rambi | BG1 (honey) | BG2+BG3 (terrain) | ADD Sub | Animates FixedColor gradient |
+| Lockjaw | BG1 (water) | BG2+BG3 (terrain) | ADD Sub | Splits screen via MainScreenLayers |
+
+**Common pattern:** One BG layer acts as overlay (sole layer on main screen),
+content layers are on sub-screen, AddSubscreen blends them. Our generic
+overlay detection (`isSoleBgOnMain && ColorMathAddSubscreen`) catches all three
+without any level-specific code.
+
 ---
 
 ## Implementation Phases
