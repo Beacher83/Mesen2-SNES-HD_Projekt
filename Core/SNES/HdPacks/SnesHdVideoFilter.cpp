@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.5"
+#define SNES_HD_BUILD_VERSION "P3.6"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -360,28 +360,56 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				bool cmOverlay = cmActive && sl.ColorMathAddSubscreen && isSoleBgOnMain;
 
 				if(cmOverlay) {
-					// Skip overlay layer — search ALL other layers for HD content
-					for(int tryLayer = 0; tryLayer < 3 && !hdTile; tryLayer++) {
-						if(tryLayer == winLayer) continue;
-						if(!(pixelInfo.BgLayerMask & (1 << tryLayer))) continue;
+					// Strategy: Try the winner layer FIRST. If it has an HD tile,
+					// it's the actual content (e.g. Lockjaw terrain) that needs
+					// SubScreenColor added as CM tint. If not found, the winner
+					// is likely a transparent overlay (Rambi honey, Mainbrace fog)
+					// so search sub-screen layers for HD content instead.
 
+					// --- Try winner layer (content-on-main case) ---
+					if(pixelInfo.BgLayerMask & (1 << winLayer)) {
 						hdTile = _hdData->GetMatchingTile(
-							pixelInfo.BgTiles[tryLayer].Key, hdScreen->Vram);
-						// BG1↔BG2 layer retry
-						if(!hdTile && (tryLayer == 0 || tryLayer == 1)) {
-							SnesHdTileKey altKey = pixelInfo.BgTiles[tryLayer].Key;
-							altKey.LayerIndex = (tryLayer == 0) ? 1 : 0;
+							pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
+						if(!hdTile && (winLayer == 0 || winLayer == 1)) {
+							SnesHdTileKey altKey = pixelInfo.BgTiles[winLayer].Key;
+							altKey.LayerIndex = (winLayer == 0) ? 1 : 0;
 							hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
 							if(hdTile) frameLayerRetry++;
 						}
 						if(hdTile) {
-							hdTileInfo = &pixelInfo.BgTiles[tryLayer];
+							hdTileInfo = &pixelInfo.BgTiles[winLayer];
 							frameHdMatch++;
-							frameHdLayers[tryLayer]++;
+							frameHdLayers[winLayer]++;
 							applyColorMath = true;
-							isOverlayPixel = true;
+							// NOT isOverlayPixel: use SubScreenColor directly as CM operand
 							frameHdCm++;
-							frameOverlay++;
+						}
+					}
+
+					// --- Fallback: search sub-screen layers (overlay case) ---
+					if(!hdTile) {
+						for(int tryLayer = 0; tryLayer < 3 && !hdTile; tryLayer++) {
+							if(tryLayer == winLayer) continue;
+							if(!(pixelInfo.BgLayerMask & (1 << tryLayer))) continue;
+
+							hdTile = _hdData->GetMatchingTile(
+								pixelInfo.BgTiles[tryLayer].Key, hdScreen->Vram);
+							// BG1↔BG2 layer retry
+							if(!hdTile && (tryLayer == 0 || tryLayer == 1)) {
+								SnesHdTileKey altKey = pixelInfo.BgTiles[tryLayer].Key;
+								altKey.LayerIndex = (tryLayer == 0) ? 1 : 0;
+								hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+								if(hdTile) frameLayerRetry++;
+							}
+							if(hdTile) {
+								hdTileInfo = &pixelInfo.BgTiles[tryLayer];
+								frameHdMatch++;
+								frameHdLayers[tryLayer]++;
+								applyColorMath = true;
+								isOverlayPixel = true;
+								frameHdCm++;
+								frameOverlay++;
+							}
 						}
 					}
 					if(!hdTile) {
