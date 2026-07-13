@@ -870,6 +870,152 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		hdmaDumped = false;
 	}
 
+	// =====================================================================
+	// DIAGNOSTIC: LEVEL ANALYSIS — once per context, after first BG frame
+	// Human-readable breakdown of how PPU layers are configured and how
+	// our HD engine treats them. Helps understand level structure at a glance.
+	// =====================================================================
+	static bool levelAnalysisDone = false;
+	if(diagContextChanged) levelAnalysisDone = false;
+
+	if(!levelAnalysisDone && frameBgPixels > 1000 && logThisFrame) {
+		levelAnalysisDone = true;
+		SnesHdScanlineInfo& sa = hdScreen->ScanlineInfo[120];
+		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
+
+		DiagLog(""); // blank line for readability
+		char hdr[256];
+		snprintf(hdr, sizeof(hdr),
+			"[SNES HD diag] ========== LEVEL ANALYSIS (sig=%016llX, %s) ==========",
+			(unsigned long long)vramSig, ctxLabel);
+		DiagLog(hdr);
+
+		// --- Per-layer breakdown ---
+		const char* layerNames[] = {"BG1", "BG2", "BG3", "BG4"};
+		for(int L = 0; L < 4; L++) {
+			bool onMain = (sa.MainScreenLayers & (1 << L)) != 0;
+			bool onSub  = (sa.SubScreenLayers & (1 << L)) != 0;
+			bool cmEnabled = (sa.ColorMathEnabled & (1 << L)) != 0;
+
+			// Skip layers with zero presence
+			if(!onMain && !onSub && frameLayerBits[L] == 0) continue;
+
+			// Compute HD match rate for this layer
+			int matchPct = (frameLayerBits[L] > 0)
+				? (int)(100ULL * frameHdLayers[L] / frameLayerBits[L]) : 0;
+
+			// Determine role
+			const char* role = "inactive";
+			if(onMain && !cmEnabled) role = "MAIN (no CM)";
+			else if(onMain && cmEnabled && sa.ColorMathAddSubscreen) role = "MAIN + CM (add subscreen)";
+			else if(onMain && cmEnabled && !sa.ColorMathAddSubscreen) role = "MAIN + CM (fixed color)";
+			else if(!onMain && onSub) role = "SUB-SCREEN only (CM operand)";
+
+			char layBuf[512];
+			snprintf(layBuf, sizeof(layBuf),
+				"  %s: %s | pixels=%u win=%u hdMatch=%u (%d%%) | onMain=%d onSub=%d cmEnabled=%d",
+				layerNames[L], role,
+				frameLayerBits[L], frameWin[L], frameHdLayers[L], matchPct,
+				onMain ? 1 : 0, onSub ? 1 : 0, cmEnabled ? 1 : 0);
+			DiagLog(layBuf);
+		}
+
+		// --- OBJ/Sprite info ---
+		bool objOnMain = (sa.MainScreenLayers & 0x10) != 0;
+		bool objOnSub  = (sa.SubScreenLayers & 0x10) != 0;
+		bool objCm     = (sa.ColorMathEnabled & 0x10) != 0;
+		char objBuf[256];
+		snprintf(objBuf, sizeof(objBuf),
+			"  OBJ: onMain=%d onSub=%d cmEnabled=%d | spriteWonPixels=%u",
+			objOnMain ? 1 : 0, objOnSub ? 1 : 0, objCm ? 1 : 0, frameSpriteWon);
+		DiagLog(objBuf);
+
+		// --- Backdrop ---
+		bool bdropCm = (sa.ColorMathEnabled & 0x20) != 0;
+		char bdBuf[128];
+		snprintf(bdBuf, sizeof(bdBuf),
+			"  Backdrop: cmEnabled=%d | emptyPixels=%u",
+			bdropCm ? 1 : 0, frameMaskZero);
+		DiagLog(bdBuf);
+
+		// --- Rendering summary ---
+		char sumBuf[512];
+		snprintf(sumBuf, sizeof(sumBuf),
+			"  Mode=%d | Bg3Priority=%d | AddSubscreen=%d | Subtract=%d | Halve=%d\n"
+			"  FixedColor=$%04X | Brightness=%d | HDMA=%s\n"
+			"  ClipMode=%d PreventMode=%d | Window1=[%d,%d] Window2=[%d,%d]\n"
+			"  ColorWindow: active=[%d,%d] inv=[%d,%d] logic=%d\n"
+			"  HD engine: match=%u miss=%u overlay=%u layerRetry=%u multiLayer=%u cmApplied=%u",
+			sa.BgMode, sa.Mode1Bg3Priority ? 1 : 0,
+			sa.ColorMathAddSubscreen ? 1 : 0, sa.ColorMathSubtractMode ? 1 : 0,
+			sa.ColorMathHalveResult ? 1 : 0,
+			sa.FixedColor, sa.ScreenBrightness,
+			frameHdmaSplit > 0 ? "YES (per-scanline changes)" : "no",
+			(int)sa.ColorMathClipMode, (int)sa.ColorMathPreventMode,
+			sa.Window1Left, sa.Window1Right, sa.Window2Left, sa.Window2Right,
+			sa.ColorWindowActive[0] ? 1 : 0, sa.ColorWindowActive[1] ? 1 : 0,
+			sa.ColorWindowInverted[0] ? 1 : 0, sa.ColorWindowInverted[1] ? 1 : 0,
+			(int)sa.ColorWindowMaskLogic,
+			frameHdMatch, frameHdMiss, frameOverlay, frameLayerRetry, frameMultiLayer, frameHdCm);
+		DiagLog(sumBuf);
+
+		// --- Compositing explanation in plain language ---
+		// Helps understand what the PPU is actually doing
+		DiagLog("  --- Compositing pipeline (PPU logic) ---");
+
+		// Which layer wins main screen?
+		uint8_t mainLayers = sa.MainScreenLayers & 0x0F;
+		if(mainLayers == 0x01) DiagLog("  Main screen: BG1 only → all BG winners are BG1");
+		else if(mainLayers == 0x04) DiagLog("  Main screen: BG3 only → BG3 overlay mode");
+		else if(mainLayers == 0x03) DiagLog("  Main screen: BG1+BG2 → standard priority compositing");
+		else if(mainLayers == 0x07) DiagLog("  Main screen: BG1+BG2+BG3 → all layers composited");
+		else if(mainLayers == 0x17 || mainLayers == 0x13) DiagLog("  Main screen: multiple layers + OBJ");
+		else {
+			char mlBuf[128];
+			snprintf(mlBuf, sizeof(mlBuf), "  Main screen: layers=$%02X", mainLayers);
+			DiagLog(mlBuf);
+		}
+
+		// What provides the CM operand?
+		if(sa.ColorMathAddSubscreen) {
+			uint8_t subLayers = sa.SubScreenLayers & 0x1F;
+			char subBuf[256];
+			snprintf(subBuf, sizeof(subBuf),
+				"  CM operand: Sub-screen (layers=$%02X) → color added to main pixel",
+				subLayers);
+			DiagLog(subBuf);
+		} else if(sa.FixedColor != 0) {
+			char fcBuf[128];
+			snprintf(fcBuf, sizeof(fcBuf),
+				"  CM operand: Fixed color=$%04X (R=%d G=%d B=%d)",
+				sa.FixedColor, sa.FixedColor & 0x1F,
+				(sa.FixedColor >> 5) & 0x1F, (sa.FixedColor >> 10) & 0x1F);
+			DiagLog(fcBuf);
+		} else {
+			DiagLog("  CM operand: none (FixedColor=0, AddSubscreen=0)");
+		}
+
+		// What gets color math?
+		uint8_t cmLayers = sa.ColorMathEnabled & 0x3F;
+		if(cmLayers) {
+			char cmBuf[256];
+			snprintf(cmBuf, sizeof(cmBuf),
+				"  CM applied to: %s%s%s%s%s%s (register=$%02X, %s mode)",
+				(cmLayers & 0x01) ? "BG1 " : "",
+				(cmLayers & 0x02) ? "BG2 " : "",
+				(cmLayers & 0x04) ? "BG3 " : "",
+				(cmLayers & 0x08) ? "BG4 " : "",
+				(cmLayers & 0x10) ? "OBJ " : "",
+				(cmLayers & 0x20) ? "Backdrop " : "",
+				sa.ColorMathEnabled,
+				sa.ColorMathSubtractMode ? "SUBTRACT" : "ADD");
+			DiagLog(cmBuf);
+		}
+
+		DiagLog("[SNES HD diag] ========== END LEVEL ANALYSIS ==========");
+		DiagLog("");
+	}
+
 	// Log build version once at startup
 	static bool buildVersionLogged = false;
 	if(!buildVersionLogged) {
