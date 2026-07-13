@@ -1,6 +1,49 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-13 | Mesen Build: P3.12 (BUILD+TEST PENDING) | Mainbrace: WORKING | Rambi Rumble: WORKING | Lockjaw: P3.12 palette tint fix pending test | Phase 4 Color Window: NOT STARTED
+Stand: 2026-07-14 | Mesen Build: P3.13 (BUILD+TEST PENDING) | Mainbrace: WORKING | Rambi Rumble: WORKING | Lockjaw: P3.13 combined ratio+tint fix pending test | Phase 4 Color Window: NOT STARTED
+
+---
+
+## P3.13 — Combined Palette Ratio + Additive Overlay Tint (2026-07-14)
+
+### Problem
+P3.12 logs (context #16, Lockjaw entering water) revealed the REAL mechanism:
+- HDMA splits screen: above water Main=$17 (BG1+BG2+BG3+OBJ), below water Main=$04 (only BG3)
+- Below water: PPU computes `BG3(main) + Sub(BG1+BG2)` — BG3 is dark blue water overlay
+- Our overlay code fires correctly (overlay=7113 pixels) and extracts BG3's blue tint
+- BUT: below water, the game also loads a DARKER palette for BG1/BG2 via CGRAM DMA
+- HD tiles were rendered with the ORIGINAL bright palette
+- Result: `HD_bright + BG3_blue` is BRIGHTER than native `BG3 + BG1_dark` — user confirmed!
+
+P3.12's palette tint mode (multiplicative only) was EXCLUSIVE with additive tint (only fired when overlay tint ≈ 0). For Lockjaw underwater, we need BOTH:
+- Multiplicative palette ratio to darken HD tiles (palette shift)
+- Additive overlay tint for BG3's blue color contribution
+
+### Fix: P3.13 Combined Mode
+For overlay pixels, ALWAYS compute both:
+1. **Additive tint** (as before): `tint = undoBrightness(ppuOutput) - SubScreenColor` = BG3's color
+2. **Palette ratio** (always enabled for overlay): `ratio = SubScreenColor / HD_center_pixel`
+3. **Combined application**: `result = (HD × ratio) + tint`
+
+This replaces P3.12's either/or logic with always-both.
+
+### Why this doesn't break Mainbrace
+For Mainbrace fog:
+- Palettes are NOT changed (same above/below fog)
+- SubScreenColor ≈ HD center pixel → ratio ≈ 1.0 (no darkening)
+- Additive tint = BG3 fog color (applied correctly as before)
+- Net effect: same as P3.12
+
+### Diagnostics
+- `PALRATIO-SAMPLE` log: first 5 overlay pixels with ratio values, center colors, tint values
+- Shows palette ratio + additive tint decomposition per pixel
+
+### HDMA Split Detail (Lockjaw entering water, context #16)
+```
+Y   7-127: Main=$17 Sub=$13 CM=$24 AddSub=1 Br=15 — above water
+Y 128-130: Main=$15 Sub=$13 CM=$24 AddSub=1 Br=15 — transition
+Y 131-230: Main=$04 Sub=$13 CM=$24 AddSub=1 Br=15 — below water (BG3 only on main)
+```
 
 ---
 

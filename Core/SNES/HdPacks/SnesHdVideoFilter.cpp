@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.12"
+#define SNES_HD_BUILD_VERSION "P3.13"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -577,15 +577,23 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 		// Pre-compute color math second operand (BGR555 → RGB888)
 				uint8_t cmR = 0, cmG = 0, cmB = 0;
-				bool usePaletteTint = false;  // P3.12: multiplicative palette tint mode
+				bool usePaletteTint = false;  // P3.13: multiplicative palette tint mode
 				// SubScreenColor in 8-bit (pre-computed for palette tint)
 				uint8_t subR8 = 0, subG8 = 0, subB8 = 0;
 				if(applyColorMath) {
 					if(isOverlayPixel) {
-						// Overlay mode: extract the overlay tint from PPU output.
-						// PPU output = content + overlay (with brightness applied).
-						// SubScreenColor = raw content color (no brightness).
-						// overlay_color = undoBrightness(ppuOutput) - SubScreenColor
+						// P3.13: Overlay mode — combined palette ratio + additive tint.
+						// PPU output = Main(overlay) + Sub(content) [brightness applied]
+						// SubScreenColor = content color on sub screen (dark palette)
+						// HD tiles rendered with original (bright) palette.
+						//
+						// Strategy:
+						//   1. Extract additive overlay tint: tint = ppuOut/br - Sub
+						//   2. Always enable palette ratio: ratio = Sub / HD_center
+						//   3. Apply both: result = HD × ratio + tint
+						//
+						// This handles Lockjaw underwater (palette darken + BG3 blue)
+						// AND Mainbrace fog (additive tint only, ratio ≈ 1.0).
 						uint16_t ppuNative = ppuOutputBuffer[ppuIndex] & 0x7FFF;
 						uint8_t br = sl.ScreenBrightness;
 						int rawR, rawG, rawB;
@@ -603,22 +611,21 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						int tintG5 = std::max(0, std::min(31, rawG - subG));
 						int tintB5 = std::max(0, std::min(31, rawB - subB));
 
-						// P3.12: If overlay tint is zero/near-zero, this is a
-						// palette-based tint (e.g. Lockjaw underwater: HDMA shifts
-						// CGRAM palette to blue, but HD tiles were rendered with
-						// original palette). Use multiplicative palette tint instead.
-						if(tintR5 <= 1 && tintG5 <= 1 && tintB5 <= 1) {
-							usePaletteTint = true;
-							subR8 = ColorUtilities::Convert5BitTo8Bit(subR);
-							subG8 = ColorUtilities::Convert5BitTo8Bit(subG);
-							subB8 = ColorUtilities::Convert5BitTo8Bit(subB);
-							framePaletteTint++;
-							// cmR/cmG/cmB stay 0 — not used in palette tint mode
-						} else {
-							cmR = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintR5);
-							cmG = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintG5);
-							cmB = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintB5);
-						}
+						// Always store additive tint (even if zero — palette ratio
+						// will handle the darkening independently)
+						cmR = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintR5);
+						cmG = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintG5);
+						cmB = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintB5);
+
+						// P3.13: Always enable palette ratio for overlay pixels.
+						// When palettes match (above water / Mainbrace), ratio ≈ 1.0
+						// and has no visible effect. When palettes differ (underwater),
+						// ratio darkens HD tiles to match the game's palette shift.
+						usePaletteTint = true;
+						subR8 = ColorUtilities::Convert5BitTo8Bit(subR);
+						subG8 = ColorUtilities::Convert5BitTo8Bit(subG);
+						subB8 = ColorUtilities::Convert5BitTo8Bit(subB);
+						framePaletteTint++;
 					} else if(sl.ColorMathAddSubscreen) {
 						uint16_t cmColor = pixelInfo.SubScreenColor;
 						cmR = ColorUtilities::Convert5BitTo8Bit(cmColor & 0x1F);
@@ -642,10 +649,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					//   Sole BG on main = BG3 is the only compositing source
 					//   Both conditions together = BG3 is a fullscreen overlay
 					//
+					// Fires for:
+					//   Mainbrace: BG3 fog overlay on main, BG1/BG2 on sub
+					//   Lockjaw underwater: BG3 water on main, BG1/BG2 on sub
 					// Does NOT fire for:
-					//   Lockjaw: winner=BG1 (not BG3) → normal CM path
-					//   Rambi:   winner=BG1 (not BG3), honey tiles removed → Step 3
-					//   Normal:  no CM or multi-BG on main → normal path
+					//   Lockjaw above water: winner=BG1 (Main=$17) → no CM path
+					//   Rambi: winner=BG1, honey tiles removed → Step 3
+					//   Normal: no CM or multi-BG on main → normal path
 					if(cmActive && sl.ColorMathAddSubscreen && hdTileBot
 						&& winLayer == 2 && sl.Mode1Bg3Priority
 						&& (sl.MainScreenLayers & 0x0F) == (1u << 2)) {
@@ -691,6 +701,22 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 								palTintG = std::max(0, std::min(512, palTintG));
 								palTintB = std::max(0, std::min(512, palTintB));
 								palTintValid = true;
+
+								// P3.13 DIAGNOSTIC: Log first 5 palette ratio samples
+								if(diagPalTintSampleCount < 5 && isOverlayPixel) {
+									char buf[400];
+									snprintf(buf, sizeof(buf),
+										"[SNES HD diag] PALRATIO-SAMPLE "
+										"sub8=(%d,%d,%d) cen=(%d,%d,%d) "
+										"ratio=(%d,%d,%d)/256 tint8=(%d,%d,%d) "
+										"x=%d y=%d MainLayers=0x%02X",
+										subR8, subG8, subB8, cenR, cenG, cenB,
+										palTintR, palTintG, palTintB,
+										(int)cmR, (int)cmG, (int)cmB,
+										x, y, sl.MainScreenLayers);
+									DiagLog(buf);
+									diagPalTintSampleCount++;
+								}
 							}
 						}
 					}
@@ -767,10 +793,21 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						// Apply color math to HD pixel
 							if(applyColorMath) {
 								if(usePaletteTint && palTintValid) {
-									// P3.12: Apply pre-computed multiplicative palette tint
+									// P3.13: Combined palette ratio + additive tint.
+									// Step 1: darken HD pixel by palette ratio
 									hdR = (uint8_t)std::min(255, (int)hdR * palTintR / 256);
 									hdG = (uint8_t)std::min(255, (int)hdG * palTintG / 256);
 									hdB = (uint8_t)std::min(255, (int)hdB * palTintB / 256);
+									// Step 2: add overlay tint (BG3 color / fixed color)
+									if(sl.ColorMathSubtractMode) {
+										hdR = (hdR > cmR) ? (hdR - cmR) : 0;
+										hdG = (hdG > cmG) ? (hdG - cmG) : 0;
+										hdB = (hdB > cmB) ? (hdB - cmB) : 0;
+									} else {
+										hdR = (uint8_t)std::min(255, (int)hdR + (int)cmR);
+										hdG = (uint8_t)std::min(255, (int)hdG + (int)cmG);
+										hdB = (uint8_t)std::min(255, (int)hdB + (int)cmB);
+									}
 								} else if(sl.ColorMathSubtractMode) {
 									hdR = (hdR > cmR) ? (hdR - cmR) : 0;
 									hdG = (hdG > cmG) ? (hdG - cmG) : 0;
