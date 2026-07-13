@@ -1,6 +1,25 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-07 | Mesen Build: P2.0 (BUILD+TEST PENDING) | Phase 2 Multi-Layer Compositing: CODE DONE — replaces M5.19 heuristic cascade | VRAM-Dump-Pipeline: COMPLETE | Wall-Pipeline: COMPLETE (untested) | BG3 Foreground: ShipDeck IMPLEMENTED + Virtual Tilemap Pipeline COMPLETE (test pending) | Issues J-P: Expected to be SUPERSEDED by Phase 2-4 engine
+Stand: 2026-07-13 | Mesen Build: P3.11 (BUILD+TEST PENDING) | Mainbrace: WORKING | Rambi Rumble: WORKING | Lockjaw: BLOCKED (never appeared in diag logs — v4 file contained only Mainbrace) | Phase 4 Color Window: NOT STARTED
+
+---
+
+## P3.11 — Context Key Fix: PPU Registers in Context Identity (2026-07-13)
+
+### Problem
+Lockjaw's Locker never appeared in diagnostic logs despite user entering the level. The v4 diag file (5609 lines, 107 context changes) contained ONLY Mainbrace Mayhem data — all LEVEL ANALYSIS blocks showed Main=$04/Sub=$13/CM=$24. Zero trace of Lockjaw's register pattern (Main=$01/Sub=$16/CM=$21).
+
+### Root Cause Analysis
+Context detection was based ONLY on VRAM signature hash. While VRAM content should differ between level types, the diagnostic system had no PPU register info in context change lines or frame summaries, making it impossible to verify what level was actually running.
+
+### Fix
+1. **Combined context key**: `contextKey = vramSig XOR (ppuConfigKey * golden_ratio)` — ensures levels with different PPU configs are ALWAYS separate contexts, even if VRAM hashes were to collide
+2. **PPU registers in CONTEXT CHANGE lines**: Now shows `Main=$XX Sub=$XX CM=$XX AddSub=X Br=X`
+3. **PPU registers in FRAME summary lines**: Every frame now includes `Main=$XX Sub=$XX CM=$XX`
+4. Context detection moved from VRAM-only to VRAM+PPU combined key
+
+### Next Step
+User needs to test again — enter Lockjaw's Locker and provide new P3.11 logs. The enhanced context detection should now capture Lockjaw as a distinct context with full PPU register visibility.
 
 ---
 

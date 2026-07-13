@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.10"
+#define SNES_HD_BUILD_VERSION "P3.11"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -186,12 +186,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	bool isHiRes = (ppuWidth == 512);
 
 	// =====================================================================
-	// DIAGNOSTIC: Context-aware logging with VRAM-based level/worldmap detection
+	// DIAGNOSTIC: Context-aware logging with combined VRAM+PPU detection
+	// Context = VRAM signature + core PPU registers (Main/Sub/CM at scanline 120).
+	// This ensures levels with different PPU configs are ALWAYS separate contexts,
+	// even if their VRAM hashes collide (e.g., Lockjaw vs Mainbrace).
 	// All per-context counters are reset together on context change.
 	// Frame budget per context: 10 total + 60 BG frames.
-	// Supports unlimited level visits — each gets its own budget.
 	// =====================================================================
-	static uint64_t diagPrevVramSig = 0;
+	static uint64_t diagPrevContextKey = 0;
 	static int diagFrameCount = 0;
 	static int diagBgFrameCount = 0;
 	static int diagMissCount = 0;
@@ -214,14 +216,36 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint64_t vramSig = sigA ^ (sigB << 1);
 	isWorldmap = (vramSig == 0xDBF342F9932FD251ULL);
 
-	// Detect context change (level transition) → reset ALL diagnostic counters
-	bool diagContextChanged = (vramSig != diagPrevVramSig);
-	if(diagContextChanged && diagPrevVramSig != 0) {
+	// PPU config snapshot at scanline 120 (mid-screen, stable reference)
+	SnesHdScanlineInfo& slCtx = hdScreen->ScanlineInfo[120];
+	uint64_t ppuConfigKey =
+		((uint64_t)slCtx.MainScreenLayers) |
+		((uint64_t)slCtx.SubScreenLayers << 8) |
+		((uint64_t)slCtx.ColorMathEnabled << 16) |
+		((uint64_t)(slCtx.ColorMathAddSubscreen ? 1 : 0) << 24) |
+		((uint64_t)(slCtx.ColorMathSubtractMode ? 1 : 0) << 25) |
+		((uint64_t)(slCtx.ColorMathHalveResult ? 1 : 0) << 26) |
+		((uint64_t)(slCtx.Mode1Bg3Priority ? 1 : 0) << 27) |
+		((uint64_t)slCtx.BgMode << 28) |
+		((uint64_t)(slCtx.FixedColor & 0x7FFF) << 32) |
+		((uint64_t)(slCtx.ScreenBrightness == 15 ? 15 : 0) << 48);
+
+	// Combined context key: VRAM sig XOR shifted PPU config
+	// Ensures Lockjaw (Main=$01/Sub=$16/CM=$21) is always distinct from
+	// Mainbrace (Main=$04/Sub=$13/CM=$24) even if VRAM hashes collide
+	uint64_t contextKey = vramSig ^ (ppuConfigKey * 0x9E3779B97F4A7C15ULL);
+
+	// Detect context change → reset ALL diagnostic counters
+	bool diagContextChanged = (contextKey != diagPrevContextKey);
+	if(diagContextChanged && diagPrevContextKey != 0) {
 		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
-		char buf[256];
+		char buf[512];
 		snprintf(buf, sizeof(buf),
-			"[SNES HD diag] === CONTEXT CHANGE #%d (build=" SNES_HD_BUILD_VERSION "): sig %016llX -> %016llX (%s) ===",
-			diagContextCount, (unsigned long long)diagPrevVramSig, (unsigned long long)vramSig, ctxLabel);
+			"[SNES HD diag] === CONTEXT CHANGE #%d (build=" SNES_HD_BUILD_VERSION "): "
+			"sig %016llX (%s) Main=$%02X Sub=$%02X CM=$%02X AddSub=%d Br=%d ===",
+			diagContextCount, (unsigned long long)vramSig, ctxLabel,
+			slCtx.MainScreenLayers, slCtx.SubScreenLayers, slCtx.ColorMathEnabled,
+			slCtx.ColorMathAddSubscreen ? 1 : 0, slCtx.ScreenBrightness);
 		DiagLog(buf);
 	}
 	if(diagContextChanged) {
@@ -236,36 +260,22 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagContextCount++;
 	}
 
-	// PPU config snapshot — logged on EVERY context change (immediate, not deferred)
-	// Also logged when PPU config changes within same VRAM sig (HDMA-driven levels)
+	// Track pending context log for deferred PPU config logging
 	static uint64_t diagPrevPpuConfigKey = 0;
 	static bool diagPendingContextLog = false;
 	static uint64_t diagPendingVramSig = 0;
 
-	SnesHdScanlineInfo& slCtx = hdScreen->ScanlineInfo[120];
-	uint64_t ppuConfigKey =
-		((uint64_t)slCtx.MainScreenLayers) |
-		((uint64_t)slCtx.SubScreenLayers << 8) |
-		((uint64_t)slCtx.ColorMathEnabled << 16) |
-		((uint64_t)(slCtx.ColorMathAddSubscreen ? 1 : 0) << 24) |
-		((uint64_t)(slCtx.ColorMathSubtractMode ? 1 : 0) << 25) |
-		((uint64_t)(slCtx.ColorMathHalveResult ? 1 : 0) << 26) |
-		((uint64_t)(slCtx.Mode1Bg3Priority ? 1 : 0) << 27) |
-		((uint64_t)slCtx.BgMode << 28) |
-		((uint64_t)(slCtx.FixedColor & 0x7FFF) << 32) |
-		((uint64_t)(slCtx.ScreenBrightness == 15 ? 15 : 0) << 48);
-
-	if(vramSig != diagPrevVramSig) {
+	if(contextKey != diagPrevContextKey) {
 		diagPendingVramSig = vramSig;
 	}
 
-	if(ppuConfigKey != diagPrevPpuConfigKey || diagPrevVramSig == 0) {
+	if(ppuConfigKey != diagPrevPpuConfigKey || diagPrevContextKey == 0) {
 		diagPendingContextLog = true;
 		diagPendingVramSig = vramSig;
 		diagPrevPpuConfigKey = ppuConfigKey;
 	}
 
-	diagPrevVramSig = vramSig;
+	diagPrevContextKey = contextKey;
 
 	// Per-frame counters
 	uint32_t frameTotalPixels = 0;
@@ -811,6 +821,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
+			" Main=$%02X Sub=$%02X CM=$%02X"
 			" (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount, ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch,
@@ -819,6 +830,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
 			frameWin[0], frameWin[1], frameWin[2], frameWin[3],
+			slCtx.MainScreenLayers, slCtx.SubScreenLayers, slCtx.ColorMathEnabled,
 			_hdData->TileByKey.size(),
 			(unsigned long long)vramSig);
 		DiagLog(buf);
