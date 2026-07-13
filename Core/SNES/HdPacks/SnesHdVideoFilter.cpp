@@ -322,11 +322,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPpuTileInfo* hdTileInfoBot = nullptr;
 			bool applyColorMath = false;
 			bool isOverlayPixel = false;  // true when CM overlay path found HD content
+			bool cmActive = false;  // hoisted so the rendering section (below) can see it too
+			uint8_t winLayer = 0xFF;  // hoisted so the rendering section (below) can see it too
 
 			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
 				frameBgPixels++;
 
-				uint8_t winLayer = pixelInfo.BgWinnerLayer;
+				winLayer = pixelInfo.BgWinnerLayer;
 				if(winLayer < 4) frameWin[winLayer]++;
 
 				// Count per-layer content bits (diagnostic only)
@@ -335,7 +337,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 
 				// Check if Color Math is active for this pixel
-				bool cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
+				cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
 
 				// ---------------------------------------------------------
 				// Unified HD tile lookup algorithm (P3.7):
