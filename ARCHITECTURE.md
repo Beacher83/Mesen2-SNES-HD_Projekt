@@ -535,9 +535,10 @@ without any level-specific code.
 
 ---
 
-## P3.9 Unified Algorithm — Definitive Reference
+## P3.10 Unified Algorithm — Definitive Reference
 
-**This is the FINAL algorithm. No swaps, no heuristics, no level-specific code.**
+**This is the FINAL algorithm. No heuristics, no level-specific code.
+All branching is based on PPU register state.**
 
 ### Tile Lookup (Steps 1-3)
 
@@ -547,6 +548,11 @@ Step 1: Try winner layer for HD tile (+ BG1↔BG2 retry)
 
 Step 2: If found → search for bottom HD tile (below winner in priority)
         → hdTileBot = bottom HD (sub-screen content, background, etc.)
+        
+        P3.10 BG3 Overlay Swap:
+        If ALL of: cmActive + AddSubscreen + hdTileBot +
+                   winLayer==2 + Mode1Bg3Priority + BG3 sole on main
+        → Swap: bottom becomes primary, isOverlayPixel=true
 
 Step 3: If NOT found + cmActive + AddSubscreen → overlay fallback
         Search other layers for HD content tile.
@@ -556,40 +562,48 @@ Step 3: If NOT found + cmActive + AddSubscreen → overlay fallback
 
 ### CM Operand Selection
 
-| Condition | CM Operand Source | Variable |
-|-----------|------------------|----------|
-| `isOverlayPixel` | Extracted from native: `undoBrightness(ppuOutput) - SubScreenColor` | `cmR/cmG/cmB` |
-| `AddSubscreen` + `hdTileBot` exists | **HD bottom tile pixel** (raw, pre-brightness) — per-subpixel | `pxCmR/pxCmG/pxCmB` |
-| `AddSubscreen` + no `hdTileBot` | Native `SubScreenColor` (BGR555→RGB888) | `cmR/cmG/cmB` |
-| `!AddSubscreen` (FixedColor) | `FixedColor` from scanline info | `cmR/cmG/cmB` |
+| Condition | CM Operand Source |
+|-----------|------------------|
+| `isOverlayPixel` (Step 3 or BG3 swap) | Extracted from native: `undoBrightness(ppuOutput) - SubScreenColor` |
+| `AddSubscreen` (normal path) | Native `SubScreenColor` (BGR555→RGB888) |
+| `!AddSubscreen` (FixedColor) | `FixedColor` from scanline info |
 
 ### Rendering (per sub-pixel dx,dy)
 
 ```
 1. result = native PPU pixel (fallback base)
 2. If hdTileBot: render bottom HD pixel (with brightness) over result
-   → Also capture raw pixel as pxCmR/pxCmG/pxCmB (if useHdSubPixel)
-3. Top HD pixel: apply CM(top, pxCm) → apply brightness → render over result
+3. Top HD pixel: apply CM(top, cm) → apply brightness → render over result
 ```
 
-### Why This Works for All Level Types
+### BG3 Overlay Swap — PPU Condition (not a heuristic)
 
-| Level | Winner (Main) | Bottom (Sub) | CM | Result |
-|-------|--------------|-------------|-----|--------|
-| **Mainbrace** | BG3 fog HD | BG1/BG2 content HD | ADD+Halve | `(fog + HD_content)/2` — foggy HD content |
-| **Lockjaw below water** | BG1 terrain HD | BG2/BG3 background HD | ADD+Halve | `(terrain + HD_bg)/2` — water-tinted terrain |
-| **Rambi** | BG1 honey HD | BG2/BG3 terrain HD | ADD+Halve | `(honey + HD_terrain)/2` — honey-glow terrain |
-| **Normal level** | BG1 terrain HD | (none or BG2 HD) | None | HD terrain, no CM |
-| **Overlay fallback** | (not found) | — | ADD+Sub | Content HD + native tint |
+The swap fires when three PPU conditions are ALL true simultaneously:
+1. `winLayer == 2` — BG3 won the compositing
+2. `Mode1Bg3Priority` — Game set $2105 bit 3 (BG3 promoted above BG1/BG2)
+3. `(MainScreenLayers & 0x0F) == 0x04` — BG3 is the SOLE BG on main screen
 
-### Key Design Decisions (locked down P3.9)
+This pattern identifies: **BG3 is a fullscreen overlay** (fog, etc.).
+It is NOT a level-specific check — any level with this PPU state will trigger it.
 
-1. **No swap:** Winner stays as top layer, bottom stays as bottom. Never discard.
-2. **HD sub-pixel CM:** When both layers have HD tiles, use HD color for CM — no
-   native-resolution data injected into HD pipeline.
-3. **Overlay fallback (Step 3)** only fires when winner has NO HD tile.
-4. **Per-subpixel:** CM operand varies per (dx,dy) based on actual HD bottom pixel.
-   Falls back to native SubScreenColor if bottom pixel is transparent (alpha=0).
+Levels where this fires: Mainbrace Mayhem (fog zones)
+Levels where this does NOT fire:
+- Lockjaw (winner=BG1, not BG3)
+- Rambi (winner=BG1, not BG3; honey tiles removed → Step 3)
+- Normal levels (no CM, or multi-BG on main)
+- Mainbrace without fog (Main=$17, multi-BG → BG3 not sole)
+
+### Why Each Level Works
+
+| Level | Winner | BG3 Swap? | Path | Result |
+|-------|--------|-----------|------|--------|
+| **Mainbrace (fog)** | BG3 | YES | Swap → overlay tint | HD content through fog |
+| **Mainbrace (no fog)** | BG1/BG2 | NO | Normal CM | HD terrain, normal colors |
+| **Lockjaw (underwater)** | BG1 | NO | Normal CM(+SubScreen) | HD terrain + water tint |
+| **Lockjaw (above water)** | BG1/BG2 | NO | Normal (no CM or multi-BG) | HD terrain, no tint |
+| **Rambi** | (none) | NO | Step 3 overlay fallback | HD terrain + honey tint |
+| **Hot-Head Hop** | varies | NO | Normal CM or no CM | HD terrain ± lava glow |
+| **Normal** | BG1/BG2 | NO | No CM | HD terrain, clean |
 
 ---
 
@@ -599,7 +613,7 @@ Step 3: If NOT found + cmActive + AddSubscreen → overlay fallback
 |-------|------|--------|------|
 | **1** | `SnesHdScanlineInfo` struct + PPU fills per scanline | **DONE** | Low |
 | **2** | Winner-only HD compositing with CM-skip | **P2.1 CODE DONE — BUILD+TEST PENDING** | Medium |
-| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **P3.9 — HD Sub-Screen CM** | High |
+| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **P3.10 — BG3 Overlay Swap** | High |
 | **4** | Color window + brightness at HD resolution | Pending | Medium |
 | **5** | Remove old special-case paths, update diagnostics | Pending | Low |
 

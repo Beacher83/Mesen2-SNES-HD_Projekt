@@ -21,7 +21,44 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
-## [2026-07-13] — Phase 3.9: HD Sub-Screen CM Operand (P3.9)
+## [2026-07-13] — Phase 3.10: Targeted BG3 Overlay Swap (P3.10)
+
+### BG3+Mode1Bg3Priority Overlay Swap + Lockjaw Fix
+
+**Datei:** `Core/SNES/HdPacks/SnesHdVideoFilter.cpp`
+
+**Problem P3.9:** `useHdSubPixel` (HD-Bottom als CM-Operand) verursachte zwei
+Regressionen:
+- Lockjaw: BG1 Terrain halb-transparent statt solid (CM ADD mit voller 8-bit
+  HD-Background-Farbe → zu starke Farbveränderung)
+- Mainbrace (ohne Nebel): leichte blaue Tönung auf BG1/BG2 Tiles in Bereichen
+  wo kein Nebel ist (useHdSubPixel feuerte für alle sole-on-main Pixel)
+
+**Lösung P3.10:** `useHdSubPixel` komplett entfernt. Stattdessen:
+
+1. **Gezielter BG3-Overlay-Swap:** Nur wenn ALLE drei PPU-Bedingungen erfüllt:
+   - `winLayer == 2` (BG3 ist der Compositing-Winner)
+   - `Mode1Bg3Priority` (Spiel hat BG3 priorisiert → Overlay-Pattern)
+   - `(MainScreenLayers & 0x0F) == 0x04` (BG3 ist sole BG auf Main)
+
+   → Swap: HD Content (BG1/BG2) wird Primary, Nebel-Tint aus nativem PPU-Output.
+
+2. **Alle anderen CM-Fälle:** Winner HD wird solid gerendert mit nativem
+   `SubScreenColor` als CM-Operand → leichte Tönung, kein Halbe-Transparenz.
+
+**Ergebnis — drei unabhängige Pfade ohne Heuristic:**
+
+| Level | Winner | Swap? | Rendering |
+|-------|--------|-------|-----------|
+| **Mainbrace (Nebel)** | BG3+Mode1Prio+sole | **JA** | HD Content + Nebel-Tint |
+| **Mainbrace (kein Nebel)** | BG1/BG2 | Nein | HD Winner + native CM |
+| **Lockjaw (unter Wasser)** | BG1 sole | Nein | HD Terrain + native Wasser-Tint |
+| **Rambi** | BG1 (entfernt) | Nein | Step 3 Overlay-Fallback |
+| **Normal** | BG1/BG2 | Nein | HD Winner, kein CM |
+
+---
+
+## [2026-07-13] — Phase 3.9: HD Sub-Screen CM Operand (P3.9) — REVERTED in P3.10
 
 ### Full-HD Color Math: CM(HD_main, HD_sub) statt CM(HD_main, native_sub)
 
