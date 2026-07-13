@@ -535,13 +535,71 @@ without any level-specific code.
 
 ---
 
+## P3.9 Unified Algorithm — Definitive Reference
+
+**This is the FINAL algorithm. No swaps, no heuristics, no level-specific code.**
+
+### Tile Lookup (Steps 1-3)
+
+```
+Step 1: Try winner layer for HD tile (+ BG1↔BG2 retry)
+        → hdTile = winner HD, hdTileInfo = winner tile info
+
+Step 2: If found → search for bottom HD tile (below winner in priority)
+        → hdTileBot = bottom HD (sub-screen content, background, etc.)
+
+Step 3: If NOT found + cmActive + AddSubscreen → overlay fallback
+        Search other layers for HD content tile.
+        → hdTile = content HD, isOverlayPixel = true
+        → CM operand = overlay tint extracted from native PPU output
+```
+
+### CM Operand Selection
+
+| Condition | CM Operand Source | Variable |
+|-----------|------------------|----------|
+| `isOverlayPixel` | Extracted from native: `undoBrightness(ppuOutput) - SubScreenColor` | `cmR/cmG/cmB` |
+| `AddSubscreen` + `hdTileBot` exists | **HD bottom tile pixel** (raw, pre-brightness) — per-subpixel | `pxCmR/pxCmG/pxCmB` |
+| `AddSubscreen` + no `hdTileBot` | Native `SubScreenColor` (BGR555→RGB888) | `cmR/cmG/cmB` |
+| `!AddSubscreen` (FixedColor) | `FixedColor` from scanline info | `cmR/cmG/cmB` |
+
+### Rendering (per sub-pixel dx,dy)
+
+```
+1. result = native PPU pixel (fallback base)
+2. If hdTileBot: render bottom HD pixel (with brightness) over result
+   → Also capture raw pixel as pxCmR/pxCmG/pxCmB (if useHdSubPixel)
+3. Top HD pixel: apply CM(top, pxCm) → apply brightness → render over result
+```
+
+### Why This Works for All Level Types
+
+| Level | Winner (Main) | Bottom (Sub) | CM | Result |
+|-------|--------------|-------------|-----|--------|
+| **Mainbrace** | BG3 fog HD | BG1/BG2 content HD | ADD+Halve | `(fog + HD_content)/2` — foggy HD content |
+| **Lockjaw below water** | BG1 terrain HD | BG2/BG3 background HD | ADD+Halve | `(terrain + HD_bg)/2` — water-tinted terrain |
+| **Rambi** | BG1 honey HD | BG2/BG3 terrain HD | ADD+Halve | `(honey + HD_terrain)/2` — honey-glow terrain |
+| **Normal level** | BG1 terrain HD | (none or BG2 HD) | None | HD terrain, no CM |
+| **Overlay fallback** | (not found) | — | ADD+Sub | Content HD + native tint |
+
+### Key Design Decisions (locked down P3.9)
+
+1. **No swap:** Winner stays as top layer, bottom stays as bottom. Never discard.
+2. **HD sub-pixel CM:** When both layers have HD tiles, use HD color for CM — no
+   native-resolution data injected into HD pipeline.
+3. **Overlay fallback (Step 3)** only fires when winner has NO HD tile.
+4. **Per-subpixel:** CM operand varies per (dx,dy) based on actual HD bottom pixel.
+   Falls back to native SubScreenColor if bottom pixel is transparent (alpha=0).
+
+---
+
 ## Implementation Phases
 
 | Phase | What | Status | Risk |
 |-------|------|--------|------|
 | **1** | `SnesHdScanlineInfo` struct + PPU fills per scanline | **DONE** | Low |
 | **2** | Winner-only HD compositing with CM-skip | **P2.1 CODE DONE — BUILD+TEST PENDING** | Medium |
-| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **P3.1 DONE** | High |
+| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **P3.9 — HD Sub-Screen CM** | High |
 | **4** | Color window + brightness at HD resolution | Pending | Medium |
 | **5** | Remove old special-case paths, update diagnostics | Pending | Low |
 

@@ -21,7 +21,40 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
-## [2026-07-13] — Phase 3.8: CM+AddSubscreen Overlay Swap (P3.8)
+## [2026-07-13] — Phase 3.9: HD Sub-Screen CM Operand (P3.9)
+
+### Full-HD Color Math: CM(HD_main, HD_sub) statt CM(HD_main, native_sub)
+
+**Datei:** `Core/SNES/HdPacks/SnesHdVideoFilter.cpp`
+
+**Problem P3.8:** Der Overlay-Swap-Ansatz (Winner verwerfen → Bottom als Primary)
+war nicht generisch genug. Er funktionierte für Mainbrace (Nebel=Overlay) aber
+verursachte Lockjaw-Regression (BG1=Terrain fälschlicherweise verworfen, da BG1
+ebenfalls sole-on-main + CM + AddSubscreen).
+
+**Lösung P3.9:** P3.8-Swap komplett entfernt. Stattdessen neuer Ansatz:
+Wenn BEIDE Layer (Winner + Bottom) HD-Tiles haben UND CM + AddSubscreen aktiv,
+wird der HD-Bottom-Pixel (raw, pre-brightness) als CM-Operand verwendet statt
+des nativen SubScreenColor. Ergebnis: `CM(HD_main, HD_sub)` — beide Seiten HD.
+
+**Rendering-Flow:**
+1. Bottom HD Tile → als Hintergrund gerendert (mit Brightness)
+2. Top HD Tile (Winner) → CM angewendet mit HD-Bottom als Operand → über Hintergrund
+3. Brightness auf CM-Ergebnis angewendet
+
+**Per-Subpixel Override:** `pxCmR/pxCmG/pxCmB` ersetzt `cmR/cmG/cmB` wenn
+`useHdSubPixel=true`. Wenn Bottom-Pixel transparent → Fallback auf native SubScreenColor.
+
+**Generische Wirkung — kein Heuristic, kein Sonderfall:**
+- Mainbrace: `CM(HD_fog, HD_content)` → nebliger HD-Content ✓
+- Lockjaw:   `CM(HD_terrain, HD_background)` → Wasser-getöntes HD-Terrain ✓
+- Rambi:     `CM(HD_honey, HD_terrain)` → Honig-Glow auf HD-Terrain ✓
+- Normal:    Kein CM → Winner HD normal gerendert ✓
+- Overlay-Fallback (Step 3): Unverändert — greift wenn Winner KEIN HD-Tile hat
+
+---
+
+## [2026-07-13] — Phase 3.8: CM+AddSubscreen Overlay Swap (P3.8) — REVERTED in P3.9
 
 ### Winner found + Color Math + AddSubscreen → overlay mode
 

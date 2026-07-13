@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.8"
+#define SNES_HD_BUILD_VERSION "P3.9"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -434,27 +434,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						}
 					}
 
-					// --- P3.8: CM+AddSubscreen swap ---
-					// When the winner is an overlay layer (fog/honey/water) that
-					// the PPU composites via Color Math with sub-screen content,
-					// and we found HD content underneath: swap to overlay mode.
-					// Only fires if the winner is NOT on the sub-screen (i.e.,
-					// it's a main-only overlay, not a content layer).
-					// This renders the sub-screen HD content as primary and
-					// applies the overlay tint extracted from the native PPU output,
-					// so HD content shows THROUGH the overlay effect.
-					if(cmActive && sl.ColorMathAddSubscreen && hdTileBot
-						&& !(sl.SubScreenLayers & (1 << winLayer))) {
-						// Swap: bottom HD becomes primary, discard winner HD tile
-						hdTile = hdTileBot;
-						hdTileInfo = hdTileInfoBot;
-						hdTileBot = nullptr;
-						hdTileInfoBot = nullptr;
-						isOverlayPixel = true;
-						// applyColorMath already true
-						frameOverlay++;
 					}
-				}
 				// --- Step 3: Winner NOT found + CM + AddSubscreen → overlay fallback ---
 				else if(cmActive && sl.ColorMathAddSubscreen) {
 					// Winner tile missing from HD pack — likely a semi-transparent
@@ -522,7 +502,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
 
 				// Pre-compute color math second operand (BGR555 → RGB888)
+				// This is the DEFAULT operand; may be overridden per-subpixel
+				// by the HD bottom tile when both layers have HD tiles (P3.9).
 				uint8_t cmR = 0, cmG = 0, cmB = 0;
+				bool useHdSubPixel = false; // P3.9: override CM operand per-subpixel
 				if(applyColorMath) {
 					if(isOverlayPixel) {
 						// Overlay mode: extract the overlay tint from PPU output.
@@ -558,6 +541,20 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					}
 				}
 
+					// P3.9: If both winner AND bottom have HD tiles, and CM uses
+					// AddSubscreen, override the CM operand per-subpixel with the
+					// HD bottom tile pixel. This gives full-HD Color Math:
+					// result = CM(HD_main, HD_sub) instead of CM(HD_main, native_sub).
+					// Works generically for all overlay types:
+					//   Mainbrace: CM(HD_fog, HD_content) → foggy HD content
+					//   Lockjaw:   CM(HD_terrain, HD_bg) → water-tinted HD terrain
+					//   Rambi:     CM(HD_honey, HD_terrain) → honey-glow HD terrain
+					if(!isOverlayPixel && sl.ColorMathAddSubscreen
+						&& hdTileBot && hdTileInfoBot && !hdTileBot->HdTileData.empty()) {
+						useHdSubPixel = true;
+					}
+				}
+
 				// Brightness from scanline info (0-15, applied after color math)
 				uint8_t brightness = sl.ScreenBrightness;
 
@@ -569,6 +566,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 						// Base: native PPU pixel
 						uint32_t result = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
+
+						// Per-subpixel CM operand (may be overridden by HD bottom)
+						uint8_t pxCmR = cmR, pxCmG = cmG, pxCmB = cmB;
 
 						// --- Bottom layer (if available) ---
 						if(hdTileBot && hdTileInfoBot && !hdTileBot->HdTileData.empty()) {
@@ -588,6 +588,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									uint8_t bR = (botColor >> 16) & 0xFF;
 									uint8_t bG = (botColor >> 8) & 0xFF;
 									uint8_t bB = botColor & 0xFF;
+
+									// P3.9: Use raw HD bottom pixel as CM operand
+									// (pre-brightness, like PPU's sub-screen input)
+									if(useHdSubPixel) {
+										pxCmR = bR;
+										pxCmG = bG;
+										pxCmB = bB;
+									}
+
 									// Apply brightness to bottom layer
 									if(brightness < 15) {
 										bR = (uint8_t)(bR * brightness / 15);
@@ -632,13 +641,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							// Apply color math to HD pixel
 							if(applyColorMath) {
 								if(sl.ColorMathSubtractMode) {
-									hdR = (hdR > cmR) ? (hdR - cmR) : 0;
-									hdG = (hdG > cmG) ? (hdG - cmG) : 0;
-									hdB = (hdB > cmB) ? (hdB - cmB) : 0;
+									hdR = (hdR > pxCmR) ? (hdR - pxCmR) : 0;
+									hdG = (hdG > pxCmG) ? (hdG - pxCmG) : 0;
+									hdB = (hdB > pxCmB) ? (hdB - pxCmB) : 0;
 								} else {
-									hdR = (uint8_t)std::min(255, (int)hdR + (int)cmR);
-									hdG = (uint8_t)std::min(255, (int)hdG + (int)cmG);
-									hdB = (uint8_t)std::min(255, (int)hdB + (int)cmB);
+									hdR = (uint8_t)std::min(255, (int)hdR + (int)pxCmR);
+									hdG = (uint8_t)std::min(255, (int)hdG + (int)pxCmG);
+									hdB = (uint8_t)std::min(255, (int)hdB + (int)pxCmB);
 								}
 								if(sl.ColorMathHalveResult) {
 									hdR >>= 1;
