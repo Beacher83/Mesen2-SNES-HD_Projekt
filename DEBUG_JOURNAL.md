@@ -45,6 +45,26 @@ Y 128-130: Main=$15 Sub=$13 CM=$24 AddSub=1 Br=15 — transition
 Y 131-230: Main=$04 Sub=$13 CM=$24 AddSub=1 Br=15 — below water (BG3 only on main)
 ```
 
+### Expected Test Result
+- **Lockjaw underwater:** BG1 HD tiles below water line should now be DARKER and BLUE-tinted (matching native BG2 appearance). Previously they were too bright.
+- **Mainbrace fog:** Should look identical to P3.12 (ratio ≈ 1.0, no darkening).
+- **Rambi Rumble:** Should be unaffected (uses Step 3 fallback, not overlay swap).
+- **Check PALRATIO-SAMPLE in diag log:** Shows `ratio` values — for Lockjaw underwater expect ratio < 256 (darkening). For Mainbrace expect ratio ≈ 256 (neutral).
+
+### Key Findings from P3.12 Log Analysis
+1. **ScreenBrightness=0 was a red herring** — that was the fade-in context (#9, Br=0). The actual gameplay context (#10/#16) has Br=15.
+2. **Lockjaw has TWO gameplay contexts:**
+   - Context #10: fully above water (hdmaSplit=0, no CM on BG1, no tint needed)
+   - Context #16: partially submerged (hdmaSplit=2, BG3 overlay swap fires below water line)
+3. **The overlay extraction DOES produce blue tint** (tintR=0, tintG=2, tintB=5) — but without palette darkening the net result was too bright.
+4. **DKC2 underwater uses BOTH mechanisms simultaneously:** CGRAM palette shift (multiplicative darkening) + BG3 additive overlay (blue water color).
+
+### Next Steps After Test
+- If Lockjaw looks correct → Lockjaw DONE, move to Phase 4 (Color Window for Gusty Glade)
+- If tint too dark → palette ratio might overcorrect; may need to clamp ratio minimum
+- If tint too blue/wrong hue → check PALRATIO-SAMPLE values, verify center pixel lookup is correct
+- If Mainbrace broken → ratio computation bug; check that SubScreenColor ≈ HD center for fog context
+
 ---
 
 ## P3.12 — Palette Tint: Multiplicative Color Correction for HDMA Palette Shifts (2026-07-13)
