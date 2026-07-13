@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.6"
+#define SNES_HD_BUILD_VERSION "P3.7"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -338,88 +338,23 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				bool cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
 
 				// ---------------------------------------------------------
-				// Generic Overlay Detection:
-				// When the PPU winner is the SOLE BG layer on main screen
-				// AND Color Math + AddSubscreen are active, the winner acts
-				// as an overlay (fog, honey, water). The actual HD content
-				// is on the sub-screen layers below.
+				// Unified HD tile lookup algorithm (P3.7):
 				//
-				// Covers:
-				//   Mainbrace: BG3 fog on main ($04), BG1+BG2 on sub ($13)
-				//   Rambi:     BG1 honey on main ($01), BG2+BG3 on sub ($16)
-				//   Lockjaw:   BG1 water on main ($01), BG2+BG3 on sub ($16)
+				// 1. Try winner layer for HD tile
+				// 2. If found → render with CM (if active), find bottom layer
+				// 3. If NOT found + CM active + AddSubscreen → winner is likely
+				//    a semi-transparent overlay (fog/honey/water) whose tile
+				//    was removed from the HD pack. Search other layers for
+				//    HD content and apply overlay tint extracted from native.
+				// 4. If NOT found + no CM fallback → show native (miss)
 				//
-				// Skip the overlay layer → search sub-screen layers for HD
-				// tiles → apply CM (= HD content visible through effect tint).
+				// No level-specific detection. Works generically for:
+				//   Mainbrace fog, Rambi honey, Lockjaw water, normal levels.
 				// ---------------------------------------------------------
 				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
 
-				// Winner is sole BG on main screen? (mask out OBJ bit 4)
-				uint8_t mainBgOnly = sl.MainScreenLayers & 0x0F;
-				bool isSoleBgOnMain = (mainBgOnly == (1 << winLayer));
-				bool cmOverlay = cmActive && sl.ColorMathAddSubscreen && isSoleBgOnMain;
-
-				if(cmOverlay) {
-					// Strategy: Try the winner layer FIRST. If it has an HD tile,
-					// it's the actual content (e.g. Lockjaw terrain) that needs
-					// SubScreenColor added as CM tint. If not found, the winner
-					// is likely a transparent overlay (Rambi honey, Mainbrace fog)
-					// so search sub-screen layers for HD content instead.
-
-					// --- Try winner layer (content-on-main case) ---
-					if(pixelInfo.BgLayerMask & (1 << winLayer)) {
-						hdTile = _hdData->GetMatchingTile(
-							pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
-						if(!hdTile && (winLayer == 0 || winLayer == 1)) {
-							SnesHdTileKey altKey = pixelInfo.BgTiles[winLayer].Key;
-							altKey.LayerIndex = (winLayer == 0) ? 1 : 0;
-							hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-							if(hdTile) frameLayerRetry++;
-						}
-						if(hdTile) {
-							hdTileInfo = &pixelInfo.BgTiles[winLayer];
-							frameHdMatch++;
-							frameHdLayers[winLayer]++;
-							applyColorMath = true;
-							// NOT isOverlayPixel: use SubScreenColor directly as CM operand
-							frameHdCm++;
-						}
-					}
-
-					// --- Fallback: search sub-screen layers (overlay case) ---
-					if(!hdTile) {
-						for(int tryLayer = 0; tryLayer < 3 && !hdTile; tryLayer++) {
-							if(tryLayer == winLayer) continue;
-							if(!(pixelInfo.BgLayerMask & (1 << tryLayer))) continue;
-
-							hdTile = _hdData->GetMatchingTile(
-								pixelInfo.BgTiles[tryLayer].Key, hdScreen->Vram);
-							// BG1↔BG2 layer retry
-							if(!hdTile && (tryLayer == 0 || tryLayer == 1)) {
-								SnesHdTileKey altKey = pixelInfo.BgTiles[tryLayer].Key;
-								altKey.LayerIndex = (tryLayer == 0) ? 1 : 0;
-								hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
-								if(hdTile) frameLayerRetry++;
-							}
-							if(hdTile) {
-								hdTileInfo = &pixelInfo.BgTiles[tryLayer];
-								frameHdMatch++;
-								frameHdLayers[tryLayer]++;
-								applyColorMath = true;
-								isOverlayPixel = true;
-								frameHdCm++;
-								frameOverlay++;
-							}
-						}
-					}
-					if(!hdTile) {
-						frameHdMiss++;
-					}
-				}
-				// ---------------------------------------------------------
-				// Normal path: Look up HD tile for the PPU winner (top layer)
-				// ---------------------------------------------------------
-				else if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+				// --- Step 1: Try winner layer ---
+				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
 					hdTile = _hdData->GetMatchingTile(
 						pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
 
@@ -430,78 +365,102 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
 						if(hdTile) frameLayerRetry++;
 					}
+				}
 
-					if(hdTile) {
-						hdTileInfo = &pixelInfo.BgTiles[winLayer];
-						frameHdMatch++;
-						frameHdLayers[winLayer]++;
-						if(cmActive) {
-							applyColorMath = true;
-							frameHdCm++;
+				if(hdTile) {
+					// --- Step 2: Winner found → render with CM + bottom layer ---
+					hdTileInfo = &pixelInfo.BgTiles[winLayer];
+					frameHdMatch++;
+					frameHdLayers[winLayer]++;
+					if(cmActive) {
+						applyColorMath = true;
+						frameHdCm++;
+					}
+
+					// DIAGNOSTIC: Log first 5 unique matches per context
+					if(diagMatchCount < 5) {
+						auto& key = pixelInfo.BgTiles[winLayer].Key;
+						if(key.ContentHash != 0
+							&& diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
+							diagLoggedHashes.insert(key.ContentHash);
+							char buf[320];
+							snprintf(buf, sizeof(buf),
+								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d win=%d cm=%d",
+								(unsigned long long)key.ContentHash, key.PaletteIndex,
+								key.LayerIndex, winLayer, cmActive ? 1 : 0);
+							DiagLog(buf);
+							diagMatchCount++;
 						}
+					}
 
-						// DIAGNOSTIC: Log first 5 unique matches per context
-						if(diagMatchCount < 5) {
-							auto& key = pixelInfo.BgTiles[winLayer].Key;
-							if(key.ContentHash != 0
-								&& diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
-								diagLoggedHashes.insert(key.ContentHash);
-								char buf[320];
-								snprintf(buf, sizeof(buf),
-									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d win=%d cm=%d",
-									(unsigned long long)key.ContentHash, key.PaletteIndex,
-									key.LayerIndex, winLayer, cmActive ? 1 : 0);
-								DiagLog(buf);
-								diagMatchCount++;
-							}
+					// Find bottom layer (for transparency compositing)
+					uint8_t prioOrder[6];
+					int prioCount = 0;
+
+					uint8_t bg1P = pixelInfo.BgTiles[0].Priority;
+					uint8_t bg2P = pixelInfo.BgTiles[1].Priority;
+					uint8_t bg3P = pixelInfo.BgTiles[2].Priority;
+
+					if(sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
+					if(bg1P) prioOrder[prioCount++] = 0;
+					if(bg2P) prioOrder[prioCount++] = 1;
+					if(!bg1P) prioOrder[prioCount++] = 0;
+					if(!bg2P) prioOrder[prioCount++] = 1;
+					if(!sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
+					if(!bg3P) prioOrder[prioCount++] = 2;
+
+					bool pastWinner = false;
+					for(int pi = 0; pi < prioCount && !hdTileBot; pi++) {
+						uint8_t layer = prioOrder[pi];
+						if(layer == winLayer) {
+							pastWinner = true;
+							continue;
 						}
-
-						// Step 2: Find bottom layer (for transparency compositing)
-						// Walk layers below the winner in Mode 1 priority order.
-						uint8_t prioOrder[6];
-						int prioCount = 0;
-
-						// Build full priority order
-						uint8_t bg1P = pixelInfo.BgTiles[0].Priority;
-						uint8_t bg2P = pixelInfo.BgTiles[1].Priority;
-						uint8_t bg3P = pixelInfo.BgTiles[2].Priority;
-
-						if(sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
-						if(bg1P) prioOrder[prioCount++] = 0;
-						if(bg2P) prioOrder[prioCount++] = 1;
-						if(!bg1P) prioOrder[prioCount++] = 0;
-						if(!bg2P) prioOrder[prioCount++] = 1;
-						if(!sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
-						if(!bg3P) prioOrder[prioCount++] = 2;
-
-						// Find winner's position in priority order, then search below
-						bool pastWinner = false;
-						for(int pi = 0; pi < prioCount && !hdTileBot; pi++) {
-							uint8_t layer = prioOrder[pi];
-							if(layer == winLayer) {
-								pastWinner = true;
-								continue;
-							}
-							if(!pastWinner) continue;
-							if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
-
-						// Only consider layers on main or sub screen
+						if(!pastWinner) continue;
+						if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
 						if(!((sl.MainScreenLayers | sl.SubScreenLayers) & (1 << layer))) continue;
 
-							SnesHdPackTileInfo* tile2 = _hdData->GetMatchingTile(
-								pixelInfo.BgTiles[layer].Key, hdScreen->Vram);
-							if(!tile2 && (layer == 0 || layer == 1)) {
-								SnesHdTileKey altKey2 = pixelInfo.BgTiles[layer].Key;
-								altKey2.LayerIndex = (layer == 0) ? 1 : 0;
-								tile2 = _hdData->GetMatchingTile(altKey2, hdScreen->Vram);
-							}
-							if(tile2) {
-								hdTileBot = tile2;
-								hdTileInfoBot = &pixelInfo.BgTiles[layer];
-								frameMultiLayer++;
-							}
+						SnesHdPackTileInfo* tile2 = _hdData->GetMatchingTile(
+							pixelInfo.BgTiles[layer].Key, hdScreen->Vram);
+						if(!tile2 && (layer == 0 || layer == 1)) {
+							SnesHdTileKey altKey2 = pixelInfo.BgTiles[layer].Key;
+							altKey2.LayerIndex = (layer == 0) ? 1 : 0;
+							tile2 = _hdData->GetMatchingTile(altKey2, hdScreen->Vram);
 						}
-					} else {
+						if(tile2) {
+							hdTileBot = tile2;
+							hdTileInfoBot = &pixelInfo.BgTiles[layer];
+							frameMultiLayer++;
+						}
+					}
+				}
+				// --- Step 3: Winner NOT found + CM + AddSubscreen → overlay fallback ---
+				else if(cmActive && sl.ColorMathAddSubscreen) {
+					// Winner tile missing from HD pack — likely a semi-transparent
+					// overlay (fog, honey, water). Search other layers for HD content.
+					for(int tryLayer = 0; tryLayer < 3 && !hdTile; tryLayer++) {
+						if(tryLayer == winLayer) continue;
+						if(!(pixelInfo.BgLayerMask & (1 << tryLayer))) continue;
+
+						hdTile = _hdData->GetMatchingTile(
+							pixelInfo.BgTiles[tryLayer].Key, hdScreen->Vram);
+						if(!hdTile && (tryLayer == 0 || tryLayer == 1)) {
+							SnesHdTileKey altKey = pixelInfo.BgTiles[tryLayer].Key;
+							altKey.LayerIndex = (tryLayer == 0) ? 1 : 0;
+							hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+							if(hdTile) frameLayerRetry++;
+						}
+						if(hdTile) {
+							hdTileInfo = &pixelInfo.BgTiles[tryLayer];
+							frameHdMatch++;
+							frameHdLayers[tryLayer]++;
+							applyColorMath = true;
+							isOverlayPixel = true;
+							frameHdCm++;
+							frameOverlay++;
+						}
+					}
+					if(!hdTile) {
 						frameHdMiss++;
 
 						// DIAGNOSTIC: Log first 60 unique misses per context
