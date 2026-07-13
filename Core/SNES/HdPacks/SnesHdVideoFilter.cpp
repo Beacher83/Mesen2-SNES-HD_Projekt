@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.2"
+#define SNES_HD_BUILD_VERSION "P3.3"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -144,27 +144,26 @@ OverscanDimensions SnesHdVideoFilter::GetOverscan()
 }
 
 // =========================================================================
-// Phase 3.1: Winner-First HD Compositing with Bottom-Layer Enhancement
+// Phase 3.3: Generic CM Overlay + Winner-First HD Compositing
 // =========================================================================
-// Extends P3.0 with multi-layer support while preserving P2.1 safety:
+// Extends P3.2 with generic overlay detection (replaces BG3-only check):
 //
 //   1. PPU winner is ALWAYS the top layer (avoids P2.0 bugs)
-//   2. Look up HD tile for winner layer (+BG1↔BG2 retry)
-//   3. If winner has NO HD tile → native pixel (winner is opaque, done)
-//   4. If winner HAS HD tile → render it as top layer
-//   5. If top HD tile has transparency: find next layer below in Mode 1
-//      priority order as "bottom layer" for compositing behind it
-//   6. Apply Color Math if AllowColorMath set for the pixel
-//   7. Apply Brightness after Color Math
+//   2. CM Overlay: if winner is sole BG on main screen + CM + AddSubscreen,
+//      skip overlay (fog/honey/water) → search sub-screen layers for HD
+//   3. Normal: look up HD tile for winner layer (+BG1↔BG2 retry)
+//   4. If winner has NO HD tile → native pixel (winner is opaque, done)
+//   5. If winner HAS HD tile → render it as top layer
+//   6. If top HD tile has transparency: find bottom layer for compositing
+//   7. Apply Color Math if AllowColorMath set for the pixel
+//   8. Apply Brightness after Color Math
 //
-// Mode 1 Priority Order (high to low, excluding sprites):
-//   If Mode1Bg3Priority: BG3P1 > BG1P1 > BG2P1 > BG1P0 > BG2P0 > BG3P0
-//   Normal:              BG1P1 > BG2P1 > BG1P0 > BG2P0 > BG3P1 > BG3P0
+// CM Overlay covers: Mainbrace fog (BG3), Rambi honey (BG1), Lockjaw water (BG1)
 //
 // Safety guarantees:
 //   - spriteWon → native pixel (sprites have absolute compositing priority)
 //   - Winner has no HD tile → native pixel (no lower-priority tile leakage)
-//   - Bottom layer filtered by MainScreenLayers (sub-screen layers excluded)
+//   - Layers filtered by MainScreenLayers|SubScreenLayers
 // =========================================================================
 
 void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
@@ -221,57 +220,39 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagMatchCount = 0;
 		diagLoggedHashes.clear();
 	}
-	// Log full PPU register snapshot to context file on EVERY context (including first)
+	// Build a compact PPU config key from the registers that matter for rendering.
+	// Context log fires only when this key changes (not on every VRAM sig change,
+	// which cycles rapidly in animated levels like Lockjaw).
+	static uint64_t diagPrevPpuConfigKey = 0;
+	static bool diagPendingContextLog = false;  // deferred until first BG-content frame
+	static uint64_t diagPendingVramSig = 0;
+
+	SnesHdScanlineInfo& slCtx = hdScreen->ScanlineInfo[120];
+	uint64_t ppuConfigKey =
+		((uint64_t)slCtx.MainScreenLayers) |
+		((uint64_t)slCtx.SubScreenLayers << 8) |
+		((uint64_t)slCtx.ColorMathEnabled << 16) |
+		((uint64_t)(slCtx.ColorMathAddSubscreen ? 1 : 0) << 24) |
+		((uint64_t)(slCtx.ColorMathSubtractMode ? 1 : 0) << 25) |
+		((uint64_t)(slCtx.ColorMathHalveResult ? 1 : 0) << 26) |
+		((uint64_t)(slCtx.Mode1Bg3Priority ? 1 : 0) << 27) |
+		((uint64_t)slCtx.BgMode << 28) |
+		((uint64_t)(slCtx.FixedColor & 0x7FFF) << 32) |
+		((uint64_t)slCtx.ScreenBrightness << 48);
+
+	// On VRAM sig change, always update sig tracking
 	if(vramSig != diagPrevVramSig) {
-		SnesHdScanlineInfo& slCtx = hdScreen->ScanlineInfo[120];
-		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
-
-		// Determine detected rendering mode
-		const char* renderMode = "NORMAL";
-		if(slCtx.Mode1Bg3Priority && (slCtx.ColorMathEnabled & 0x04)) {
-			renderMode = "BG3_OVERLAY";  // BG3 wins + CM on BG3 → fog/overlay
-		} else if(slCtx.ColorMathAddSubscreen && (slCtx.SubScreenLayers & 0x04)) {
-			renderMode = "SUBSCREEN_BLEND";  // BG3 on sub-screen (honey etc.)
-		} else if(!slCtx.ColorMathAddSubscreen && slCtx.FixedColor != 0x0000) {
-			renderMode = "FIXED_COLOR";  // Blend with FixedColor (mine fog etc.)
-		}
-
-		char ctxBuf[1024];
-		snprintf(ctxBuf, sizeof(ctxBuf),
-			"--- CONTEXT: sig=%016llX (%s) ---\n"
-			"  BgMode=%d  Mode1Bg3Pri=%d\n"
-			"  MainScreenLayers=$%02X  SubScreenLayers=$%02X\n"
-			"  CMEnabled=$%02X (BG1=%d BG2=%d BG3=%d BG4=%d OBJ=%d BDrop=%d)\n"
-			"  AddSubscreen=%d  SubtractMode=%d  HalveResult=%d\n"
-			"  FixedColor=$%04X  ScreenBrightness=%d\n"
-			"  ClipMode=%d  PreventMode=%d\n"
-			"  Window1: L=%d R=%d  Window2: L=%d R=%d\n"
-			"  ColorWin: active=[%d,%d] inv=[%d,%d] logic=%d\n"
-			"  → Detected mode: %s\n",
-			(unsigned long long)vramSig, ctxLabel,
-			slCtx.BgMode, slCtx.Mode1Bg3Priority ? 1 : 0,
-			slCtx.MainScreenLayers, slCtx.SubScreenLayers,
-			slCtx.ColorMathEnabled,
-			(slCtx.ColorMathEnabled & 0x01) ? 1 : 0,
-			(slCtx.ColorMathEnabled & 0x02) ? 1 : 0,
-			(slCtx.ColorMathEnabled & 0x04) ? 1 : 0,
-			(slCtx.ColorMathEnabled & 0x08) ? 1 : 0,
-			(slCtx.ColorMathEnabled & 0x10) ? 1 : 0,
-			(slCtx.ColorMathEnabled & 0x20) ? 1 : 0,
-			slCtx.ColorMathAddSubscreen ? 1 : 0,
-			slCtx.ColorMathSubtractMode ? 1 : 0,
-			slCtx.ColorMathHalveResult ? 1 : 0,
-			slCtx.FixedColor, slCtx.ScreenBrightness,
-			(int)slCtx.ColorMathClipMode, (int)slCtx.ColorMathPreventMode,
-			slCtx.Window1Left, slCtx.Window1Right,
-			slCtx.Window2Left, slCtx.Window2Right,
-			slCtx.ColorWindowActive[0] ? 1 : 0, slCtx.ColorWindowActive[1] ? 1 : 0,
-			slCtx.ColorWindowInverted[0] ? 1 : 0, slCtx.ColorWindowInverted[1] ? 1 : 0,
-			(int)slCtx.ColorWindowMaskLogic,
-			renderMode);
-		ContextLog(ctxBuf);
-		DiagLog(ctxBuf);
+		diagPendingVramSig = vramSig;
 	}
+
+	// On PPU config change OR first frame, mark context log as pending
+	// (will fire once we see a frame with actual BG content, avoiding transition zeros)
+	if(ppuConfigKey != diagPrevPpuConfigKey || diagPrevVramSig == 0) {
+		diagPendingContextLog = true;
+		diagPendingVramSig = vramSig;
+		diagPrevPpuConfigKey = ppuConfigKey;
+	}
+
 	diagPrevVramSig = vramSig;
 
 	// Per-frame counters
@@ -339,24 +320,37 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				bool cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
 
 				// ---------------------------------------------------------
-				// BG3 Overlay Detection: When BG3 wins with Mode1Bg3Priority
-				// AND Color Math is active, BG3 acts as a fog/overlay effect.
-				// In this case, render the LOWER layer (BG1/BG2) in HD and
-				// apply CM to it (= HD content visible through fog tint).
+				// Generic Overlay Detection:
+				// When the PPU winner is the SOLE BG layer on main screen
+				// AND Color Math + AddSubscreen are active, the winner acts
+				// as an overlay (fog, honey, water). The actual HD content
+				// is on the sub-screen layers below.
+				//
+				// Covers:
+				//   Mainbrace: BG3 fog on main ($04), BG1+BG2 on sub ($13)
+				//   Rambi:     BG1 honey on main ($01), BG2+BG3 on sub ($16)
+				//   Lockjaw:   BG1 water on main ($01), BG2+BG3 on sub ($16)
+				//
+				// Skip the overlay layer → search sub-screen layers for HD
+				// tiles → apply CM (= HD content visible through effect tint).
 				// ---------------------------------------------------------
 				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
-				bool bg3Overlay = (winLayer == 2 && cmActive && sl.Mode1Bg3Priority);
 
-				if(bg3Overlay) {
-					// Skip BG3's tile — search BG1 then BG2 for HD content
-					for(int tryLayer = 0; tryLayer <= 1 && !hdTile; tryLayer++) {
+				// Winner is sole BG on main screen? (mask out OBJ bit 4)
+				uint8_t mainBgOnly = sl.MainScreenLayers & 0x0F;
+				bool isSoleBgOnMain = (mainBgOnly == (1 << winLayer));
+				bool cmOverlay = cmActive && sl.ColorMathAddSubscreen && isSoleBgOnMain;
+
+				if(cmOverlay) {
+					// Skip overlay layer — search ALL other layers for HD content
+					for(int tryLayer = 0; tryLayer < 3 && !hdTile; tryLayer++) {
+						if(tryLayer == winLayer) continue;
 						if(!(pixelInfo.BgLayerMask & (1 << tryLayer))) continue;
-						if(!(sl.MainScreenLayers & (1 << tryLayer))) continue;
 
 						hdTile = _hdData->GetMatchingTile(
 							pixelInfo.BgTiles[tryLayer].Key, hdScreen->Vram);
 						// BG1↔BG2 layer retry
-						if(!hdTile) {
+						if(!hdTile && (tryLayer == 0 || tryLayer == 1)) {
 							SnesHdTileKey altKey = pixelInfo.BgTiles[tryLayer].Key;
 							altKey.LayerIndex = (tryLayer == 0) ? 1 : 0;
 							hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
@@ -443,8 +437,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							if(!pastWinner) continue;
 							if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
 
-							// Only consider layers on the main screen
-							if(!(sl.MainScreenLayers & (1 << layer))) continue;
+						// Only consider layers on main or sub screen
+						if(!((sl.MainScreenLayers | sl.SubScreenLayers) & (1 << layer))) continue;
 
 							SnesHdPackTileInfo* tile2 = _hdData->GetMatchingTile(
 								pixelInfo.BgTiles[layer].Key, hdScreen->Vram);
@@ -641,6 +635,63 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 		} // end for(x)
 	} // end for(y)
+
+	// =====================================================================
+	// DIAGNOSTIC: Deferred context log — emitted on first frame with BG content
+	// after a PPU config change (avoids capturing transition-frame zeros)
+	// =====================================================================
+	if(diagPendingContextLog && frameBgPixels > 0) {
+		diagPendingContextLog = false;
+
+		// Re-read scanline 120 (now guaranteed to have real data)
+		SnesHdScanlineInfo& slLog = hdScreen->ScanlineInfo[120];
+		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
+
+		const char* renderMode = "NORMAL";
+		if(slLog.Mode1Bg3Priority && (slLog.ColorMathEnabled & 0x04)) {
+			renderMode = "BG3_OVERLAY";
+		} else if(slLog.ColorMathAddSubscreen && (slLog.SubScreenLayers & 0x04)) {
+			renderMode = "SUBSCREEN_BLEND";
+		} else if(!slLog.ColorMathAddSubscreen && slLog.FixedColor != 0x0000) {
+			renderMode = "FIXED_COLOR";
+		}
+
+		char ctxBuf[1024];
+		snprintf(ctxBuf, sizeof(ctxBuf),
+			"--- CONTEXT: sig=%016llX (%s) ---\n"
+			"  BgMode=%d  Mode1Bg3Pri=%d\n"
+			"  MainScreenLayers=$%02X  SubScreenLayers=$%02X\n"
+			"  CMEnabled=$%02X (BG1=%d BG2=%d BG3=%d BG4=%d OBJ=%d BDrop=%d)\n"
+			"  AddSubscreen=%d  SubtractMode=%d  HalveResult=%d\n"
+			"  FixedColor=$%04X  ScreenBrightness=%d\n"
+			"  ClipMode=%d  PreventMode=%d\n"
+			"  Window1: L=%d R=%d  Window2: L=%d R=%d\n"
+			"  ColorWin: active=[%d,%d] inv=[%d,%d] logic=%d\n"
+			"  -> Detected mode: %s\n",
+			(unsigned long long)diagPendingVramSig, ctxLabel,
+			slLog.BgMode, slLog.Mode1Bg3Priority ? 1 : 0,
+			slLog.MainScreenLayers, slLog.SubScreenLayers,
+			slLog.ColorMathEnabled,
+			(slLog.ColorMathEnabled & 0x01) ? 1 : 0,
+			(slLog.ColorMathEnabled & 0x02) ? 1 : 0,
+			(slLog.ColorMathEnabled & 0x04) ? 1 : 0,
+			(slLog.ColorMathEnabled & 0x08) ? 1 : 0,
+			(slLog.ColorMathEnabled & 0x10) ? 1 : 0,
+			(slLog.ColorMathEnabled & 0x20) ? 1 : 0,
+			slLog.ColorMathAddSubscreen ? 1 : 0,
+			slLog.ColorMathSubtractMode ? 1 : 0,
+			slLog.ColorMathHalveResult ? 1 : 0,
+			slLog.FixedColor, slLog.ScreenBrightness,
+			(int)slLog.ColorMathClipMode, (int)slLog.ColorMathPreventMode,
+			slLog.Window1Left, slLog.Window1Right,
+			slLog.Window2Left, slLog.Window2Right,
+			slLog.ColorWindowActive[0] ? 1 : 0, slLog.ColorWindowActive[1] ? 1 : 0,
+			slLog.ColorWindowInverted[0] ? 1 : 0, slLog.ColorWindowInverted[1] ? 1 : 0,
+			(int)slLog.ColorWindowMaskLogic,
+			renderMode);
+		ContextLog(ctxBuf);
+		DiagLog(ctxBuf);
+	}
 
 	// =====================================================================
 	// DIAGNOSTIC: Per-frame summary
