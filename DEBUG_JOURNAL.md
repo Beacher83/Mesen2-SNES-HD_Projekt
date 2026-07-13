@@ -2663,4 +2663,154 @@ Nativer Pixel hat bereits korrektes Color Math. Fixt Bug 4, handhabt Bug 5.
 | Rambi Rumble | Nativ (BG1 Honig gewinnt mit CM → nativ) |
 | Hot Head Hop | HD wo kein CM, nativ wo CM (mixed) |
 
-### Status: **P2.1 — BUILD + TEST PENDING**
+### Status: **P2.1 — TESTED, VERIFIED → Basis für Phase 3**
+
+---
+
+## Phase 3: HD Color Math Engine (2026-07-07 — 2026-07-13)
+
+### Ziel
+
+Den CM-skip aus P2.1 durch echtes HD Color Math ersetzen: HD-Tiles rendern UND
+PPU Color Math (ADD/SUB, Sub-Screen/FixedColor, Half-Intensity, Brightness) korrekt
+darauf anwenden. EIN generischer Algorithmus für ALLE Level — keine Heuristiken.
+
+### Architektur-Überblick (5-Phasen-Plan, siehe ARCHITECTURE.md)
+
+| Phase | Thema | Status |
+|-------|-------|--------|
+| P3.0 | Winner + Layer Retry (kein CM) | Done |
+| P3.1-P3.5 | Iterative CM-Integration | Done |
+| P3.6-P3.7 | Unified Algorithm + Diagnostik | Done |
+| P3.8 | BG3 Swap (zu breit) | Done, teilw. revertiert |
+| P3.9 | useHdSubPixel (revertiert) | Done, revertiert |
+| P3.10 | BG3+Mode1Bg3Priority targeted swap | **CURRENT (3a1b31ae)** |
+
+### P3.10 Algorithm (Current — committed `3a1b31ae`, pushed)
+
+Three-step algorithm:
+
+**Step 1:** Try HD tile for PPU compositing winner layer (+ BG1↔BG2 retry for 4bpp layers)
+
+**Step 2 (winner HD tile found):**
+- Search for bottom HD tile below winner in priority order
+- **BG3 Overlay Swap:** If ALL conditions met:
+  - `cmActive` (AllowColorMath on this pixel)
+  - `AddSubscreen` (sub-screen blend mode)
+  - `hdTileBot` exists (bottom layer HD tile found)
+  - `winLayer == 2` (BG3 is winner)
+  - `Mode1Bg3Priority` ($2105 bit 3 set)
+  - `(MainScreenLayers & 0x0F) == 0x04` (only BG3 on main screen)
+  → Swap bottom to primary, set `isOverlayPixel=true`
+- Otherwise: render winner HD tile with CM using native `SubScreenColor`
+
+**Step 3 (winner HD NOT found + cmActive + AddSubscreen):** Overlay fallback —
+search other layers for HD content, apply overlay tint extracted from native PPU output
+
+### PPU Data Available Per-Pixel (from `SnesPpu.cpp`)
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `BgWinnerLayer` | PPU compositing | Which BG won (0-3) |
+| `BgLayerMask` | PPU per-pixel | Which layers have non-transparent content (MAIN screen) |
+| `MainScreenFlags` | PPU | Bit 7=AllowColorMath, Bit 5=IsSubtract, Bit 6=HalfResult |
+| `SubScreenColor` | PPU sub-screen buffer | BGR555, post-compositing |
+| `MainScreenColor` | PPU main-screen buffer | BGR555, pre-Color-Math, post-Brightness |
+| `BgTiles[0..3].Key` | PPU | ContentHash + PaletteIndex + LayerIndex per layer |
+
+### Per-Scanline Data (from `SnesHdScanlineInfo`)
+
+| Field | Description |
+|-------|-------------|
+| `MainScreenLayers` | $212C — which layers on main screen |
+| `SubScreenLayers` | $212D — which layers on sub screen |
+| `CMEnabled` | $2131 low 6 bits — which layers have CM enabled |
+| `AddSubscreen` | bool — use sub-screen (vs fixed color) |
+| `Mode1Bg3Priority` | bool — $2105 bit 3 |
+| `ScreenBrightness` | 0-15 — $2100 |
+| `ColorMathHalveResult` | bool — half-intensity flag |
+
+### Test Results (P3.10)
+
+| Level | Result | Notes |
+|-------|--------|-------|
+| Mainbrace Mayhem | ✓ Working | BG3 swap fires, terrain visible through fog |
+| Rambi Rumble | ✓ Working | BG1 overlay tint visible on terrain |
+| Pirate Panic | ✓ Working | No regression |
+| Lockjaw's Locker | ✗ Water tint missing | BG1 HD tiles found via retry, but no blue tint |
+| Hot Head Hop | ? | Not yet tested in P3.10 |
+| Gusty Glade | ? | Not yet tested (Phase 4: Color Window needed) |
+
+---
+
+## Lockjaw's Locker — P3.10 Diagnostic Investigation (2026-07-13)
+
+### PPU Configuration (confirmed from context log)
+
+```
+Signature: 213CE0452E0D6AB0 (fade-in) / CE539ABFD210DBD0 (gameplay)
+Main=$01 (only BG1)
+Sub=$16 (BG2+BG3+OBJ)
+CMEnabled=$21 (BG1+Backdrop)
+AddSubscreen=1
+Mode1Bg3Priority=1
+ScreenBrightness=15 (after fade-in)
+No windows active (ClipMode=0, PreventMode=0)
+```
+
+### P3.7 Diagnostic Data Analysis
+
+From `snes_hd_diag (1).txt` (Lockjaw frames):
+
+```
+wn0=55700  — ALL pixels have winner=BG1 (only BG1 on main screen)
+hdBG1=0    — NO BG1 HD tiles found directly
+hdBG2=38400, hdBG3=9900 — HD content found via Layer-Retry/Overlay
+lRetry=38500 — almost all via BG1→BG2 layer retry
+overlay=48300 — everything goes through overlay path
+miss=7300  — BG1 tiles that completely miss
+```
+
+**MISS entries:** All show `mask=0x01` (only BG1 present), pal=6, VRAM $5320-$6340
+
+### What This Means for P3.10
+
+1. BG1 has NO HD tiles in the pack (user confirmed: removed from pack for Rambi/Beehive levels)
+2. Step 1 layer retry (BG1→BG2) finds HD tiles → Step 2 fires
+3. Step 2 applies CM with `SubScreenColor` (native PPU sub-screen value)
+4. **Key question:** What is `SubScreenColor` at BG1 terrain positions?
+   - Sub-screen has BG2+BG3+OBJ → BG3 water tiles cover those positions
+   - If SubScreenColor is blue → CM ADD should produce blue tint on HD tiles
+   - If SubScreenColor is 0/black → ADD with 0 = no visible tint
+
+### Diagnostic Code Added (this session)
+
+Added diagnostic logging after line 394 in `SnesHdVideoFilter.cpp`:
+- Logs `SubScreenColor`, `SubScreenLayers`, `MainScreenLayers`, `CMEnabled`,
+  `ColorMathHalveResult`, x/y position
+- Limited to 10 entries where: `winLayer==0 && MainScreenLayers==0x01 && cmActive && AddSubscreen`
+- Purpose: Confirm whether SubScreenColor is actually blue (non-zero) at Lockjaw terrain pixels
+
+### Next Steps
+
+1. **User builds P3.10 with diagnostic**, runs Lockjaw, shares log
+2. **If SubScreenColor IS blue:** Bug is in CM application math (rendering stage)
+3. **If SubScreenColor IS 0/black:** Bug is in PPU capture (sub-screen not composited correctly at those positions)
+4. Fix based on findings
+
+### Status: **DIAGNOSTIC ADDED — AWAITING USER BUILD + TEST**
+
+---
+
+## DKC2 Level PPU Configurations (Reference Table)
+
+| Level | Sig | Main | Sub | CM ($2131) | AddSub | Mode1Bg3Pri |
+|-------|-----|------|-----|------------|--------|-------------|
+| Mainbrace (fog) | BD2C76B73C545997 | $04 (BG3) | $13 (BG1+BG2+OBJ) | $24 (BG3+Backdrop) | Yes | Yes |
+| Mainbrace (no fog) | E10E4686511EB716 | $17→$04 (HDMA) | $13 | $24 | Yes | Yes |
+| Lockjaw (underwater) | 213CE0452E0D6AB0 | $01 (BG1) | $16 (BG2+BG3+OBJ) | $21 (BG1+Backdrop) | Yes | Yes |
+| Lockjaw (gameplay) | CE539ABFD210DBD0 | $01 | $16 | $21 | Yes | Yes |
+| Pirate Panic | 1DF33CEAA50F7F08 | $17 | $10 (OBJ) | $02 (BG2 only) | Yes | Yes |
+| Rambi Rumble | CE539ABFD210DBD0 | $01 | $16 | $21 | Yes | Yes |
+| Gusty Glade | 02DABED78E3BD21D | rotates | — | — | — | — |
+| Hot Head Hop | 02D047A001E155B7 | $17 | $00 | $06 (BG2+BG3) | No (fixed) | Yes |

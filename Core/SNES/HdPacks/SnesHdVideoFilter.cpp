@@ -393,6 +393,27 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						}
 					}
 
+					// DIAGNOSTIC: Lockjaw scenario — BG1 sole on main + CM + AddSubscreen
+					// Log SubScreenColor to understand why water tint may be missing
+					static int diagLockjawCount = 0;
+					if(diagLockjawCount < 10
+						&& winLayer == 0
+						&& (sl.MainScreenLayers & 0x0F) == 0x01
+						&& cmActive && sl.ColorMathAddSubscreen) {
+						uint16_t ssc = pixelInfo.SubScreenColor;
+						char buf[400];
+						snprintf(buf, sizeof(buf),
+							"[SNES HD diag] LOCKJAW-CM win=BG1 SubScreenColor=0x%04X "
+							"(R=%d G=%d B=%d) SubLayers=0x%02X MainLayers=0x%02X "
+							"CMEnabled=0x%02X HalfMath=%d x=%d y=%d",
+							ssc, ssc & 0x1F, (ssc >> 5) & 0x1F, (ssc >> 10) & 0x1F,
+							sl.SubScreenLayers, sl.MainScreenLayers,
+							sl.ColorMathEnabled, sl.ColorMathHalveResult ? 1 : 0,
+							x, y);
+						DiagLog(buf);
+						diagLockjawCount++;
+					}
+
 					// Find bottom layer (for transparency compositing)
 					uint8_t prioOrder[6];
 					int prioCount = 0;
@@ -433,8 +454,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							frameMultiLayer++;
 						}
 					}
-
-					}
+				}
 				// --- Step 3: Winner NOT found + CM + AddSubscreen → overlay fallback ---
 				else if(cmActive && sl.ColorMathAddSubscreen) {
 					// Winner tile missing from HD pack — likely a semi-transparent
@@ -522,9 +542,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						int subR = (int)(pixelInfo.SubScreenColor & 0x1F);
 						int subG = (int)((pixelInfo.SubScreenColor >> 5) & 0x1F);
 						int subB = (int)((pixelInfo.SubScreenColor >> 10) & 0x1F);
-						cmR = ColorUtilities::Convert5BitTo8Bit(std::max(0, std::min(31, rawR - subR)));
-						cmG = ColorUtilities::Convert5BitTo8Bit(std::max(0, std::min(31, rawG - subG)));
-						cmB = ColorUtilities::Convert5BitTo8Bit(std::max(0, std::min(31, rawB - subB)));
+						cmR = ColorUtilities::Convert5BitTo8Bit((uint8_t)std::max(0, std::min(31, rawR - subR)));
+						cmG = ColorUtilities::Convert5BitTo8Bit((uint8_t)std::max(0, std::min(31, rawG - subG)));
+						cmB = ColorUtilities::Convert5BitTo8Bit((uint8_t)std::max(0, std::min(31, rawB - subB)));
 					} else if(sl.ColorMathAddSubscreen) {
 						uint16_t cmColor = pixelInfo.SubScreenColor;
 						cmR = ColorUtilities::Convert5BitTo8Bit(cmColor & 0x1F);
