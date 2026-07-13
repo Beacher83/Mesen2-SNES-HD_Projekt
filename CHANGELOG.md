@@ -21,7 +21,36 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
-## [2026-07-10] — Phase 3.1: Winner-First + Bottom-Layer Enhancement (P3.1)
+## [2026-07-13] — Phase 3.5: Enhanced HDMA Diagnostics (P3.5)
+
+### Per-Scanline HDMA Dump + Expanded Split Detection
+
+**Datei:** `Core/SNES/HdPacks/SnesHdVideoFilter.cpp`
+
+**Analyse-Ergebnis P3.4:** Lockjaw hdBG1=0 ist KEIN Regression — BG1-Tiles
+bei VRAM $2000-$2340 sind DMA-animiert und wurden in keinem Build (auch P3.3)
+jemals gefunden. Die MISS-Hashes sind zwischen P3.3 und P3.4 identisch.
+
+**Änderungen P3.5:**
+
+1. **HDMA Split Detection erweitert:** Erkennt jetzt auch Änderungen in
+   SubScreenLayers, ColorMathEnabled, FixedColor und ScreenBrightness
+   (nicht mehr nur MainScreenLayers). → Gangplank Galleon wird jetzt als
+   HDMA-aktiv erkannt falls HDMA FixedColor/CM per Scanline ändert.
+
+2. **Per-Scanline HDMA Dump:** Bei HDMA-aktiven Kontexten wird einmalig
+   pro Kontext ein kompakter Dump ausgegeben der Scanline-Bereiche mit
+   gleichen Registerwerten zusammenfasst:
+   ```
+   HDMA SCANLINE DUMP (first HDMA frame):
+     Y   1- 95: Main=$13 Sub=$14 CM=$23 AddSub=1 Fixed=$0000 Br=15
+     Y  96-224: Main=$01 Sub=$14 CM=$23 AddSub=1 Fixed=$0000 Br=15
+   ```
+   Damit können wir Gangplank/Lockjaw HDMA-Effekte verstehen.
+
+---
+
+## [2026-07-13] — Phase 3.4: Overlay Tint Extraction (P3.4)
 
 ### Winner-Only bleibt Top-Layer, Multi-Layer nur für Bottom
 

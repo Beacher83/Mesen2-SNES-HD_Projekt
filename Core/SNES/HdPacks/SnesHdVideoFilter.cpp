@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.4"
+#define SNES_HD_BUILD_VERSION "P3.5"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -194,6 +194,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagMissCount = 0;
 	static int diagMatchCount = 0;
 	static std::unordered_set<uint64_t> diagLoggedHashes;
+	static bool hdmaDumped = false;
 
 	// Compute VRAM context signature from two stable reference tiles
 	uint64_t sigA = 0, sigB = 0;
@@ -220,6 +221,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagMissCount = 0;
 		diagMatchCount = 0;
 		diagLoggedHashes.clear();
+		hdmaDumped = false;
 	}
 	// Build a compact PPU config key from the registers that matter for rendering.
 	// Context log fires only when this key changes (not on every VRAM sig change,
@@ -277,11 +279,16 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// =====================================================================
 	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
 
-		// HDMA split detection: track MainScreenLayers changes between scanlines
+		// HDMA split detection: track per-scanline register changes
 		if(y > overscan.Top) {
-			uint8_t prevMain = hdScreen->ScanlineInfo[y - 1].MainScreenLayers;
-			uint8_t curMain = hdScreen->ScanlineInfo[y].MainScreenLayers;
-			if(curMain != prevMain) frameHdmaSplit++;
+			SnesHdScanlineInfo& prev = hdScreen->ScanlineInfo[y - 1];
+			SnesHdScanlineInfo& cur = hdScreen->ScanlineInfo[y];
+			if(cur.MainScreenLayers != prev.MainScreenLayers ||
+			   cur.SubScreenLayers != prev.SubScreenLayers ||
+			   cur.ColorMathEnabled != prev.ColorMathEnabled ||
+			   cur.FixedColor != prev.FixedColor ||
+			   cur.ScreenBrightness != prev.ScreenBrightness)
+				frameHdmaSplit++;
 		}
 
 		for(uint32_t x = overscan.Left; x < baseWidth - overscan.Right; x++) {
@@ -759,6 +766,48 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		if(frameBgPixels > 0) {
 			diagBgFrameCount++;
 		}
+	}
+
+	// =====================================================================
+	// DIAGNOSTIC: Per-scanline HDMA dump (once per context, first BG frame)
+	// Shows scanline ranges where MainScreenLayers/Sub/CM/FixedColor change.
+	// =====================================================================
+	if(logThisFrame && frameBgPixels > 0 && frameHdmaSplit > 0 && !hdmaDumped) {
+		hdmaDumped = true;
+		DiagLog("[SNES HD diag] HDMA SCANLINE DUMP (first HDMA frame):");
+		uint8_t prevMain = 0xFF, prevSub = 0xFF, prevCM = 0xFF;
+		uint16_t prevFixed = 0xFFFF;
+		uint8_t prevBr = 0xFF;
+		uint32_t rangeStart = overscan.Top;
+		for(uint32_t sy = overscan.Top; sy <= 239 - overscan.Bottom; sy++) {
+			SnesHdScanlineInfo& sli = hdScreen->ScanlineInfo[sy];
+			bool last = (sy == 239 - overscan.Bottom);
+			bool changed = (sli.MainScreenLayers != prevMain ||
+				sli.SubScreenLayers != prevSub ||
+				sli.ColorMathEnabled != prevCM ||
+				sli.FixedColor != prevFixed ||
+				sli.ScreenBrightness != prevBr);
+			if((changed || last) && prevMain != 0xFF) {
+				uint32_t rangeEnd = changed ? sy - 1 : sy;
+				char slBuf[256];
+				snprintf(slBuf, sizeof(slBuf),
+					"  Y %3u-%3u: Main=$%02X Sub=$%02X CM=$%02X AddSub=%d Fixed=$%04X Br=%d",
+					rangeStart, rangeEnd, prevMain, prevSub, prevCM,
+					hdScreen->ScanlineInfo[rangeStart].ColorMathAddSubscreen ? 1 : 0,
+					prevFixed, prevBr);
+				DiagLog(slBuf);
+				rangeStart = sy;
+			}
+			prevMain = sli.MainScreenLayers;
+			prevSub = sli.SubScreenLayers;
+			prevCM = sli.ColorMathEnabled;
+			prevFixed = sli.FixedColor;
+			prevBr = sli.ScreenBrightness;
+		}
+	}
+	// Reset HDMA dump flag on context change (handled by diagLoggedHashes clear)
+	if(logThisFrame && frameHdmaSplit == 0) {
+		hdmaDumped = false;
 	}
 
 	// Log build version once at startup
