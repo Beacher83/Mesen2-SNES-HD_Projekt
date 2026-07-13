@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P3.11"
+#define SNES_HD_BUILD_VERSION "P3.12"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -200,6 +200,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagMatchCount = 0;
 	static int diagCmSampleCount = 0;    // generic CM+AddSubscreen pixel samples
 	static int diagNoCmSampleCount = 0;  // pixels where CM expected but per-pixel flag off
+	static int diagPalTintSampleCount = 0; // P3.12: palette tint diagnostic samples
 	static std::unordered_set<uint64_t> diagLoggedHashes;
 	static bool hdmaDumped = false;
 	static int diagContextCount = 0;     // total context changes seen
@@ -255,6 +256,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagMatchCount = 0;
 		diagCmSampleCount = 0;
 		diagNoCmSampleCount = 0;
+		diagPalTintSampleCount = 0;
 		diagLoggedHashes.clear();
 		hdmaDumped = false;
 		diagContextCount++;
@@ -292,6 +294,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameHdLayers[4] = {};  // per-layer: HD tile found count
 	uint32_t frameMultiLayer = 0;   // pixels where bottom HD layer also found
 	uint32_t frameHdmaSplit = 0;    // scanlines where MainScreenLayers differs from previous
+	uint32_t framePaletteTint = 0;  // HD pixels where palette tint (multiplicative) was applied
 
 	// =====================================================================
 	// Main pixel loop
@@ -513,6 +516,23 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							isOverlayPixel = true;
 							frameHdCm++;
 							frameOverlay++;
+
+							// P3.12 DIAGNOSTIC: Sample palette tint candidates
+							if(diagPalTintSampleCount < 10) {
+								uint16_t ppuN = ppuOutputBuffer[ppuIndex] & 0x7FFF;
+								uint16_t ssc = pixelInfo.SubScreenColor;
+								char buf[400];
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] PALTINT-SAMPLE layer=%d win=%d "
+									"ppuOut=0x%04X SubScreen=0x%04X "
+									"MainLayers=0x%02X SubLayers=0x%02X "
+									"MainFlags=0x%02X x=%d y=%d",
+									tryLayer, winLayer, ppuN, ssc,
+									sl.MainScreenLayers, sl.SubScreenLayers,
+									pixelInfo.MainScreenFlags, x, y);
+								DiagLog(buf);
+								diagPalTintSampleCount++;
+							}
 						}
 					}
 					if(!hdTile) {
@@ -555,8 +575,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// Get scanline info for color math parameters
 				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
 
-			// Pre-compute color math second operand (BGR555 → RGB888)
+		// Pre-compute color math second operand (BGR555 → RGB888)
 				uint8_t cmR = 0, cmG = 0, cmB = 0;
+				bool usePaletteTint = false;  // P3.12: multiplicative palette tint mode
+				// SubScreenColor in 8-bit (pre-computed for palette tint)
+				uint8_t subR8 = 0, subG8 = 0, subB8 = 0;
 				if(applyColorMath) {
 					if(isOverlayPixel) {
 						// Overlay mode: extract the overlay tint from PPU output.
@@ -576,9 +599,26 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						int subR = (int)(pixelInfo.SubScreenColor & 0x1F);
 						int subG = (int)((pixelInfo.SubScreenColor >> 5) & 0x1F);
 						int subB = (int)((pixelInfo.SubScreenColor >> 10) & 0x1F);
-						cmR = ColorUtilities::Convert5BitTo8Bit((uint8_t)std::max(0, std::min(31, rawR - subR)));
-						cmG = ColorUtilities::Convert5BitTo8Bit((uint8_t)std::max(0, std::min(31, rawG - subG)));
-						cmB = ColorUtilities::Convert5BitTo8Bit((uint8_t)std::max(0, std::min(31, rawB - subB)));
+						int tintR5 = std::max(0, std::min(31, rawR - subR));
+						int tintG5 = std::max(0, std::min(31, rawG - subG));
+						int tintB5 = std::max(0, std::min(31, rawB - subB));
+
+						// P3.12: If overlay tint is zero/near-zero, this is a
+						// palette-based tint (e.g. Lockjaw underwater: HDMA shifts
+						// CGRAM palette to blue, but HD tiles were rendered with
+						// original palette). Use multiplicative palette tint instead.
+						if(tintR5 <= 1 && tintG5 <= 1 && tintB5 <= 1) {
+							usePaletteTint = true;
+							subR8 = ColorUtilities::Convert5BitTo8Bit(subR);
+							subG8 = ColorUtilities::Convert5BitTo8Bit(subG);
+							subB8 = ColorUtilities::Convert5BitTo8Bit(subB);
+							framePaletteTint++;
+							// cmR/cmG/cmB stay 0 — not used in palette tint mode
+						} else {
+							cmR = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintR5);
+							cmG = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintG5);
+							cmB = ColorUtilities::Convert5BitTo8Bit((uint8_t)tintB5);
+						}
 					} else if(sl.ColorMathAddSubscreen) {
 						uint16_t cmColor = pixelInfo.SubScreenColor;
 						cmR = ColorUtilities::Convert5BitTo8Bit(cmColor & 0x1F);
@@ -622,6 +662,39 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 				// Brightness from scanline info (0-15, applied after color math)
 				uint8_t brightness = sl.ScreenBrightness;
+
+				// P3.12: Pre-compute palette tint ratio once per native pixel
+				// (same for all hdScale×hdScale sub-pixels)
+				int palTintR = 256, palTintG = 256, palTintB = 256;  // fixed-point 8.8, 256=1.0
+				bool palTintValid = false;
+				if(usePaletteTint) {
+					uint8_t rawX = hdTileInfo->OffsetX;
+					uint8_t rawY = hdTileInfo->OffsetY;
+					bool hFlipPT = hdTileInfo->HorizontalMirror;
+					bool vFlipPT = hdTileInfo->VerticalMirror;
+					uint8_t srcTX = hFlipPT ? (7 - rawX) : rawX;
+					uint8_t srcTY = vFlipPT ? (7 - rawY) : rawY;
+					uint32_t centerPX = srcTX * hdScale + hdScale / 2;
+					uint32_t centerPY = srcTY * hdScale + hdScale / 2;
+					if(centerPX < hdTile->Width && centerPY < hdTile->Height) {
+						uint32_t centerColor = hdTile->HdTileData[centerPY * hdTile->Width + centerPX];
+						uint8_t cenA = (centerColor >> 24) & 0xFF;
+						if(cenA > 0) {
+							uint8_t cenR = (centerColor >> 16) & 0xFF;
+							uint8_t cenG = (centerColor >> 8) & 0xFF;
+							uint8_t cenB = centerColor & 0xFF;
+							if(cenR > 8 || cenG > 8 || cenB > 8) {
+								palTintR = cenR > 8 ? (int)subR8 * 256 / cenR : 256;
+								palTintG = cenG > 8 ? (int)subG8 * 256 / cenG : 256;
+								palTintB = cenB > 8 ? (int)subB8 * 256 / cenB : 256;
+								palTintR = std::max(0, std::min(512, palTintR));
+								palTintG = std::max(0, std::min(512, palTintG));
+								palTintB = std::max(0, std::min(512, palTintB));
+								palTintValid = true;
+							}
+						}
+					}
+				}
 
 				// Render HD tile (multi-layer: top over bottom over native)
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
@@ -693,7 +766,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 						// Apply color math to HD pixel
 							if(applyColorMath) {
-								if(sl.ColorMathSubtractMode) {
+								if(usePaletteTint && palTintValid) {
+									// P3.12: Apply pre-computed multiplicative palette tint
+									hdR = (uint8_t)std::min(255, (int)hdR * palTintR / 256);
+									hdG = (uint8_t)std::min(255, (int)hdG * palTintG / 256);
+									hdB = (uint8_t)std::min(255, (int)hdB * palTintB / 256);
+								} else if(sl.ColorMathSubtractMode) {
 									hdR = (hdR > cmR) ? (hdR - cmR) : 0;
 									hdG = (hdG > cmG) ? (hdG - cmG) : 0;
 									hdB = (hdB > cmB) ? (hdB - cmB) : 0;
@@ -702,7 +780,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									hdG = (uint8_t)std::min(255, (int)hdG + (int)cmG);
 									hdB = (uint8_t)std::min(255, (int)hdB + (int)cmB);
 								}
-								if(sl.ColorMathHalveResult) {
+								if(sl.ColorMathHalveResult && !usePaletteTint) {
 									hdR >>= 1;
 									hdG >>= 1;
 									hdB >>= 1;
@@ -816,7 +894,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		char buf[1024];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
-			": total=%u bg=%u match=%u miss=%u hdCm=%u overlay=%u lRetry=%u multi=%u"
+			": total=%u bg=%u match=%u miss=%u hdCm=%u overlay=%u palTint=%u lRetry=%u multi=%u"
 			" sprWon=%u mask0=%u hdmaSplit=%u"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
@@ -825,7 +903,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			" (TileByKey=%zu, sig=%016llX)",
 			diagFrameCount, diagBgFrameCount, ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch,
-			frameHdMiss, frameHdCm, frameOverlay, frameLayerRetry, frameMultiLayer,
+			frameHdMiss, frameHdCm, frameOverlay, framePaletteTint, frameLayerRetry, frameMultiLayer,
 			frameSpriteWon, frameMaskZero, frameHdmaSplit,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],

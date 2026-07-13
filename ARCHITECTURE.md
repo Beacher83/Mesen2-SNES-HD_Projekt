@@ -599,7 +599,7 @@ Levels where this does NOT fire:
 |-------|--------|-----------|------|--------|
 | **Mainbrace (fog)** | BG3 | YES | Swap → overlay tint | HD content through fog |
 | **Mainbrace (no fog)** | BG1/BG2 | NO | Normal CM | HD terrain, normal colors |
-| **Lockjaw (underwater)** | BG1 | NO | Normal CM(+SubScreen) | HD terrain + water tint |
+| **Lockjaw (underwater)** | backdrop/BG3 | NO | Step 3 → P3.12 palette tint | HD terrain + blue water tint |
 | **Lockjaw (above water)** | BG1/BG2 | NO | Normal (no CM or multi-BG) | HD terrain, no tint |
 | **Rambi** | (none) | NO | Step 3 overlay fallback | HD terrain + honey tint |
 | **Hot-Head Hop** | varies | NO | Normal CM or no CM | HD terrain ± lava glow |
@@ -613,7 +613,7 @@ Levels where this does NOT fire:
 |-------|------|--------|------|
 | **1** | `SnesHdScanlineInfo` struct + PPU fills per scanline | **DONE** | Low |
 | **2** | Winner-only HD compositing with CM-skip | **P2.1 CODE DONE — BUILD+TEST PENDING** | Medium |
-| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **P3.10 — BG3 Overlay Swap** | High |
+| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **P3.12 — Palette Tint** | High |
 | **4** | Color window + brightness at HD resolution | Pending | Medium |
 | **5** | Remove old special-case paths, update diagnostics | Pending | Low |
 

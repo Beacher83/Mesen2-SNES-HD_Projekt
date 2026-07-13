@@ -1,6 +1,45 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-13 | Mesen Build: P3.11 (BUILD+TEST PENDING) | Mainbrace: WORKING | Rambi Rumble: WORKING | Lockjaw: BLOCKED (never appeared in diag logs — v4 file contained only Mainbrace) | Phase 4 Color Window: NOT STARTED
+Stand: 2026-07-13 | Mesen Build: P3.12 (BUILD+TEST PENDING) | Mainbrace: WORKING | Rambi Rumble: WORKING | Lockjaw: P3.12 palette tint fix pending test | Phase 4 Color Window: NOT STARTED
+
+---
+
+## P3.12 — Palette Tint: Multiplicative Color Correction for HDMA Palette Shifts (2026-07-13)
+
+### Problem
+Lockjaw's Locker: BG2 (natively rendered) shows correct blue water tint underwater, but BG1 HD tiles render WITHOUT the blue tint. User confirmed this is NOT a Color Math issue — the blue comes from **HDMA palette manipulation** (CGRAM entries are shifted to blue below the water line).
+
+### Root Cause Analysis
+The overlay tint extraction formula `tint = undoBrightness(ppuOutput) - SubScreenColor` produces **zero** for Lockjaw underwater pixels:
+- Main screen = backdrop (black, $0000) or BG3 (mostly transparent)
+- Sub screen = BG1/BG2 (level content with blue-shifted palette)
+- CM: backdrop(0) + SubScreenColor = SubScreenColor
+- undoBrightness(ppuOutput) ≈ SubScreenColor → tint = 0
+
+The HD tiles were pre-rendered with the ORIGINAL (non-blue) palette. Since the blue tint is in the PALETTE COLOR itself (not in a separate overlay layer), the additive overlay extraction correctly finds zero — there IS no overlay. The color difference is purely palette-based.
+
+### Fix: P3.12 Multiplicative Palette Tint
+When the overlay tint extraction produces zero (all channels ≤ 1 in 5-bit space), switch to **multiplicative palette tint mode**:
+
+1. **Detection**: `tintR5 ≤ 1 && tintG5 ≤ 1 && tintB5 ≤ 1` after overlay extraction
+2. **Reference computation**: Get the HD tile's center pixel at this native position → this approximates the ORIGINAL palette color
+3. **Tint ratio**: `ratio = SubScreenColor / HD_center_pixel` (per channel, fixed-point 8.8)
+4. **Application**: `HD_pixel = HD_pixel * ratio` (multiplicative, preserves HD detail)
+5. **HalveResult skip**: Palette tint skips the CM halve step (the ratio already represents the correct target color)
+
+### Generic Properties
+- No level-specific detection — works for ANY palette-based tint
+- Additive overlay tint (Mainbrace fog, Rambi honey) unaffected — those have non-zero overlay tint
+- BG3 overlay swap path unchanged (uses separate tint computation)
+
+### Diagnostics Added
+- `palTint` counter in FRAME summary — shows how many pixels used palette tint mode
+- `PALTINT-SAMPLE` log entries — first 10 palette tint candidates per context with ppuOutput, SubScreenColor, MainLayers, SubLayers
+
+### Expected Lockjaw Result
+- Underwater BG1 HD tiles should now have blue-shifted colors matching native BG2
+- `palTint` should show ~20k+ pixels per underwater frame
+- Mainbrace fog and Rambi honey should be unaffected (non-zero overlay tint → normal path)
 
 ---
 
