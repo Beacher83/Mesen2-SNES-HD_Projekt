@@ -258,6 +258,21 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 	diagPrevVramSig = vramSig;
 
+	// DIAGNOSTIC: On very first frame, unconditionally log what we see
+	static bool diagFirstFrameLogged = false;
+	if(!diagFirstFrameLogged) {
+		diagFirstFrameLogged = true;
+		SnesHdScanlineInfo& slFirst = hdScreen->ScanlineInfo[120];
+		char buf[512];
+		snprintf(buf, sizeof(buf),
+			"[SNES HD diag] STARTUP: sig=%016llX Main=$%02X Sub=$%02X CM=$%02X "
+			"AddSub=%d Mode=%d Bg3Pri=%d Br=%d",
+			(unsigned long long)vramSig, slFirst.MainScreenLayers, slFirst.SubScreenLayers,
+			slFirst.ColorMathEnabled, slFirst.ColorMathAddSubscreen ? 1 : 0,
+			slFirst.BgMode, slFirst.Mode1Bg3Priority ? 1 : 0, slFirst.ScreenBrightness);
+		DiagLog(buf);
+	}
+
 	// Per-frame counters
 	uint32_t frameTotalPixels = 0;
 	uint32_t frameBgPixels = 0;
@@ -395,10 +410,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						}
 					}
 
-					// DIAGNOSTIC: Lockjaw scenario — BG1 sole on main + CM + AddSubscreen
+	// DIAGNOSTIC: Lockjaw scenario — BG1 sole on main + CM + AddSubscreen
 					// Log SubScreenColor to understand why water tint may be missing
 					static int diagLockjawCount = 0;
-					if(diagLockjawCount < 10
+					if(diagFrameCount == 0) diagLockjawCount = 0; // reset on context change
+					if(diagLockjawCount < 20
 						&& winLayer == 0
 						&& (sl.MainScreenLayers & 0x0F) == 0x01
 						&& cmActive && sl.ColorMathAddSubscreen) {
@@ -414,6 +430,24 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							x, y);
 						DiagLog(buf);
 						diagLockjawCount++;
+					}
+					// DIAGNOSTIC: BG1-only on main but CM NOT active per-pixel — why?
+					static int diagLockjawNoCmCount = 0;
+					if(diagFrameCount == 0) diagLockjawNoCmCount = 0;
+					if(diagLockjawNoCmCount < 10
+						&& winLayer == 0
+						&& (sl.MainScreenLayers & 0x0F) == 0x01
+						&& sl.ColorMathAddSubscreen
+						&& (sl.ColorMathEnabled & 0x01)  // CM enabled for BG1 in register
+						&& !cmActive) {  // but per-pixel flag says NO
+						char buf[400];
+						snprintf(buf, sizeof(buf),
+							"[SNES HD diag] LOCKJAW-NOCM win=BG1 MainFlags=0x%02X "
+							"CMEnabled=0x%02X MainLayers=0x%02X SubLayers=0x%02X x=%d y=%d",
+							pixelInfo.MainScreenFlags, sl.ColorMathEnabled,
+							sl.MainScreenLayers, sl.SubScreenLayers, x, y);
+						DiagLog(buf);
+						diagLockjawNoCmCount++;
 					}
 
 					// Find bottom layer (for transparency compositing)
