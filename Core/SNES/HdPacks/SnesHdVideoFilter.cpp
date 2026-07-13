@@ -187,14 +187,20 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 	// =====================================================================
 	// DIAGNOSTIC: Context-aware logging with VRAM-based level/worldmap detection
+	// All per-context counters are reset together on context change.
+	// Frame budget per context: 10 total + 60 BG frames.
+	// Supports unlimited level visits — each gets its own budget.
 	// =====================================================================
 	static uint64_t diagPrevVramSig = 0;
 	static int diagFrameCount = 0;
 	static int diagBgFrameCount = 0;
 	static int diagMissCount = 0;
 	static int diagMatchCount = 0;
+	static int diagCmSampleCount = 0;    // generic CM+AddSubscreen pixel samples
+	static int diagNoCmSampleCount = 0;  // pixels where CM expected but per-pixel flag off
 	static std::unordered_set<uint64_t> diagLoggedHashes;
 	static bool hdmaDumped = false;
+	static int diagContextCount = 0;     // total context changes seen
 
 	// Compute VRAM context signature from two stable reference tiles
 	uint64_t sigA = 0, sigB = 0;
@@ -208,26 +214,32 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint64_t vramSig = sigA ^ (sigB << 1);
 	isWorldmap = (vramSig == 0xDBF342F9932FD251ULL);
 
-	// Detect context change (level transition) → reset diagnostic counters
-	if(vramSig != diagPrevVramSig && diagPrevVramSig != 0) {
+	// Detect context change (level transition) → reset ALL diagnostic counters
+	bool diagContextChanged = (vramSig != diagPrevVramSig);
+	if(diagContextChanged && diagPrevVramSig != 0) {
 		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
 		char buf[256];
 		snprintf(buf, sizeof(buf),
-			"[SNES HD diag] CONTEXT CHANGE (build=" SNES_HD_BUILD_VERSION "): sig %016llX -> %016llX (%s)",
-			(unsigned long long)diagPrevVramSig, (unsigned long long)vramSig, ctxLabel);
+			"[SNES HD diag] === CONTEXT CHANGE #%d (build=" SNES_HD_BUILD_VERSION "): sig %016llX -> %016llX (%s) ===",
+			diagContextCount, (unsigned long long)diagPrevVramSig, (unsigned long long)vramSig, ctxLabel);
 		DiagLog(buf);
+	}
+	if(diagContextChanged) {
 		diagFrameCount = 0;
 		diagBgFrameCount = 0;
 		diagMissCount = 0;
 		diagMatchCount = 0;
+		diagCmSampleCount = 0;
+		diagNoCmSampleCount = 0;
 		diagLoggedHashes.clear();
 		hdmaDumped = false;
+		diagContextCount++;
 	}
-	// Build a compact PPU config key from the registers that matter for rendering.
-	// Context log fires only when this key changes (not on every VRAM sig change,
-	// which cycles rapidly in animated levels like Lockjaw).
+
+	// PPU config snapshot — logged on EVERY context change (immediate, not deferred)
+	// Also logged when PPU config changes within same VRAM sig (HDMA-driven levels)
 	static uint64_t diagPrevPpuConfigKey = 0;
-	static bool diagPendingContextLog = false;  // deferred until first BG-content frame
+	static bool diagPendingContextLog = false;
 	static uint64_t diagPendingVramSig = 0;
 
 	SnesHdScanlineInfo& slCtx = hdScreen->ScanlineInfo[120];
@@ -243,13 +255,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		((uint64_t)(slCtx.FixedColor & 0x7FFF) << 32) |
 		((uint64_t)(slCtx.ScreenBrightness == 15 ? 15 : 0) << 48);
 
-	// On VRAM sig change, always update sig tracking
 	if(vramSig != diagPrevVramSig) {
 		diagPendingVramSig = vramSig;
 	}
 
-	// On PPU config change OR first frame, mark context log as pending
-	// (will fire once we see a frame with actual BG content, avoiding transition zeros)
 	if(ppuConfigKey != diagPrevPpuConfigKey || diagPrevVramSig == 0) {
 		diagPendingContextLog = true;
 		diagPendingVramSig = vramSig;
@@ -257,21 +266,6 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	}
 
 	diagPrevVramSig = vramSig;
-
-	// DIAGNOSTIC: On very first frame, unconditionally log what we see
-	static bool diagFirstFrameLogged = false;
-	if(!diagFirstFrameLogged) {
-		diagFirstFrameLogged = true;
-		SnesHdScanlineInfo& slFirst = hdScreen->ScanlineInfo[120];
-		char buf[512];
-		snprintf(buf, sizeof(buf),
-			"[SNES HD diag] STARTUP: sig=%016llX Main=$%02X Sub=$%02X CM=$%02X "
-			"AddSub=%d Mode=%d Bg3Pri=%d Br=%d",
-			(unsigned long long)vramSig, slFirst.MainScreenLayers, slFirst.SubScreenLayers,
-			slFirst.ColorMathEnabled, slFirst.ColorMathAddSubscreen ? 1 : 0,
-			slFirst.BgMode, slFirst.Mode1Bg3Priority ? 1 : 0, slFirst.ScreenBrightness);
-		DiagLog(buf);
-	}
 
 	// Per-frame counters
 	uint32_t frameTotalPixels = 0;
@@ -408,46 +402,40 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							DiagLog(buf);
 							diagMatchCount++;
 						}
-					}
+				}
 
-	// DIAGNOSTIC: Lockjaw scenario — BG1 sole on main + CM + AddSubscreen
-					// Log SubScreenColor to understand why water tint may be missing
-					static int diagLockjawCount = 0;
-					if(diagFrameCount == 0) diagLockjawCount = 0; // reset on context change
-					if(diagLockjawCount < 20
-						&& winLayer == 0
-						&& (sl.MainScreenLayers & 0x0F) == 0x01
-						&& cmActive && sl.ColorMathAddSubscreen) {
+					// DIAGNOSTIC: Sample CM pixels — log SubScreenColor when CM+AddSubscreen active
+					// Generic: works for any level where winner has CM (Lockjaw, etc.)
+					if(diagCmSampleCount < 20
+						&& cmActive && sl.ColorMathAddSubscreen && hdTile) {
 						uint16_t ssc = pixelInfo.SubScreenColor;
 						char buf[400];
 						snprintf(buf, sizeof(buf),
-							"[SNES HD diag] LOCKJAW-CM win=BG1 SubScreenColor=0x%04X "
-							"(R=%d G=%d B=%d) SubLayers=0x%02X MainLayers=0x%02X "
-							"CMEnabled=0x%02X HalfMath=%d x=%d y=%d",
-							ssc, ssc & 0x1F, (ssc >> 5) & 0x1F, (ssc >> 10) & 0x1F,
-							sl.SubScreenLayers, sl.MainScreenLayers,
-							sl.ColorMathEnabled, sl.ColorMathHalveResult ? 1 : 0,
-							x, y);
+							"[SNES HD diag] CM-SAMPLE win=%d SubScreenColor=0x%04X "
+							"(R=%d G=%d B=%d) MainFlags=0x%02X SubLayers=0x%02X "
+							"MainLayers=0x%02X CMEnabled=0x%02X x=%d y=%d sig=%016llX",
+							winLayer, ssc, ssc & 0x1F, (ssc >> 5) & 0x1F, (ssc >> 10) & 0x1F,
+							pixelInfo.MainScreenFlags, sl.SubScreenLayers,
+							sl.MainScreenLayers, sl.ColorMathEnabled, x, y,
+							(unsigned long long)vramSig);
 						DiagLog(buf);
-						diagLockjawCount++;
+						diagCmSampleCount++;
 					}
-					// DIAGNOSTIC: BG1-only on main but CM NOT active per-pixel — why?
-					static int diagLockjawNoCmCount = 0;
-					if(diagFrameCount == 0) diagLockjawNoCmCount = 0;
-					if(diagLockjawNoCmCount < 10
-						&& winLayer == 0
-						&& (sl.MainScreenLayers & 0x0F) == 0x01
-						&& sl.ColorMathAddSubscreen
-						&& (sl.ColorMathEnabled & 0x01)  // CM enabled for BG1 in register
-						&& !cmActive) {  // but per-pixel flag says NO
+					// DIAGNOSTIC: Winner has CM enabled in register but per-pixel flag is OFF
+					if(diagNoCmSampleCount < 10
+						&& !cmActive && sl.ColorMathAddSubscreen
+						&& (sl.ColorMathEnabled & (1 << winLayer))
+						&& hdTile) {
 						char buf[400];
 						snprintf(buf, sizeof(buf),
-							"[SNES HD diag] LOCKJAW-NOCM win=BG1 MainFlags=0x%02X "
-							"CMEnabled=0x%02X MainLayers=0x%02X SubLayers=0x%02X x=%d y=%d",
-							pixelInfo.MainScreenFlags, sl.ColorMathEnabled,
-							sl.MainScreenLayers, sl.SubScreenLayers, x, y);
+							"[SNES HD diag] CM-MISSING win=%d MainFlags=0x%02X "
+							"CMEnabled=0x%02X MainLayers=0x%02X SubLayers=0x%02X "
+							"x=%d y=%d sig=%016llX",
+							winLayer, pixelInfo.MainScreenFlags, sl.ColorMathEnabled,
+							sl.MainScreenLayers, sl.SubScreenLayers, x, y,
+							(unsigned long long)vramSig);
 						DiagLog(buf);
-						diagLockjawNoCmCount++;
+						diagNoCmSampleCount++;
 					}
 
 					// Find bottom layer (for transparency compositing)
