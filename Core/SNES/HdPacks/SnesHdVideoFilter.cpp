@@ -539,7 +539,6 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						cmG = ColorUtilities::Convert5BitTo8Bit((cmColor >> 5) & 0x1F);
 						cmB = ColorUtilities::Convert5BitTo8Bit((cmColor >> 10) & 0x1F);
 					}
-				}
 
 					// P3.9: If both winner AND bottom have HD tiles, and CM uses
 					// AddSubscreen, override the CM operand per-subpixel with the
