@@ -955,20 +955,14 @@ void SnesPpu::RenderScanline()
 			sl.ColorWindowMaskLogic  = _state.MaskLogic[5];
 		}
 
-		// Save pre-color-math main screen color for HD delta computation.
-		// Apply brightness inline so the pre-math value is brightness-scaled
-		// like the post-math value (from ppuOutputBuffer), preventing the
-		// brightness factor from contaminating the color math ratio/delta.
+		// P4.0: Save the pre-color-math, pre-brightness main screen color.
+		// The HD filter reproduces the PPU pipeline itself (color math first,
+		// then brightness), so the raw pre-math color is what it needs as the
+		// base under HD layers. (The old inline brightness scaling existed for
+		// the removed P3.x delta/ratio approach.)
 		if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight) {
 			for(int x = _drawStartX; x <= _drawEndX && x < SnesHdScreenInfo::ScreenWidth; x++) {
-				uint16_t color = _mainScreenBuffer[x];
-				if(_state.ScreenBrightness != 15) {
-					uint16_t r = (color & 0x1F) * _state.ScreenBrightness / 15;
-					uint16_t g = ((color >> 5) & 0x1F) * _state.ScreenBrightness / 15;
-					uint16_t b = ((color >> 10) & 0x1F) * _state.ScreenBrightness / 15;
-					color = r | (g << 5) | (b << 10);
-				}
-				_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].MainScreenColor = color;
+				_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].MainScreenColor = _mainScreenBuffer[x];
 			}
 		}
 
@@ -982,6 +976,9 @@ void SnesPpu::RenderScanline()
 				SnesHdPpuPixelInfo& px = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
 				px.MainScreenFlags = _mainScreenFlags[x];
 				px.SubScreenColor = _subScreenBuffer[x];
+				// P4.0: authoritative "sub screen empty" flag — exactly the condition
+				// ApplyColorMathToPixel checks to switch to FixedColor + disable halve.
+				px.SubScreenEmpty = (_subScreenPriority[x] == 0);
 			}
 		}
 
@@ -1147,6 +1144,12 @@ void SnesPpu::RenderTilemap()
 			if constexpr(!hiResMode) {
 				if(drawSub && _subScreenPriority[x] < priority && !ProcessMaskWindow<layerIndex>(subWindowCount, x)) {
 					DrawSubPixel(x, rgbColor, priority);
+					// HD (P4.0): record which BG layer currently wins the sub screen.
+					// Last writer wins — same semantics as _subScreenBuffer itself.
+					// +1 encoding so the memset(0) frame clear means "none".
+					if(hdValid && x < SnesHdScreenInfo::ScreenWidth) {
+						_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].SubScreenWinnerPlus1 = layerIndex + 1;
+					}
 				}
 			}
 
@@ -1668,6 +1671,9 @@ void SnesPpu::SendFrame()
 				sizeof(SnesHdPpuPixelInfo) * SnesHdScreenInfo::ScreenWidth * bottom);
 		}
 		_hdActiveScreen->FrameNumber = _frameCount;
+		// P4.0: CGRAM snapshot — basis for detecting palette shifts vs. the
+		// pack's reference palettes (underwater darkening, sunset HDMA, cycling).
+		memcpy(_hdActiveScreen->Cgram, _cgram, sizeof(_hdActiveScreen->Cgram));
 		frame.Data = _hdActiveScreen;
 		// Swap to other buffer for next frame
 		_hdActiveScreen = (_hdActiveScreen == _hdScreenInfo[0]) ? _hdScreenInfo[1] : _hdScreenInfo[0];

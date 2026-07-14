@@ -535,10 +535,86 @@ without any level-specific code.
 
 ---
 
-## P3.10 Unified Algorithm — Definitive Reference
+## 2026-07-14 — Architecture Review & Refactor Plan (P4.0)
 
-**This is the FINAL algorithm. No heuristics, no level-specific code.
-All branching is based on PPU register state.**
+### Befund (Review über Filter, PPU-Capture, Loader, Issue-Katalog)
+
+Die Richtung des P3.x-Umbaus (Register statt Heuristiken) ist korrekt, aber der
+Filter **rekonstruierte** das PPU-Compositing aus unvollständigen Daten, statt es
+mit vollständigen Daten **nachzurechnen**. Überall wo Information fehlte, wurde
+zurückgeraten (Tint-Extraktion P3.4, Overlay-Swaps P3.8/P3.10, Palette-Ratio-
+Sampling P3.12/P3.13) — jede Raterei mit eigenen Fehlerfällen. Das war die
+Ursache der Per-Level-Bug-Serie. Drei Informationslücken erzeugten alle offenen Bugs:
+
+| Lücke | Was fehlte | Bug-Familie |
+|-------|-----------|-------------|
+| 1. Sub-Screen nur als fertige Farbe | `SubScreenColor` ist ein komponierter Einzelwert; Sub-Winner-Tile + "Sub leer?" gingen verloren | Mainbrace/Rambi/Lockjaw-Overlay-Saga, alle Swap/Tint-Hacks |
+| 2. Palette in HD-Tiles eingebacken | CGRAM-Änderungen (Unterwasser-DMA, Sunset-HDMA, Paletten-Zyklus) unsichtbar für den Filter | Lockjaw-Verdunklung+Wellen-Animation, Gangplank, (vermutl.) Pirate Panic |
+| 3. Color Math nicht exakt | Leer-Subscreen→FixedColor+Halve-off-Sonderfall (`SnesPpu.cpp:1488-1496`) fehlte; Windows fehlten komplett | Pirate-Panic-Tönung, Gusty Glade |
+
+**Nebenfunde:**
+- P3.13-Ratio-Rauschen hatte eine Zusatzursache: der Loader **premultipliziert Alpha**
+  (`SnesHdPackLoader.cpp:392`) — Center-Pixel-Sampling las vorgemultiplizierte
+  (alpha-verdunkelte) Werte → Ratio-Ausreißer bis zum 512-Clamp.
+- `DetectActiveGfxset()` wird **nirgends aufgerufen** — Fingerprints sind geladen
+  aber tot. Das `isWorldmap`-Sig-Gate im Filter ist deshalb tragend und bleibt
+  vorerst (Tech-Debt: Fingerprints verdrahten, dann Gate entfernen).
+- Diagnose-`static`s in `ApplyFilter()` sind nicht threadsicher (Tech-Debt).
+- HD-**Sprites** sind komplett unbenutzt: `Sprites[4]`/`SpriteCount` werden von der
+  PPU erfasst, der Filter liest sie nie (Sprite-Pixel → immer nativ).
+
+### Refactor-Plan (R-Serie)
+
+| Schritt | Inhalt | Status |
+|---------|--------|--------|
+| **R1** | Capture-Lücken schließen: `SubScreenWinnerPlus1` + `SubScreenEmpty` pro Pixel, CGRAM-Snapshot pro Frame, `MainScreenColor` ohne Brightness | **DONE (P4.0)** |
+| **R2** | Filter-Kern = PPU-Composite @ HD: ein generischer Pfad, exakte `ApplyColorMathToPixel`-Portierung inkl. Leer-Sub-Sonderfall, Clip/Prevent-Windows, Sub-Operand aus HD-Tile. Löscht: Overlay-Erkennung, Swaps, Tint-Extraktion, Palette-Ratio | **DONE (P4.0)** |
+| **R3** | Palettendynamische HD-Tiles: Referenz-Paletten ins Pack (`palettes.bin`), Laufzeit-Diff Live-CGRAM vs. Referenz → stabiler Transform pro Palette-Zeile (statt Pixel-Sampling) | offen (nächster Schritt; Viewer + Mesen) |
+| **R4** | Color Window @ HD | **Kern in P4.0 mitgeliefert** (Clip/Prevent + W1/W2-Masklogik im CM-Port); Gusty-Glade-Test ausstehend |
+| **R5** | Golden-Frame-Regressionsharness (Savestates pro Level + Bilddiff) | offen |
+| **R6** | HD-Sprites, Performance (Tile-Cache, Issue D), Cleanup (Worldmap-Gate→Fingerprints, Statics) | offen |
+
+### P4.0 Unified Algorithm — Definitive Reference
+
+```
+Pro Pixel (Lookup):
+  1. Main-Winner-HD-Tile suchen (+ BG1↔BG2-Retry)      [wie bisher]
+  2. Falls gefunden: Bottom-Layer-Tile für Soft-Alpha    [wie bisher]
+  3. NEU: Sub-Screen-Operand — unabhängig von 1./2.:
+     cmActive && AddSubscreen && !SubScreenEmpty && !SubScreenHasSprite
+     → HD-Tile für BgTiles[SubScreenWinnerPlus1-1] suchen (+Retry)
+
+Pro Sub-Pixel (Rendering, wenn Main-HD ODER Sub-HD existiert):
+  m = blend(TopHD über BottomHD über natives MainScreenColor[pre-math])
+  ColorMath (exakter Port von SnesPpu::ApplyColorMathToPixel):
+    - Clip-to-Black nach ClipMode+Window (auch ohne AllowColorMath!)
+    - AllowColorMath-Flag (per-Pixel) + PreventMode+Window
+    - Operand: AddSubscreen
+        ? (SubScreenEmpty ? FixedColor + halve=0            ← PPU-Sonderfall!
+                          : blend(SubHD über natives SubScreenColor))
+        : FixedColor
+    - ADD: min(255, m+o)>>halve   SUB: max(0, m-o)>>halve
+  Brightness danach (wie PPU)
+Sonst: nativer Fallback (unverändert)
+```
+
+**Warum das jedes Level abdeckt:** Overlay-Effekte (Nebel/Honig/Wasser) sind nur
+noch der Fall "Main ohne HD-Tile, Sub mit HD-Tile" — kein Erkennungscode mehr.
+Pirate Panic bekommt durch den Leer-Sub-Sonderfall erstmals den korrekten
+FixedColor-Grünton ($0180). Erwartete Rest-Lücke nach P4.0: Lockjaws
+Unterwasser-**Verdunklung** (dunklere CGRAM-Palette) — das ist Familie 2 und
+kommt erst mit R3.
+
+**Log-Format-Änderung P4.0:** FRAME-Zeile: `overlay=`/`palTint=` ersetzt durch
+`mNat=` (Main nativ + Sub-HD gerendert), `sHd=` (Sub-Operand aus HD-Tile),
+`sFix=` (Leer-Sub→FixedColor-Fall). Neues `SUBOP-SAMPLE`-Log (erste 10
+Operand-Entscheidungen pro Kontext). PALTINT/PALRATIO/CM-MISSING entfernt.
+
+---
+
+## P3.10 Unified Algorithm — SUPERSEDED (durch P4.0, siehe oben)
+
+**Historische Referenz der P3.x-Architektur. Nicht mehr der aktive Algorithmus.**
 
 ### Tile Lookup (Steps 1-3)
 
@@ -612,10 +688,10 @@ Levels where this does NOT fire:
 | Phase | What | Status | Risk |
 |-------|------|--------|------|
 | **1** | `SnesHdScanlineInfo` struct + PPU fills per scanline | **DONE** | Low |
-| **2** | Winner-only HD compositing with CM-skip | **P2.1 CODE DONE — BUILD+TEST PENDING** | Medium |
-| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **P3.12 — Palette Tint** | High |
-| **4** | Color window + brightness at HD resolution | Pending | Medium |
-| **5** | Remove old special-case paths, update diagnostics | Pending | Low |
+| **2** | Winner-only HD compositing with CM-skip | **DONE (P2.1)** | Medium |
+| **3** | General color math on HD pixels (ADD/SUB/HALF) + Multi-Layer | **SUPERSEDED durch P4.0/R2** (P3.x-Serie war Rekonstruktions-Ansatz) | High |
+| **4** | Color window + brightness at HD resolution | **Kern DONE in P4.0** (Clip/Prevent/Masklogik im CM-Port) | Medium |
+| **5** | Remove old special-case paths, update diagnostics | **Größtenteils DONE in P4.0** (Swaps/Tint/Ratio entfernt); Rest siehe R6 | Low |
 
 ### Phase 1: Scanline Register Snapshot (DONE)
 

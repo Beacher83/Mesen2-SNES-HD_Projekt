@@ -1,6 +1,217 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-14 | Mesen Build: P3.13 (BUILD+TEST PENDING) | Mainbrace: WORKING | Rambi Rumble: WORKING | Lockjaw: P3.13 combined ratio+tint fix pending test | Phase 4 Color Window: NOT STARTED
+Stand: 2026-07-14 | Mesen Build: P4.0 (BUILD+TEST PENDING) | Architektur-Umbau R1+R2: Filter rechnet PPU-Composite bei HD nach statt zu rekonstruieren | Phase 4 Color Window: Kern in P4.0 enthalten
+
+---
+
+## P4.0 — R1+R2: PPU-Composite @ HD (2026-07-14)
+
+**Kontext:** Architektur-Review (siehe ARCHITECTURE.md, Abschnitt "2026-07-14 —
+Architecture Review & Refactor Plan") ergab: die P3.x-Serie rekonstruierte das
+Compositing aus unvollständigen Daten (Tint-Extraktion, Swaps, Ratio-Sampling).
+P4.0 schließt die Datenlücken und rechnet stattdessen die echte PPU-Pipeline
+bei HD-Auflösung nach.
+
+### Änderungen
+
+**R1 — Capture (SnesHdData.h, SnesPpu.cpp):**
+- `SubScreenWinnerPlus1` (0=keiner, 1-4=BG1-4): welcher Layer den Sub-Screen
+  gewann — gesetzt am `DrawSubPixel`-Callsite in `RenderTilemap()`
+- `SubScreenEmpty`: `_subScreenPriority[x]==0` — exakt die Bedingung, mit der
+  die PPU auf FixedColor+Halve-off umschaltet (`ApplyColorMathToPixel`)
+- `Cgram[256]`-Snapshot pro Frame in `SnesHdScreenInfo` (Basis für R3)
+- `MainScreenColor` jetzt pre-math UND pre-brightness (Brightness-Inline-
+  Skalierung entfernt — war Altlast des P3.x-Delta-Ansatzes)
+
+**R2 — Filter-Kern (SnesHdVideoFilter.cpp):**
+- Ein generischer Renderpfad: `m = blend(TopHD über BottomHD über nativem
+  Pre-Math-Main)` → exakter Port von `ApplyColorMathToPixel` (Clip/Prevent-
+  Windows, AllowColorMath-Flag, Leer-Sub→FixedColor+Halve-off, ADD/SUB+Halve)
+  → Brightness danach
+- CM-Operand kann jetzt aus dem HD-Tile des SUB-SCREEN-Winners gesampelt
+  werden (`SubScreenWinnerPlus1`) — Overlay-Level sind nur noch der Fall
+  "Main ohne HD, Sub mit HD"
+- ERSATZLOS ENTFERNT: Step-3-Overlay-Suche, P3.10-BG3-Swap, P3.4-Tint-
+  Extraktion, P3.12/P3.13-Palette-Ratio, CM-MISSING/PALTINT/PALRATIO-Logs
+- Sprite-Gate gelockert: nur Sprite-auf-MAIN erzwingt nativ; Sprite-auf-Sub
+  fließt korrekt als nativer Operand ein
+- Neue Helfer: `SampleHdTile()`, `IsInsideColorWindow()` (Port von
+  `ProcessMaskWindow<ColorWindowIndex>` + `PixelNeedsMasking`)
+
+**Log-Format:** FRAME-Zeile: `overlay=`/`palTint=` → `mNat=` (Main nativ +
+Sub-HD), `sHd=` (Sub-Operand aus HD), `sFix=` (Leer-Sub→FixedColor). Neu:
+`SUBOP-SAMPLE` (erste 10 Operand-Entscheidungen pro Kontext).
+
+### Erwartete Testergebnisse P4.0
+
+| Level | Erwartung |
+|-------|-----------|
+| Pirate Panic | **Wasserfarbe erstmals korrekt leicht grünlich** (Leer-Sub→FixedColor=$0180-Sonderfall greift jetzt); `sFix` groß im Log |
+| Mainbrace | Wie P3.10-Stand oder besser (Nebel + HD-Terrain über einen Pfad); `sHd` groß |
+| Rambi Rumble | Wie bisher gut (Honig nativ + HD-Terrain via `mNat`) |
+| Lockjaw über Wasser | Unverändert HD |
+| Lockjaw unter Wasser | HD-Terrain sichtbar, blaugetönt, aber **noch zu hell** — Palette-Verdunklung kommt erst mit R3 (CGRAM-Transform). NICHT als Regression werten |
+| Hot Head Hop | Unverändert (FixedColor-Pfad, Lava-Glow via Per-Scanline-FixedColor) |
+| Gusty Glade | Beobachten: Window-Auswertung ist jetzt drin — blaue Quadrate könnten sich ändern/verschwinden |
+| NPC Shops | Unverändert (kein CM) |
+
+### P4.0 Test-Ergebnis (2026-07-14, User-Test + Log-Analyse) — GROSSER ERFOLG
+
+| Level | Ergebnis |
+|-------|----------|
+| Pirate Panic | ✅ **Wasserfarbe erstmals korrekt** — der Leer-Sub→FixedColor-Sonderfall wirkt (Log: `sFix` groß). Issue J damit im Kern gelöst |
+| Mainbrace | ✅ wie bisher, evtl. leicht besser |
+| Rambi Rumble | ✅ wie bisher, evtl. leicht besser |
+| Lockjaw | ✅ Wasseroberfläche jetzt HD in Vorder- UND Hintergrund (besser als je zuvor). Wasserfarbe (zu hell) unverändert = **erwartet**, braucht R3 |
+| Gusty Glade | ❌ blaue Quadrate weiterhin — ABER neue Diagnose, siehe unten |
+
+**Log-Bestätigung der Engine:** Rambi/Lockjaw-Kontexte (`Main=$01 Sub=$16 CM=$21`)
+zeigen `mainNatHdSub=51522 subOpHd=51522` — 90% des Schirms rendert über den
+neuen Pfad "natives Overlay + HD-Sub-Operand". `layerRetry=45883` (Sub-Tiles via
+BG1↔BG2-Retry gefunden).
+
+### Gusty Glade — neue Befunde aus dem P4.0-Log (sig 02D047A001E155B7)
+
+Config: `Main=$13 (BG1+BG2+OBJ) Sub=$14 (BG3+OBJ) CM=$23 (BG1+BG2+BDrop) AddSub=1`,
+HDMA-Splits (Y7-38 Sub=$04, Y39-165 Sub=$14, Y166-230 Main=$11 Sub=$06).
+**Keine Windows aktiv** (ClipMode=0, PreventMode=0, alle Window-Register 0) —
+die alte "Phase 4 Color Window"-Hypothese für die blauen Quadrate ist damit TOT.
+
+1. **Pack hat hier praktisch 0% HD-Abdeckung:** BG1 37k Pixel → hdMatch=0 (0%),
+   BG2 53k → 58 Pixel (0%). MISS-Hashes liegen bei VRAM $2200-$2340 (Layer 0,
+   knapp über der bekannten DMA-Range) und $5060-$5320 (Layer 1) — vermutlich
+   DMA-animiertes Blattwerk (Wind-Level!) und/oder Gfxset nie korrekt exportiert.
+2. **Verdächtige fürs Blaue:** `sHd=3723` konstant — BG3-Sub-Tiles (swp=3)
+   MATCHEN und werden per ADD auf den nativen Main-Pixel gerechnet. ~3723 px ≈
+   ~58 Tiles = verstreute Quadrate. Passt exakt zum Symptom. Hypothese:
+   **Cross-Gfxset-Kontamination** — BG3-Content-Hash kollidiert mit einem Tile
+   aus anderem Gfxset, dessen PNG mit dessen (blauer) Palette exportiert wurde.
+   Genau dagegen wurden die Fingerprints gebaut — und `DetectActiveGfxset()`
+   wird NIE aufgerufen (Review-Fund).
+
+### P4.1 — Gfxset-Diagnose (2026-07-14, rein additiv, kein Verhaltens-Change)
+
+- `DetectActiveGfxset()` wird jetzt pro Frame aufgerufen (nur Diagnose, Matching
+  unverändert)
+- CONTEXT-CHANGE-Zeile: neu ` gfx=<aktiver Gfxset>/<Anzahl Fingerprints>`
+- MATCH-Zeile: neu ` set=<GfxsetIndex des gematchten Tiles>`
+- SUBOP-SAMPLE: neu ` subSet=<GfxsetIndex des Sub-Operand-Tiles>` (-1 = keins)
+
+**Was der nächste Log beantworten soll:**
+1. Gusty Glade: `gfx=?` — hat das Level überhaupt einen erkannten Gfxset?
+   Und `subSet=?` in den SUBOP-Zeilen — stammen die blauen BG3-Tiles aus einem
+   FREMDEN Set (subSet ≠ gfx → Kontamination bewiesen)?
+2. Funktionierende Level (Pirate Panic etc.): `gfx=?` — decken die Fingerprints
+   alle 6 importierten Sets ab? (Wichtig BEVOR wir Scoping erzwingen — sonst
+   Regression auf Sets ohne Fingerprint.)
+
+### P4.1 Test-Ergebnis (2026-07-15, Route: Worldmap→Pirate Panic(durchquert)→Gusty Glade→Gangplank Galleon)
+
+**Fingerprint-Erkennung funktioniert grundsätzlich:** 6 Fingerprint-Sets geladen.
+- Pirate Panic: `gfx=7` ✓ (gfxset_07 korrekt erkannt)
+- Gangplank Galleon: `gfx=29` (= 0x1D) ✓ — BG2 99% HD-Match, BG3 23%, kein CM
+  (`CM=$00`, `AddSub=0`), Sunset läuft rein über CGRAM (im Register unsichtbar,
+  `hdmaSplit=0`) → Sunset-Fix kommt mit R3 (CGRAM-Transform), wie Lockjaw-Farbe.
+- **Gusty Glade: `gfx=-1`** — KEIN Set erkannt! Zusammen mit BG1 hdMatch=0 heißt
+  das: die Laufzeit-VRAM-Inhalte (inkl. der Fingerprint-Referenz-Tiles) stimmen
+  nicht mit dem überein, was beim Export gehasht wurde. User bestätigt: BG1-Tiles
+  sind im Pack und sehen im Viewer korrekt/vollständig aus → der Export basiert
+  auf anderem VRAM-Stand als die Laufzeit zeigt (Wind-DMA-Animation und/oder
+  veralteter VRAM-Snapshot für dieses Set). **Nächster Schritt Gusty: VRAM zur
+  Laufzeit neu dumpen (Tools > Dump VRAM to File existiert!) und Set im Viewer
+  gegen den echten Runtime-Dump neu aufbauen/exportieren.**
+
+**Blaue Quadrate — Kontamination faktisch bestätigt:** User bestätigt, die
+Blätter-Overlay-Tiles (BG3) wurden bewusst aus dem Pack entfernt. Trotzdem
+`sHd=3723` konstant — es matchen also BG3-keyed Tiles, die NICHT von Gusty
+stammen können → Fremd-Set-Tiles (Hash+Pal+Layer-Kollision, PNG mit fremder
+= blauer Palette, Verdacht: Lockjaw-Wasser-BG3). Fix-Richtung: Gfxset-Scoping
+in `GetMatchingTile` erzwingen (Tile.GfxsetIndex == ActiveGfxset; bei
+ActiveGfxset==-1 Content-Hash-Matching blocken — deckt auch den Worldmap-Fall
+ab und macht das isWorldmap-Gate obsolet). **VOR dem Scharfschalten:** ein
+voller Durchlauf durch alle Level mit P4.1 nötig, um zu prüfen ob JEDES
+funktionierende Level ein `gfx=` erkennt (sonst Regression).
+
+### NEU: Issue Q — Flimmern am unteren Bildschirmrand (Gangplank + Lockjaw)
+
+Vom User beim P4.0-Test bemerkt (unklar ob neu in P4.0 oder vorher übersehen).
+Gangplank-Log zeigt `hdmaSplit=0` + `CM=$00` → Register über alle Zeilen stabil,
+Register-/ScanlineInfo-Theorie damit unwahrscheinlich. Wahrscheinlichste
+Ursache: DMA-animierte Wellen-/Wasser-Tiles am unteren Rand — Match/Miss
+wechselt pro Animationsframe → HD/nativ-Flackern (Issue-F-Mechanik, evtl.
+durch P4.0 sichtbarer geworden). Offene Fragen an nächsten Test: (a) war das
+Flimmern in P3.13 auch schon da? (b) exakte Bildschirmposition/Screenshot.
+
+### Status: **P4.0 VERIFIED ✓ / P4.1 getestet (Gusty+Gangplank), voller Level-Durchlauf für Scoping-Entscheidung steht aus**
+
+---
+
+## P3.13 — Test Result: No Visible Change (2026-07-14)
+
+### User report
+Built P3.13, tested — "leider alles beim alten, wasser hat sich noch nicht geändert"
+(water unchanged from before).
+
+### Log analysis (`snes_hd_context.txt` + `snes_hd_diag.txt`, 2026-07-14 test session)
+
+**Log actually spans TWO levels, not just Lockjaw** (worked out from context-signature
+sequence, not from the stale sig reference table below — that table predates P3.11's
+combined VRAM+PPU key and no longer matches current sig values):
+1. Contexts #5–#24 (tag `other`, sig `E10E4686511EB716`): cycles through
+   `Main=$00/$04/$13/$17` as the HDMA fog band shifts frame to frame — this is
+   **Mainbrace Mayhem** (visited first). Additive overlay tint here is bluish-grey,
+   e.g. `tint8=(0,16,41)` at many x/y — consistent with Mainbrace's fog color.
+2. Contexts #26–#33: `WORLDMAP` → transition → then a genuinely new sig
+   (`BD2C76B73C545997`, tag `LEVEL2`) appears at #34. This is the level transition
+   into **Lockjaw's Locker** via the worldmap.
+3. Contexts #34–#135 (tag `LEVEL2`): **rotate through exactly 7 signatures in a fixed
+   round-robin** (`BD2C76B73C545997 → 989D555A0B0C0B73 → 14AD3323553A51E3 →
+   975E5DA3A8029AD5 → 20EA52BD21C48AE3 → 1ABDA4C0649E66C7 → F4AE27740B28F473 →
+   26F9149D83DDEF29 → repeat`), one new "context" every single frame, ~14 full cycles
+   over the log. `Main=$04 Sub=$13 CM=$24` stays constant throughout — only the
+   VRAM/CGRAM-derived part of the combined key changes.
+
+**New finding (not previously known):** Lockjaw's underwater water has an **animated
+CGRAM palette cycle** (a wave/ripple effect), producing a different combined
+VRAM+PPU context key on every single frame. Side effect: the per-context diagnostic
+counters (and anything else keyed off "context change", per P3.11) reset on **every
+frame** while underwater, not once per level — FRAME 0/0, 1/0, ... never accumulates
+past 1-2 frames before a reset. Worth keeping in mind for any future per-context
+caching logic, not just diagnostics.
+
+### Root cause for "no visible change": palette ratio is noise, not a signal
+
+`PALRATIO-SAMPLE` log lines confirm the P3.13 code path fires correctly (`overlay`
+and `palTint` counters track `bg` almost 1:1 in both levels' FRAME lines — this is not
+a "code doesn't run" bug). But the computed ratio is wildly inconsistent pixel to
+pixel instead of a stable darkening factor:
+
+```
+ratio=(128,256,256)/256   sub8=(8,8,0)     cen=(16,7,0)       — Mainbrace, mild R-darken
+ratio=(85,83,49)/256      sub8=(41,24,8)   cen=(123,74,41)    — Mainbrace, strong darken
+ratio=(512,512,512)/256   sub8=(123,74,41) cen=(49,33,16)     — Mainbrace, 2x BRIGHTEN (clamp!)
+ratio=(32,66,27)/256      sub8=(24,49,24)  cen=(188,188,222)  — Lockjaw, near-black multiply
+ratio=(268,260,257)/256   sub8=(66,107,239) cen=(63,105,238)  — Lockjaw, ~neutral
+```
+
+Same level, same overlay type, values swinging from "multiply by 0.13" to "multiply by
+2.0 (clamped)" within a few frames. Averaged over a whole tile/frame this cancels out
+visually to roughly "unchanged" — which matches exactly what the user reported.
+
+**Likely mechanism:** `ratio = SubScreenColor(native, flat SNES color) /
+HD_center_pixel(AI-upscaled texture)`. The HD art is AI-upscaled and carries local
+texture/shading/detail that the flat native SNES source pixel never had. Comparing one
+sampled upscaled pixel against one flat native pixel measures mostly **upscaler
+detail noise**, not the actual CGRAM palette DMA shift (which should be a clean,
+uniform factor per palette index, not something that varies pixel-by-pixel within the
+same tile).
+
+### Suggested fix direction (not implemented here — documenting only per user request)
+Derive the ratio from the actual **palette/CGRAM data** (compare the palette index's
+brightness before/after the underwater DMA shift) instead of sampling individual HD
+texture pixels vs. native pixels. That gives one stable multiplier per palette index
+(or per tile), immune to AI-upscaler texture noise, instead of a per-pixel value that
+swings from 0.13x to 2x on the same water surface.
 
 ---
 

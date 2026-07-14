@@ -138,10 +138,19 @@ struct SnesHdPpuPixelInfo
 	uint8_t BgWinnerLayer = 0xFF;        // Which BG layer won compositing (0-3), or 0xFF = sprite/backdrop
 	bool SubScreenHasSprite = false;     // Sprite wins sub-screen at this pixel (set by RenderSprites)
 
+	// P4.0: sub-screen winner identity — lets the HD filter sample the color
+	// math operand from an HD tile instead of the flat native SubScreenColor.
+	// Encoded +1 so the memset(0) buffer clear means "no BG won the sub screen".
+	uint8_t SubScreenWinnerPlus1 = 0;    // 0 = none/backdrop, 1-4 = BG1-BG4 won the sub screen
+	// P4.0: true when _subScreenPriority[x] == 0 after rendering — the PPU's
+	// color math then uses FixedColor instead of the sub-screen color AND
+	// disables the halve operation (SnesPpu::ApplyColorMathToPixel special case).
+	bool SubScreenEmpty = false;
+
 	SnesHdPpuTileInfo Sprites[4] = {};   // Up to 4 sprite tiles at this pixel
 	uint8_t SpriteCount = 0;
 
-	uint16_t MainScreenColor = 0;        // Original SNES BGR555 color (for fallback)
+	uint16_t MainScreenColor = 0;        // P4.0: pre-color-math, pre-brightness main screen color (BGR555)
 	uint16_t SubScreenColor = 0;
 	uint8_t MainScreenFlags = 0;
 	uint8_t MainScreenPriority = 0;
@@ -216,6 +225,7 @@ struct SnesHdScreenInfo
 
 	SnesHdPpuPixelInfo* ScreenTiles;
 	SnesHdScanlineInfo ScanlineInfo[ScreenHeight];  // Per-scanline PPU register snapshot (filled by PPU)
+	uint16_t Cgram[256] = {};   // P4.0: CGRAM snapshot at SendFrame — basis for palette-shift transforms (R3)
 	uint16_t* Vram = nullptr;   // Pointer to PPU VRAM (word-addressed, 0x8000 entries); set by PPU at init
 	uint32_t FrameNumber = 0;
 	uint16_t Scanline = 0;
