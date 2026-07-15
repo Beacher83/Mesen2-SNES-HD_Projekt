@@ -1,6 +1,55 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-15 | Mesen Build: P4.1e (BUILD+TEST PENDING) | Issue Q gelöst, Perf bestätigt | OFFEN: Issue R Sprite-"Halbtransparenz" (P4.1d-Fix half nicht, P4.1e = Diagnose) | Architektur: P4.0-Composite-Engine
+Stand: 2026-07-15 | Mesen Build: P4.1f (BUILD+TEST PENDING) | Issue R Root Cause per SPR-SAMPLE bestätigt + Fix gebaut | WICHTIG: Sig-Level-Zuordnung korrigiert (s.u.) | Architektur: P4.0-Composite-Engine
+
+---
+
+## KORREKTUR: Sig↔Level-Zuordnung war vertauscht (2026-07-15)
+
+**Beweis:** P4.1e-Testlauf, User besuchte AUSSCHLIESSLICH Lockjaw's Locker —
+Log enthält ausschließlich Sig `E10E4686` (+Worldmap). Zusätzlich: MainScreenColor
+an Sprite-Pixeln dort = 0x1CE4/0x1440 (dunkles Teal/Blau = Unterwasser), nicht
+heller Nebel.
+
+- **`E10E4686` = Lockjaw's Locker** (bisher fälschlich "Mainbrace" genannt,
+  seit Session 2026-07-14). Erkanntes Gfxset: **3 = Lockjaws Set**.
+- **LEVEL2-Tag (rotierende Sigs `BD2C76B7`/`F4AE2774`/…, CGRAM/CHR-Zyklus) =
+  sehr wahrscheinlich Mainbrace Mayhem** — deckt sich mit M5.x-Journal
+  ("Level-2-Fog", M5.6 "Sprites im Level-2-Fog"). Erkanntes Gfxset: 37.
+  Bestätigung beim nächsten gezielten Mainbrace-Besuch.
+- **Folgen:** Ältere per-Level-Interpretationen (z.B. "Lockjaw hat animierten
+  CGRAM-Palettenzyklus", P3.12/P3.13-Unterwasser-Analysen auf LEVEL2-Kontexten)
+  müssen dem jeweils ANDEREN Level zugeschrieben und neu bewertet werden.
+  Die P4.2-Coverage-Aussage bleibt gültig (beide Level erkennen ihr Set).
+
+---
+
+## Issue R — GELÖST (P4.1f, Test ausstehend): HD-Main-Tile wäscht Sprite-Operand aus
+
+**Beweis aus P4.1e-SPR-SAMPLEs (48 Samples, alle in Lockjaw `E10E4686`):**
+An Charakter-Pixeln (Sprite = finaler Sub-Screen-Gewinner, swp=0) gewinnt BG3
+(Wasser-Overlay) bzw. BG1 den Main-Screen und hat ein HD-Tile (`mainHd=1
+set=3`, Lockjaws EIGENES Set — keine Kontamination). Counter: sprSub≈1600,
+davon sprSubHd≈845 (>50%) mit HD-Main-Tile.
+
+**Mechanismus:** Der Filter legt das semi-transparente HD-Wasser-Artwork über
+den Pixel und addiert DANACH den nativen Sprite als CM-Operand. Nativ sind die
+Wasser-Texel dunkel (0x1440!) → ADD lässt den Charakter dominieren. Das hellere/
+deckendere HD-Artwork wäscht ihn aus → "halbtransparente Charaktere". P4.1d
+(Stale-Flag) war ein echter, aber unsichtbarer Nebenfix — die sichtbare Ursache
+ist der HD-Main-Composite an Sprite-Operand-Pixeln.
+
+**Fix (P4.1f, `SnesHdVideoFilter.cpp`):** Neues Pixel-Flag `spriteIsSubOperand`
+(gesetzt im Sprite-Zweig der Sub-Op-Sektion). Render-Bedingung:
+`(hasMainHd || hasSubHd) && !spriteIsSubOperand` → wenn der Charakter selbst
+der CM-Operand ist, wird das Pixel exakt nativ gerendert (PPU-Output =
+Wasser + Sprite-ADD). Kosten: Wasser-Textur in der Charakter-Silhouette ist SD —
+gegenüber ausgewaschenen Charakteren klar das kleinere Übel. `sprSubHd=` zählt
+jetzt genau die Pixel, die die Regel betrifft.
+
+**Regressions-Check beim Test:** Mainbrace (LEVEL2-Level) — Sprites hinter dem
+Nebel: Charakter-Pixel werden dort ebenfalls nativ (SD-Nebel in der Silhouette).
+Prüfen, ob das auffällt.
 
 ---
 

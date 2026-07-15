@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P4.1e"
+#define SNES_HD_BUILD_VERSION "P4.1f"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -510,6 +510,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			SnesHdPpuTileInfo* subTileInfo = nullptr;
 			bool cmActive = false;  // hoisted so the rendering section (below) can see it too
 			uint8_t winLayer = 0xFF;  // hoisted so the rendering section (below) can see it too
+			bool spriteIsSubOperand = false;  // P4.1f: sprite is the final sub winner AND the CM operand → force native
 
 			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
 				frameBgPixels++;
@@ -692,13 +693,18 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 							}
 						}
 					} else {
-						// P4.1e diag: a sprite is the final sub-screen winner here —
-						// the CM operand stays native (sprite color), by design.
-						// Counters + mid-screen samples to hunt the Lockjaw
-						// "half-transparent characters on BG1 contact" artifact:
-						// they show which render path these pixels actually take.
+						// P4.1f (Issue R fix): a sprite is the final sub-screen winner —
+						// the CHARACTER ITSELF is the color-math operand. Rendering the
+						// main winner's HD tile here paints semi-transparent HD art
+						// (Lockjaw water overlay) over the pixel before the sprite is
+						// added; native water texels are dark so the PPU's ADD leaves
+						// the character dominant, while brighter HD art washes it out
+						// ("half-transparent characters", confirmed via SPR-SAMPLE).
+						// Force the native path — exact PPU output (water + sprite ADD)
+						// at these few pixels; the surrounding water stays HD.
+						spriteIsSubOperand = true;
 						frameSprSub++;
-						if(hdTile) frameSprSubMainHd++;
+						if(hdTile) frameSprSubMainHd++; // pixels the forced-native rule affects
 						if(diagSprSampleCount < 12 && x >= 48 && x <= 208 && y >= 40 && y <= 200) {
 							char buf[400];
 							snprintf(buf, sizeof(buf),
@@ -749,7 +755,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			bool hasMainHd = hdTile && hdTileInfo && !hdTile->HdTileData.empty();
 			bool hasSubHd = subTile && subTileInfo && !subTile->HdTileData.empty();
 
-			if(hasMainHd || hasSubHd) {
+			// P4.1f: when the character is the color-math operand, render the
+			// exact PPU output instead of compositing HD art over it (Issue R).
+			if((hasMainHd || hasSubHd) && !spriteIsSubOperand) {
 				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
 				uint8_t brightness = sl.ScreenBrightness;
 
