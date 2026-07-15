@@ -1083,6 +1083,12 @@ void SnesPpu::RenderTilemap()
 	uint8_t hiresSubColor;
 	uint8_t pixelFlags = (((_state.ColorMathEnabled >> layerIndex) & 0x01) ? (PixelFlags::AllowColorMath | (_state.ColorMathSubtractMode ? PixelFlags::IsSubtractMode : 0)) : 0);
 
+	// P4.1c perf: consecutive pixels share the same 8x8 tile, so the content
+	// hash (FNV over 32-64 VRAM bytes) only needs recomputing when the tile's
+	// CHR address changes — not per pixel. VRAM cannot change mid-scanline.
+	uint16_t hdLastHashAddr = 0xFFFF;
+	uint64_t hdLastHash = 0;
+
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
 		if constexpr(hiResMode) {
 			lookupIndex = (x + (hScrollOriginal & 0x07)) >> 2;
@@ -1148,7 +1154,16 @@ void SnesPpu::RenderTilemap()
 					// Last writer wins — same semantics as _subScreenBuffer itself.
 					// +1 encoding so the memset(0) frame clear means "none".
 					if(hdValid && x < SnesHdScreenInfo::ScreenWidth) {
-						_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].SubScreenWinnerPlus1 = layerIndex + 1;
+						SnesHdPpuPixelInfo& subPx = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
+						subPx.SubScreenWinnerPlus1 = layerIndex + 1;
+						// P4.1d: sprites render BEFORE tilemaps (RenderMode1), so a
+						// higher-priority BG overwriting the sprite on the sub screen
+						// must clear the stale sprite flag. Otherwise the HD filter
+						// skips the sub-operand lookup at exactly the pixels where
+						// terrain covers a sprite → character-shaped native-SD patch
+						// in HD terrain (Lockjaw: "half-transparent" characters on
+						// BG1 contact underwater).
+						subPx.SubScreenHasSprite = false;
 					}
 				}
 			}
@@ -1167,7 +1182,11 @@ void SnesPpu::RenderTilemap()
 				uint16_t vramWordAddr = (_state.Layers[layerIndex].ChrAddress + tileIndex * 4 * bpp) & 0x7FFF;
 				tileInfo.Key.VramAddress = vramWordAddr;
 				if(_hdData->UseContentHash) {
-					tileInfo.Key.ContentHash = ComputeTileContentHash(_vram, vramWordAddr, 4 * bpp);
+					if(vramWordAddr != hdLastHashAddr) {
+						hdLastHash = ComputeTileContentHash(_vram, vramWordAddr, 4 * bpp);
+						hdLastHashAddr = vramWordAddr;
+					}
+					tileInfo.Key.ContentHash = hdLastHash;
 				}
 				tileInfo.Key.PaletteIndex = paletteIndex;
 				tileInfo.Key.LayerIndex = layerIndex;
@@ -1677,12 +1696,21 @@ void SnesPpu::SendFrame()
 		frame.Data = _hdActiveScreen;
 		// Swap to other buffer for next frame
 		_hdActiveScreen = (_hdActiveScreen == _hdScreenInfo[0]) ? _hdScreenInfo[1] : _hdScreenInfo[0];
-		// Clear next frame's screen info
-		memset(_hdActiveScreen->ScreenTiles, 0, sizeof(SnesHdPpuPixelInfo) * SnesHdScreenInfo::ScreenPixelCount);
-		memset(_hdActiveScreen->ScanlineInfo, 0, sizeof(SnesHdScanlineInfo) * SnesHdScreenInfo::ScreenHeight);
 	}
 
 	_emu->GetVideoDecoder()->UpdateFrame(frame, isRewinding, isRewinding);
+
+	// Clear next frame's screen info AFTER UpdateFrame: the buffer being cleared
+	// was attached to the PREVIOUS frame, and the async HD filter may still be
+	// reading it until UpdateFrame's entry wait (_frameChanged spin) confirms that
+	// decode finished. Clearing before that wait zeroed rows the filter had not
+	// reached yet — the bottom of the screen fell back to native for one frame
+	// whenever the filter overran the frame budget (Issue Q: bottom-edge flicker
+	// in Gangplank/Lockjaw, the heaviest filter workloads).
+	if(_hdData) {
+		memset(_hdActiveScreen->ScreenTiles, 0, sizeof(SnesHdPpuPixelInfo) * SnesHdScreenInfo::ScreenPixelCount);
+		memset(_hdActiveScreen->ScanlineInfo, 0, sizeof(SnesHdScanlineInfo) * SnesHdScreenInfo::ScreenHeight);
+	}
 
 	if(!_skipRender) {
 		_frameSkipTimer.Reset();

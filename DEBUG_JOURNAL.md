@@ -1,6 +1,124 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-14 | Mesen Build: P4.0 (BUILD+TEST PENDING) | Architektur-Umbau R1+R2: Filter rechnet PPU-Composite bei HD nach statt zu rekonstruieren | Phase 4 Color Window: Kern in P4.0 enthalten
+Stand: 2026-07-15 | Mesen Build: P4.1e (BUILD+TEST PENDING) | Issue Q gelöst, Perf bestätigt | OFFEN: Issue R Sprite-"Halbtransparenz" (P4.1d-Fix half nicht, P4.1e = Diagnose) | Architektur: P4.0-Composite-Engine
+
+---
+
+## Issue R — Lockjaw: Charaktere "halbtransparent" bei BG1-Kontakt (OFFEN, P4.1e = Diagnose)
+
+**P4.1d-Testergebnis:** Stale-Flag-Fix (SubScreenHasSprite-Reset) korrekt gebaut,
+**Symptom besteht unverändert** — die Stale-Flag-Theorie war nicht (allein) die
+Ursache. Hypothesen-Status:
+- Stale SubScreenHasSprite: gefixt (Fix bleibt drin, semantisch korrekt), ABER
+  nicht die sichtbare Ursache.
+- Bisherige Diagnostik war für Sprite-Pixel blind: SUBOP-SAMPLE nimmt nur die
+  ersten 10 Pixel eines Frames (x=0-9, y=oben) — im ganzen Log 0 Samples mit
+  spr=1. sprWon=0 in Lockjaw ist erwartbar (Sprites unter Wasser nur auf Sub).
+
+**P4.1e (Diagnose, kein Fix):**
+- Neue Counter in der FRAME-Zeile: `sprSub=` (Pixel, an denen ein Sprite finaler
+  Sub-Screen-Gewinner ist → Operand bleibt nativ) und `sprSubHd=` (davon Pixel,
+  die trotzdem den HD-Pfad nehmen, weil der Main-Winner ein HD-Tile hat).
+- Neue `SPR-SAMPLE`-Zeilen (max 12/Kontext, nur Bildmitte x=48-208/y=40-200):
+  x/y, winLayer, mainHd/bot, BgLayerMask, swp, MainScreenColor, SubScreenColor,
+  MainScreenFlags, Set des Main-Tiles — zeigt, welchen Renderpfad die
+  Charakter-Pixel wirklich nehmen.
+- **Test-Anleitung:** In Lockjaw den Charakter gezielt ans Terrain drücken
+  (Artefakt reproduzieren), dabei Log laufen lassen. Auswertung: Wenn
+  `sprSubHd` > 0 nennenswert → Charakter-Pixel laufen durch den HD-Pfad mit
+  semi-transparentem HD-Main-Tile (Wasseroberflächen-PNG?) → Verdacht: HD-Tile
+  wäscht den nativen ADD-Operanden aus. Wenn sprSubHd=0 → Charakter-Pixel sind
+  komplett nativ, dann ist die "Transparenz" der native water+sprite-ADD-Look
+  im Kontrast zum HD-Umfeld (Wahrnehmung, echter Fix wäre R6 HD-Sprites).
+
+---
+
+## P4.1d — Stale SubScreenHasSprite: "halbtransparente" Charaktere (2026-07-15)
+
+**Symptom (User, Lockjaw unter Wasser):** Charaktere wirken bei Berührung mit
+BG1-Terrain plötzlich halbtransparent; verschwindet bei freier Bewegung.
+Kein P4.1c-Regression — P4.0-Logik, vorher von Issue-Q-Flimmern überdeckt.
+
+**Root Cause:** `RenderMode1` rendert Sprites VOR den Tilemaps. `RenderSprites`
+setzt `SubScreenHasSprite=true` sobald der Sprite den (noch leeren) Sub-Screen
+gewinnt. Überschreibt danach ein höher-priorisiertes BG-Tile (BG1-Terrain,
+Prio 9 > Sprite-Prio 7) den Sprite auf dem Sub-Screen, blieb das Flag stale
+auf true. Der Filter überspringt bei gesetztem Flag den Sub-Operand-Lookup
+(M5.6-Sprite-Guard) → genau die Pixel, wo Terrain den Charakter verdeckt,
+fallen auf natives SD zurück → charakterförmiger SD-Fleck im HD-Terrain =
+wahrgenommene "Halbtransparenz".
+
+**Fix (`SnesPpu.cpp`, RenderTilemap DrawSubPixel-Block):** Wenn ein BG-Layer
+den Sub-Screen-Pixel gewinnt (derselbe Ort, der `SubScreenWinnerPlus1` setzt),
+wird `SubScreenHasSprite=false` zurückgesetzt. Flag bedeutet jetzt "Sprite ist
+FINALER Sub-Screen-Gewinner" — Main-Screen-Pendant (`IsSpritePixel` in
+`_mainScreenFlags`) war schon immer selbstkorrigierend, weil DrawMainPixel die
+Flags komplett ersetzt; nur die HD-Capture-Seite fehlte.
+
+**Nebenbefund entkräftet:** SUBOP-`subSet=3`-Samples stammen alle aus dem
+Mainbrace-Kontext (dort korrekt), NICHT aus Lockjaw — im P4.1c-Log keine
+Kontaminations-Evidenz in Lockjaw. Gusty bleibt der einzige belegte Fall.
+
+---
+
+## P4.1b + P4.1c — Issue Q Buffer-Race + Filter-Performance (2026-07-15)
+
+### Issue Q — Flimmern am unteren Bildschirmrand (Gangplank/Lockjaw): GELÖST (P4.1b)
+
+**Root Cause (durch User-Test bestätigt — Flimmern nach Fix weg):** Buffer-Race
+zwischen Emu-Thread und asynchronem Filter-Thread. `SnesPpu::SendFrame` nullte
+per `memset` die HD-ScreenTiles/ScanlineInfo des Doppelpuffers BEVOR
+`VideoDecoder::UpdateFrame` lief — erst dessen Entry-Spin (`_frameChanged`)
+wartet aber darauf, dass der Filter den VORHERIGEN Frame fertig gelesen hat.
+Brauchte der P4.0-Filter länger als 1 Frame, wurden ihm genau die noch nicht
+verarbeiteten Zeilen (= die UNTEREN) genullt → BgLayerMask=0 → nativer
+SD-Fallback für 1 Frame → HD↔SD-Flimmern unten. Mainbrace: leichterer
+Workload, unter Budget, daher sauber. **Fix: memsets hinter den
+UpdateFrame-Aufruf verschoben** (Entry-Wait garantiert Decode-Ende; kein
+Zusatz-Blocking). Dazu Log-Flut-Fix: Lockjaws rotierende VRAM-Sigs (CHR-
+Animation, ~8 Sigs Round-Robin) feuerten JEDEN Frame "Kontext-Wechsel" →
+Counter-Reset → ~90 DiagLog-Zeilen+fflush/Frame auf dem Filter-Thread.
+Jetzt Ring der letzten 16 Kontext-Keys; nur echte neue Kontexte resetten.
+
+### P4.1c — Performance (User meldete spürbaren Einbruch in Gangplank/Lockjaw nach P4.1b)
+
+Erwartet: P4.1b tauscht Race gegen Warten — der Emu-Thread blockt jetzt korrekt
+bis der Filter fertig ist, dadurch wird der zu langsame Filter als Ruckeln
+sichtbar. P4.1c macht den Filter selbst schneller:
+
+1. **Memoisierter Tile-Lookup im Filter** (`SnesHdVideoFilter.cpp`):
+   16-Slot direct-mapped Cache vor `GetMatchingTile`. Nachbarpixel teilen
+   dasselbe 8x8-Tile → bis zu 5 Map-Lookups pro Pixel (Winner, Retry, Bottom,
+   SubOp, SubOp-Retry) reduzieren sich um ~7/8. Negative Ergebnisse (nullptr)
+   werden mitgecacht — Misses dominieren in Lockjaw (BG3) und Gangplank (BG1).
+2. **`HdTileSampler` ersetzt `SampleHdTile`**: Koordinaten-/Flip-/Bounds-Mathe
+   einmal pro Nativ-Pixel statt pro Subpixel (16x bei 4x-Scale); im
+   Subpixel-Loop nur noch Pointer-Arithmetik. Bis zu 3 Samples/Subpixel
+   (Bottom, Main, SubOp) profitieren.
+3. **Color-Math-Hoisting**: Clip-/Prevent-Window-Entscheidung, halfShift und
+   Operand-Modus (Fixed vs. Sub) sind pro Nativ-Pixel konstant → aus dem
+   Subpixel-Loop gezogen. Semantik = exakter ApplyColorMathToPixel-Port,
+   unverändert.
+4. **Content-Hash-Memo in der PPU** (`SnesPpu.cpp`, `RenderTilemap`): FNV-Hash
+   über 32-64 VRAM-Bytes wurde PRO PIXEL berechnet; jetzt nur noch bei Wechsel
+   der Tile-CHR-Adresse (Nachbarpixel teilen das Tile, VRAM ändert sich nicht
+   mid-scanline) → ~7/8 der Hash-Arbeit auf dem Emu-Thread gespart.
+
+**Test steht aus:** Perf in Gangplank/Lockjaw, Flimmern darf nicht zurückkommen,
+Mainbrace/Pirate als Regressionscheck (Bild muss identisch zu P4.1b sein).
+
+### P4.1-Volldurchlauf #2 (P4.1b-Log) — Coverage-Erkenntnisse
+
+- **F88DC3D9 = NPC-Shop** (fehlt im Lauf ohne Shop-Besuche; per Ausschluss).
+  Einziger Kontext mit substanziellem Match (32%) und gfx=-1 → einziger echter
+  Verlust bei Strict-Scoping. Option: Shop-Gfxset im Viewer fingerprinten.
+- **66769298 = vermutl. Bonus-Raum in Lockjaw** (liegt zwischen Lockjaw-
+  Kontexten, statisch, Main=$13 CM=$00, 0% Match) — kein Scoping-Blocker.
+- Beide `1DF33CEA`-Besuche (laut User-Route Pirate Panic UND Gangplank Galley)
+  zeigen identisches Profil (Main=$17 Sub=$10 CM=$02, hdmaSplit=16, 100% Match,
+  gfx=7) — Sig+Gfxset-Sharing der beiden Schiffslevel bestätigt Annahme aus P3.x.
+- Alle HD-nutzenden Gameplay-Kontexte erkennen ihr Set (7/3/37) →
+  **P4.2 Strict-Scoping ist nach P4.1c-Perf-Validierung freigegeben.**
 
 ---
 

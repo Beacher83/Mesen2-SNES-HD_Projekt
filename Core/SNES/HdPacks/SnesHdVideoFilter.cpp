@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P4.1"
+#define SNES_HD_BUILD_VERSION "P4.1e"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -92,25 +92,81 @@ static void ContextLog(const char* msg)
 // P4.0 helpers — HD tile sampling and PPU color-window evaluation
 // ---------------------------------------------------------------------------
 
-// Sample one HD sub-pixel from a tile, honoring the tile's flip flags.
-// Returns false if the computed coordinate is outside the tile bitmap.
+// Samples HD sub-pixels from a tile, honoring the tile's flip flags.
 // Pixel data is alpha-PREMULTIPLIED (done at pack load time).
-static inline bool SampleHdTile(const SnesHdPackTileInfo* tile, const SnesHdPpuTileInfo* info,
-	uint32_t dx, uint32_t dy, uint32_t hdScale, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a)
+//
+// P4.1c perf: Init() resolves the tile-local base pointer and flip-aware
+// row/column steps once per native pixel; Sample() inside the hdScale×hdScale
+// sub-pixel loop is then pure pointer arithmetic — no per-sub-pixel coordinate
+// math or bounds checks. Init fails (valid=false) when the native tile cell
+// lies outside the HD bitmap; callers must skip sampling then.
+struct HdTileSampler
 {
-	uint8_t srcTX = info->HorizontalMirror ? (7 - info->OffsetX) : info->OffsetX;
-	uint8_t srcTY = info->VerticalMirror ? (7 - info->OffsetY) : info->OffsetY;
-	uint32_t px = srcTX * hdScale + (info->HorizontalMirror ? (hdScale - 1 - dx) : dx);
-	uint32_t py = srcTY * hdScale + (info->VerticalMirror ? (hdScale - 1 - dy) : dy);
-	if(px >= tile->Width || py >= tile->Height) {
-		return false;
+	const uint32_t* base = nullptr;
+	int rowStep = 0;
+	int colStep = 0;
+	bool valid = false;
+
+	inline void Init(const SnesHdPackTileInfo* tile, const SnesHdPpuTileInfo* info, uint32_t hdScale)
+	{
+		valid = false;
+		if(!tile || !info || tile->HdTileData.empty()) {
+			return;
+		}
+		uint8_t srcTX = info->HorizontalMirror ? (7 - info->OffsetX) : info->OffsetX;
+		uint8_t srcTY = info->VerticalMirror ? (7 - info->OffsetY) : info->OffsetY;
+		// The sub-pixel loop covers px in [srcTX*s, srcTX*s + s-1], same for py —
+		// one bounds check for the whole cell replaces one per sub-pixel.
+		if(srcTX * hdScale + hdScale > tile->Width || srcTY * hdScale + hdScale > tile->Height) {
+			return;
+		}
+		uint32_t px0 = srcTX * hdScale + (info->HorizontalMirror ? (hdScale - 1) : 0);
+		uint32_t py0 = srcTY * hdScale + (info->VerticalMirror ? (hdScale - 1) : 0);
+		base = tile->HdTileData.data() + py0 * tile->Width + px0;
+		rowStep = info->VerticalMirror ? -(int)tile->Width : (int)tile->Width;
+		colStep = info->HorizontalMirror ? -1 : 1;
+		valid = true;
 	}
-	uint32_t c = tile->HdTileData[py * tile->Width + px];
-	a = (c >> 24) & 0xFF;
-	r = (c >> 16) & 0xFF;
-	g = (c >> 8) & 0xFF;
-	b = c & 0xFF;
-	return true;
+
+	inline uint32_t Sample(uint32_t dx, uint32_t dy) const
+	{
+		return base[(int)dy * rowStep + (int)dx * colStep];
+	}
+};
+
+// P4.1c perf: memoized tile lookup.
+//
+// Neighboring pixels share the same 8x8 tile, so the same (hash, palette,
+// layer) key hits the unordered_map up to 8 times per row — and each pixel
+// performs up to 5 lookups (winner, winner-retry, bottom layer, sub-op,
+// sub-op-retry). A small direct-mapped cache in front of GetMatchingTile
+// removes ~7/8 of the map traffic. Negative results (nullptr) are cached
+// too — misses dominate in Lockjaw (BG3 water) and Gangplank (BG1 waves).
+// Keys are content hashes, so entries stay valid for the whole frame.
+struct TileLookupEntry
+{
+	uint64_t hash = 0;
+	uint8_t pal = 0xFF;
+	uint8_t layer = 0xFF;
+	SnesHdPackTileInfo* tile = nullptr;
+};
+
+static inline SnesHdPackTileInfo* CachedGetMatchingTile(SnesHdPackData* hdData, const uint16_t* vram,
+	TileLookupEntry* cache, const SnesHdTileKey& key)
+{
+	if(!hdData->UseContentHash || key.ContentHash == 0) {
+		return hdData->GetMatchingTile(key, vram);
+	}
+	TileLookupEntry& e = cache[(key.ContentHash ^ key.PaletteIndex ^ ((uint64_t)key.LayerIndex << 2)) & 15];
+	if(e.hash == key.ContentHash && e.pal == key.PaletteIndex && e.layer == key.LayerIndex) {
+		return e.tile;
+	}
+	SnesHdPackTileInfo* t = hdData->GetMatchingTile(key, vram);
+	e.hash = key.ContentHash;
+	e.pal = key.PaletteIndex;
+	e.layer = key.LayerIndex;
+	e.tile = t;
+	return t;
 }
 
 // Port of WindowConfig::PixelNeedsMasking (SnesPpuTypes.h) using the
@@ -270,6 +326,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagMatchCount = 0;
 	static int diagCmSampleCount = 0;    // generic CM+AddSubscreen pixel samples
 	static int diagSubOpSampleCount = 0; // P4.0: sub-screen operand decision samples
+	static int diagSprSampleCount = 0;   // P4.1e: sub-screen SPRITE pixel samples (transparency bug hunt)
 	static std::unordered_set<uint64_t> diagLoggedHashes;
 	static bool hdmaDumped = false;
 	static int diagContextCount = 0;     // total context changes seen
@@ -315,8 +372,26 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// Mainbrace (Main=$04/Sub=$13/CM=$24) even if VRAM hashes collide
 	uint64_t contextKey = vramSig ^ (ppuConfigKey * 0x9E3779B97F4A7C15ULL);
 
+	// P4.1b: ring of recently seen context keys. Lockjaw's animated CGRAM/CHR
+	// cycle rotates through ~8 VRAM sigs round-robin, so a plain prev-key compare
+	// fired a "context change" EVERY frame — resetting all counters and re-logging
+	// FRAME/MISS/MATCH lines each frame. That flooded the log AND put heavy file
+	// I/O (fflush per line) on the filter thread every frame, feeding the decode
+	// overruns behind Issue Q. A key only counts as a new context if it wasn't
+	// seen in the last 16 distinct contexts.
+	static uint64_t diagRecentKeys[16] = {};
+	static int diagRecentPos = 0;
+	bool diagKeyInRing = false;
+	for(int ri = 0; ri < 16; ri++) {
+		if(diagRecentKeys[ri] == contextKey) { diagKeyInRing = true; break; }
+	}
+
 	// Detect context change → reset ALL diagnostic counters
-	bool diagContextChanged = (contextKey != diagPrevContextKey);
+	bool diagContextChanged = (contextKey != diagPrevContextKey) && !diagKeyInRing;
+	if(diagContextChanged) {
+		diagRecentKeys[diagRecentPos] = contextKey;
+		diagRecentPos = (diagRecentPos + 1) % 16;
+	}
 	if(diagContextChanged && diagPrevContextKey != 0) {
 		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
 		char buf[512];
@@ -336,6 +411,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagMatchCount = 0;
 		diagCmSampleCount = 0;
 		diagSubOpSampleCount = 0;
+		diagSprSampleCount = 0;
 		diagLoggedHashes.clear();
 		hdmaDumped = false;
 		diagContextCount++;
@@ -375,6 +451,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSubOpHd = 0;      // P4.0: CM operand sampled from a sub-screen HD tile
 	uint32_t frameSubOpFixed = 0;   // P4.0: empty sub-screen → FixedColor operand (PPU special case)
 	uint32_t frameMainNatHd = 0;    // P4.0: rendered with native main color + HD sub operand (overlay case)
+	uint32_t frameSprSub = 0;       // P4.1e: pixels where a sprite is the final sub-screen winner (operand stays native)
+	uint32_t frameSprSubMainHd = 0; // P4.1e: of those, pixels that STILL render HD because the main winner matched
+
+	// P4.1c perf: per-frame memoized tile lookup (see CachedGetMatchingTile).
+	TileLookupEntry tileLookupCache[16];
 
 	// =====================================================================
 	// Main pixel loop
@@ -460,14 +541,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 				// --- Step 1: Try winner layer ---
 				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
-					hdTile = _hdData->GetMatchingTile(
-						pixelInfo.BgTiles[winLayer].Key, hdScreen->Vram);
+					hdTile = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[winLayer].Key);
 
 					// BG1↔BG2 layer retry
 					if(!hdTile && (winLayer == 0 || winLayer == 1)) {
 						SnesHdTileKey altKey = pixelInfo.BgTiles[winLayer].Key;
 						altKey.LayerIndex = (winLayer == 0) ? 1 : 0;
-						hdTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+						hdTile = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, altKey);
 						if(hdTile) frameLayerRetry++;
 					}
 				}
@@ -542,12 +622,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
 						if(!((sl.MainScreenLayers | sl.SubScreenLayers) & (1 << layer))) continue;
 
-						SnesHdPackTileInfo* tile2 = _hdData->GetMatchingTile(
-							pixelInfo.BgTiles[layer].Key, hdScreen->Vram);
+						SnesHdPackTileInfo* tile2 = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[layer].Key);
 						if(!tile2 && (layer == 0 || layer == 1)) {
 							SnesHdTileKey altKey2 = pixelInfo.BgTiles[layer].Key;
 							altKey2.LayerIndex = (layer == 0) ? 1 : 0;
-							tile2 = _hdData->GetMatchingTile(altKey2, hdScreen->Vram);
+							tile2 = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, altKey2);
 						}
 						if(tile2) {
 							hdTileBot = tile2;
@@ -599,12 +678,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						uint8_t swp = pixelInfo.SubScreenWinnerPlus1;
 						if(swp >= 1 && swp <= 4 && (pixelInfo.BgLayerMask & (1 << (swp - 1)))) {
 							uint8_t sLayer = swp - 1;
-							subTile = _hdData->GetMatchingTile(
-								pixelInfo.BgTiles[sLayer].Key, hdScreen->Vram);
+							subTile = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[sLayer].Key);
 							if(!subTile && sLayer <= 1) {
 								SnesHdTileKey altKey = pixelInfo.BgTiles[sLayer].Key;
 								altKey.LayerIndex = sLayer ^ 1;
-								subTile = _hdData->GetMatchingTile(altKey, hdScreen->Vram);
+								subTile = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, altKey);
 								if(subTile) frameLayerRetry++;
 							}
 							if(subTile) {
@@ -612,6 +690,28 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 								frameSubOpHd++;
 								if(!hdTile) frameMainNatHd++;
 							}
+						}
+					} else {
+						// P4.1e diag: a sprite is the final sub-screen winner here —
+						// the CM operand stays native (sprite color), by design.
+						// Counters + mid-screen samples to hunt the Lockjaw
+						// "half-transparent characters on BG1 contact" artifact:
+						// they show which render path these pixels actually take.
+						frameSprSub++;
+						if(hdTile) frameSprSubMainHd++;
+						if(diagSprSampleCount < 12 && x >= 48 && x <= 208 && y >= 40 && y <= 200) {
+							char buf[400];
+							snprintf(buf, sizeof(buf),
+								"[SNES HD diag] SPR-SAMPLE x=%d y=%d win=%d mainHd=%d bot=%d "
+								"mask=0x%02X swp=%d MainCol=0x%04X SubCol=0x%04X "
+								"MainFlags=0x%02X set=%d",
+								x, y, winLayer, hdTile ? 1 : 0, hdTileBot ? 1 : 0,
+								pixelInfo.BgLayerMask, pixelInfo.SubScreenWinnerPlus1,
+								pixelInfo.MainScreenColor, pixelInfo.SubScreenColor,
+								pixelInfo.MainScreenFlags,
+								hdTile ? (int)hdTile->GfxsetIndex : -1);
+							DiagLog(buf);
+							diagSprSampleCount++;
 						}
 					}
 
@@ -670,6 +770,47 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// evaluated once per native pixel (no sub-pixel windows needed)
 				bool isInsideWindow = IsInsideColorWindow(sl, (int)x);
 
+				// P4.1c perf: everything that is constant across the hdScale×hdScale
+				// sub-pixel block is decided once per native pixel. Semantics are an
+				// exact match of the previous per-sub-pixel ApplyColorMathToPixel port.
+				HdTileSampler botSampler, mainSampler, subSampler;
+				botSampler.Init(hdTileBot, hdTileInfoBot, hdScale);
+				if(hasMainHd) mainSampler.Init(hdTile, hdTileInfo, hdScale);
+				if(hasSubHd) subSampler.Init(subTile, subTileInfo, hdScale);
+
+				// 1. Clip main color to black (runs even without AllowColorMath;
+				//    Always mode does NOT reset halfShift — matches PPU)
+				int halfShift = sl.ColorMathHalveResult ? 1 : 0;
+				bool clipMain = false;
+				switch(sl.ColorMathClipMode) {
+					default:
+					case ColorWindowMode::Never: break;
+					case ColorWindowMode::OutsideWindow:
+						if(!isInsideWindow) { clipMain = true; halfShift = 0; }
+						break;
+					case ColorWindowMode::InsideWindow:
+						if(isInsideWindow) { clipMain = true; halfShift = 0; }
+						break;
+					case ColorWindowMode::Always: clipMain = true; break;
+				}
+
+				// 2. AllowColorMath (per-pixel PPU flag) + prevent window
+				bool prevented = false;
+				switch(sl.ColorMathPreventMode) {
+					default:
+					case ColorWindowMode::Never: break;
+					case ColorWindowMode::OutsideWindow: prevented = !isInsideWindow; break;
+					case ColorWindowMode::InsideWindow: prevented = isInsideWindow; break;
+					case ColorWindowMode::Always: prevented = true; break;
+				}
+				bool doMath = cmActive && !prevented;
+				// 3. Second operand: fixed color when AddSubscreen is off, or on the
+				//    PPU's empty-sub-screen special case (which also disables halve)
+				bool operandFixed = !sl.ColorMathAddSubscreen || pixelInfo.SubScreenEmpty;
+				if(doMath && sl.ColorMathAddSubscreen && pixelInfo.SubScreenEmpty) {
+					halfShift = 0;
+				}
+
 				// Per sub-pixel: compose pre-math main pixel → color math → brightness
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
 					for(uint32_t dx = 0; dx < hdScale; dx++) {
@@ -677,84 +818,58 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						if(outIndex >= frameInfo.Width * frameInfo.Height) continue;
 
 						// --- Compose pre-math main pixel (HD layers over native) ---
-						int r = nmR, g = nmG, b = nmB;
-						uint8_t hr = 0, hg = 0, hb = 0, ha = 0;
-						if(hdTileBot && hdTileInfoBot && !hdTileBot->HdTileData.empty()
-							&& SampleHdTile(hdTileBot, hdTileInfoBot, dx, dy, hdScale, hr, hg, hb, ha)
-							&& ha > 0) {
-							// premultiplied alpha blend
-							r = hr + (r * (255 - ha)) / 255;
-							g = hg + (g * (255 - ha)) / 255;
-							b = hb + (b * (255 - ha)) / 255;
-						}
-						if(hasMainHd
-							&& SampleHdTile(hdTile, hdTileInfo, dx, dy, hdScale, hr, hg, hb, ha)
-							&& ha > 0) {
-							r = hr + (r * (255 - ha)) / 255;
-							g = hg + (g * (255 - ha)) / 255;
-							b = hb + (b * (255 - ha)) / 255;
+						int r = 0, g = 0, b = 0;
+						if(!clipMain) {
+							r = nmR; g = nmG; b = nmB;
+							if(botSampler.valid) {
+								uint32_t c = botSampler.Sample(dx, dy);
+								uint32_t ha = c >> 24;
+								if(ha > 0) {
+									// premultiplied alpha blend
+									r = ((c >> 16) & 0xFF) + (r * (255 - (int)ha)) / 255;
+									g = ((c >> 8) & 0xFF) + (g * (255 - (int)ha)) / 255;
+									b = (c & 0xFF) + (b * (255 - (int)ha)) / 255;
+								}
+							}
+							if(mainSampler.valid) {
+								uint32_t c = mainSampler.Sample(dx, dy);
+								uint32_t ha = c >> 24;
+								if(ha > 0) {
+									r = ((c >> 16) & 0xFF) + (r * (255 - (int)ha)) / 255;
+									g = ((c >> 8) & 0xFF) + (g * (255 - (int)ha)) / 255;
+									b = (c & 0xFF) + (b * (255 - (int)ha)) / 255;
+								}
+							}
 						}
 
 						// --- Color math: exact port of SnesPpu::ApplyColorMathToPixel ---
-						int halfShift = sl.ColorMathHalveResult ? 1 : 0;
-
-						// 1. Clip main color to black (runs even without AllowColorMath;
-						//    Always mode does NOT reset halfShift — matches PPU)
-						switch(sl.ColorMathClipMode) {
-							default:
-							case ColorWindowMode::Never: break;
-							case ColorWindowMode::OutsideWindow:
-								if(!isInsideWindow) { r = 0; g = 0; b = 0; halfShift = 0; }
-								break;
-							case ColorWindowMode::InsideWindow:
-								if(isInsideWindow) { r = 0; g = 0; b = 0; halfShift = 0; }
-								break;
-							case ColorWindowMode::Always: r = 0; g = 0; b = 0; break;
-						}
-
-						// 2. AllowColorMath (per-pixel PPU flag) + prevent window
-						if(cmActive) {
-							bool prevented = false;
-							switch(sl.ColorMathPreventMode) {
-								default:
-								case ColorWindowMode::Never: break;
-								case ColorWindowMode::OutsideWindow: prevented = !isInsideWindow; break;
-								case ColorWindowMode::InsideWindow: prevented = isInsideWindow; break;
-								case ColorWindowMode::Always: prevented = true; break;
-							}
-							if(!prevented) {
-								// 3. Second operand
-								int oR, oG, oB;
-								if(sl.ColorMathAddSubscreen) {
-									if(pixelInfo.SubScreenEmpty) {
-										// PPU special case: empty sub-screen →
-										// fixed color operand, halve disabled
-										oR = fxR; oG = fxG; oB = fxB;
-										halfShift = 0;
-									} else {
-										oR = nsR; oG = nsG; oB = nsB;
-										if(hasSubHd
-											&& SampleHdTile(subTile, subTileInfo, dx, dy, hdScale, hr, hg, hb, ha)
-											&& ha > 0) {
-											oR = hr + (oR * (255 - ha)) / 255;
-											oG = hg + (oG * (255 - ha)) / 255;
-											oB = hb + (oB * (255 - ha)) / 255;
-										}
+						if(doMath) {
+							// 3. Second operand
+							int oR, oG, oB;
+							if(operandFixed) {
+								oR = fxR; oG = fxG; oB = fxB;
+							} else {
+								oR = nsR; oG = nsG; oB = nsB;
+								if(subSampler.valid) {
+									uint32_t c = subSampler.Sample(dx, dy);
+									uint32_t ha = c >> 24;
+									if(ha > 0) {
+										oR = ((c >> 16) & 0xFF) + (oR * (255 - (int)ha)) / 255;
+										oG = ((c >> 8) & 0xFF) + (oG * (255 - (int)ha)) / 255;
+										oB = (c & 0xFF) + (oB * (255 - (int)ha)) / 255;
 									}
-								} else {
-									oR = fxR; oG = fxG; oB = fxB;
 								}
+							}
 
-								// 4. Arithmetic — 8-bit equivalent of the PPU's 5-bit math
-								if(sl.ColorMathSubtractMode) {
-									r = std::max(0, r - oR) >> halfShift;
-									g = std::max(0, g - oG) >> halfShift;
-									b = std::max(0, b - oB) >> halfShift;
-								} else {
-									r = std::min(255, r + oR) >> halfShift;
-									g = std::min(255, g + oG) >> halfShift;
-									b = std::min(255, b + oB) >> halfShift;
-								}
+							// 4. Arithmetic — 8-bit equivalent of the PPU's 5-bit math
+							if(sl.ColorMathSubtractMode) {
+								r = std::max(0, r - oR) >> halfShift;
+								g = std::max(0, g - oG) >> halfShift;
+								b = std::max(0, b - oB) >> halfShift;
+							} else {
+								r = std::min(255, r + oR) >> halfShift;
+								g = std::min(255, g + oG) >> halfShift;
+								b = std::min(255, b + oB) >> halfShift;
 							}
 						}
 
@@ -851,7 +966,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
-			" sprWon=%u mask0=%u hdmaSplit=%u"
+			" sprWon=%u sprSub=%u sprSubHd=%u mask0=%u hdmaSplit=%u"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
@@ -860,7 +975,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			diagFrameCount, diagBgFrameCount, ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch,
 			frameHdMiss, frameHdCm, frameMainNatHd, frameSubOpHd, frameSubOpFixed, frameLayerRetry, frameMultiLayer,
-			frameSpriteWon, frameMaskZero, frameHdmaSplit,
+			frameSpriteWon, frameSprSub, frameSprSubMainHd, frameMaskZero, frameHdmaSplit,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
 			frameWin[0], frameWin[1], frameWin[2], frameWin[3],
