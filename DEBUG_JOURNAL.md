@@ -1,6 +1,76 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-16 | Mesen Build: R3.1 (Farben bestätigt gut, Perf weiter zu schwach → R6 Multithreading) | R3 CGRAM-Diff-Transform bestätigt (Mesen+Viewer) | Architektur: P4.0-Composite-Engine
+Stand: 2026-07-16 | Mesen Build: R6.0 (BUILD+TEST PENDING) | R3.0+R3.1 bestätigt+committed (`cdfa8703`) | Architektur: P4.0-Composite-Engine, Filter jetzt multithreaded
+
+---
+
+## R6.0 — Filter-Multithreading: Zeilen-Chunks auf Worker-Pool (2026-07-16)
+
+**Ziel:** R3.1-Test zeigte: Farben gut, aber Lockjaw+Gangplank ruckeln weiter
+stark bei vielen Bildelementen — die Grundlast des P4.0-Filters (bis ~1,7M
+HD-Samples/Frame) überfordert einen einzelnen Thread. Seit P4.1b wartet der
+Emu-Thread korrekt auf den Filter → Filterzeit limitiert direkt die Framerate.
+
+**Umsetzung (NUR `SnesHdVideoFilter.cpp` — kein Header, inkrementeller Build):**
+- Der komplette Pixel-Loop ist unverändert in die File-Level-Funktion
+  `RenderHdRows(ctx, yStart, yEnd, stats, cache)` gewandert. `HdFilterFrameCtx`
+  bündelt den read-only Frame-Zustand (Puffer, Overscan, R3-LUTs, vramSig …).
+- **`HdFilterWorkPool`:** persistenter Thread-Pool (Kerne−2 Worker, min 1,
+  max 7; einmal gestartet, wartet auf Condition-Variable). Arbeit wird
+  DYNAMISCH verteilt: atomarer Zeilenzähler gibt 4-Zeilen-Chunks aus, Worker
+  UND der aufrufende Decode-Thread ziehen Chunks bis der Frame leer ist
+  (HD-Last ballt sich vertikal — statische Bänder würden schlecht balancieren).
+  `RunFrame` kehrt erst zurück, wenn alle Chunks fertig sind (pending-Counter
+  unter Mutex) → Puffer-Lebensdauer wie bisher, kein neues Race mit P4.1b.
+- **Warum das sicher ist:** Der Loop liest nur unveränderliche Frame-Daten
+  (ScreenTiles, ScanlineInfo, VRAM, CGRAM-LUTs, TileByKey-Map — GetMatchingTile
+  ist reiner `find`) und schreibt disjunkte Output-Zeilen.
+- **Frame-Counter** (`match`/`miss`/`sHd`/…) laufen pro Thread in
+  `HdFilterFrameStats` und werden nach dem Join summiert — FRAME-Log-Werte
+  bleiben exakt identisch zum Single-Thread-Build.
+- **Diagnose-Sampling** (MATCH/MISS/CM-/SUBOP-/SPR-SAMPLE, Caps pro Kontext)
+  läuft jetzt über file-scope Statics + `s_diagMutex` (Cap-Check ohne Lock,
+  Recheck nach Lock) — nach den ersten Frames eines Kontexts kostenlos.
+- **Tile-Lookup-Memo (P4.1c)** lebt jetzt pro Thread+Frame (in `DrainRows`).
+- Pool ist absichtlich geleakter Singleton (Join im Static-Destruktor kann
+  beim DLL-Unload unter Loader-Lock deadlocken; OS räumt Threads beim Exit ab).
+- MSVC-ICE-Falle beachtet: alles auf Datei-Ebene, keine Lambdas in ApplyFilter.
+
+**Erwartung:** Bildausgabe pixel-identisch zu R3.1, Filterzeit ÷ ~Kernzahl.
+Lockjaw/Gangplank/Mainbrace sollten deutlich flüssiger sein. Log unverändert
+(Build-Version "R6.0" prüfen!).
+
+**Test:** Lockjaw + Gangplank + Mainbrace Perf mit viel Bildinhalt; Bild auf
+Artefakte prüfen (horizontale Streifen wären ein Chunk-Grenzen-Bug); Mainbrace/
+Pirate Regression; FRAME-Zeilen sollten plausible (gleiche) Counter zeigen.
+
+### R6.0-Testergebnis (2026-07-16)
+
+**Bild gut, KEINE Streifen/Artefakte, Performance DEUTLICH besser** —
+aber vereinzelte Ruckler bleiben bei viel Bildinhalt. Log sauber: Counter
+konsistent (match+miss=bg), Kontexte korrekt, kein Log-Flood.
+
+**Lastprofil aus dem Log (erklärt die verbleibenden Ruckler):**
+- Mainbrace (LEVEL2, schwerster Fall): bg=57344 (100% Abdeckung!),
+  match=53918, multi=53918 (Bottom-Layer an JEDEM Match), sHd=54844
+  (Sub-Operand an fast jedem Pixel), hdCm=53918 → praktisch jedes Pixel
+  nimmt den vollen Dreifach-Layer-Pfad: 917k HD-Subpixel × 3 Textur-Samples
+  mit Alpha-Blend + CM + Brightness ≈ ~2,7M Samples & >20M Integer-Ops/Frame.
+- Lockjaw: bg=55431, match=43864, sHd=28380, multi=25987 — ähnlich schwer.
+- Pirate/Gangplank: match=55663, multi=30891, sFix=24772 (FixedColor-Pfad
+  statt Sub-Sample → billiger).
+
+**Nächste Perf-Hebel (R6.1-Kandidaten, noch nicht gebaut):**
+1. **Opaque-Top-Skip:** Main-Sample ZUERST ziehen; bei Alpha=255 Bottom-
+   Sample+Blend komplett überspringen (Interior-Texel sind meist opak, nur
+   Kanten transparent). Zusätzlich pro Pixel: Bottom-LOOKUP nur wenn
+   `hdTile->HasTransparentPixels` (Flag existiert schon). In Mainbrace hilft
+   das wenig (Fog ist semi-transparent), in Lockjaw/Gangplank viel.
+2. **Blend-Arithmetik:** `(x*(255-a))/255` durch exakten Shift-Trick ersetzen
+   (`t=x*inva+128; (t+(t>>8))>>8`) — Divisionen raus aus dem innersten Loop.
+3. **Filter-Zeitmessung** in die FRAME-Zeile (`ms=`) — macht sichtbar, wie
+   nah am 16,7-ms-Budget wir sind und ob Ruckler wirklich vom Filter kommen.
+4. Falls das nicht reicht: SIMD (SSE2) für den Subpixel-Blend.
 
 ---
 

@@ -9,9 +9,13 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cstdlib>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "R3.1"
+#define SNES_HD_BUILD_VERSION "R6.0"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -293,6 +297,728 @@ OverscanDimensions SnesHdVideoFilter::GetOverscan()
 //   - No HD anywhere → native pixel (PPU output is already correct)
 // =========================================================================
 
+// ===========================================================================
+// R6: multithreaded filter.
+//
+// The pixel loop reads only immutable per-frame data (ScreenTiles,
+// ScanlineInfo, VRAM, CGRAM LUTs, tile map) and writes disjoint output rows,
+// so rows render in parallel. Work is handed out dynamically in small row
+// chunks (HD content clusters vertically -- static bands balance poorly).
+// Per-frame counters accumulate per thread and are summed after the join,
+// so FRAME-log values stay identical to the single-threaded build. In-loop
+// diagnostic sampling (capped per context) synchronizes on s_diagMutex --
+// cold once the caps fill.
+//
+// MSVC note: everything lives at file level -- local structs/lambdas inside
+// ApplyFilter trigger ICE C1001 (see P4.1d journal entry).
+// ===========================================================================
+
+// Diagnostic sampling state shared by the render threads. Reset in
+// ApplyFilter on context change (no render threads running then); all
+// in-loop access takes s_diagMutex after a cheap unsynchronized cap check.
+static std::mutex s_diagMutex;
+static int diagMissCount = 0;
+static int diagMatchCount = 0;
+static int diagCmSampleCount = 0;    // generic CM+AddSubscreen pixel samples
+static int diagSubOpSampleCount = 0; // P4.0: sub-screen operand decision samples
+static int diagSprSampleCount = 0;   // P4.1e: sub-screen SPRITE pixel samples
+static std::unordered_set<uint64_t> diagLoggedHashes;
+
+// Read-only per-frame state shared by all render threads.
+struct HdFilterFrameCtx
+{
+	SnesHdScreenInfo* hdScreen = nullptr;
+	SnesHdPackData* hdData = nullptr;
+	uint32_t* outputBuffer = nullptr;
+	uint16_t* ppuOutput = nullptr;
+	const uint32_t* calculatedPalette = nullptr;
+	OverscanDimensions overscan = {};
+	uint32_t frameWidth = 0;
+	uint32_t frameHeight = 0;
+	uint32_t hdScale = 1;
+	uint32_t ppuWidth = 256;
+	bool isHiRes = false;
+	bool isWorldmap = false;
+	uint64_t vramSig = 0;
+	bool anyPalTransform = false;
+	const bool* palRowActive = nullptr;        // [8]
+	const uint8_t (*palLut)[3][256] = nullptr; // [8][3][256]
+};
+
+// Per-thread frame counters, summed after all threads joined.
+struct HdFilterFrameStats
+{
+	uint32_t TotalPixels = 0;
+	uint32_t BgPixels = 0;
+	uint32_t HdMatch = 0;       // pixels where HD tile found for winner layer
+	uint32_t HdMiss = 0;        // BG pixels where NO HD tile found for winner
+	uint32_t HdCm = 0;          // HD pixels that had color math applied
+	uint32_t LayerRetry = 0;    // BG1<->BG2 layer-agnostic retry matches
+	uint32_t SpriteWon = 0;     // pixels where sprite won the MAIN screen
+	uint32_t MaskZero = 0;      // non-sprite pixels with BgLayerMask == 0
+	uint32_t LayerBits[4] = {}; // per-layer: pixels where layer has content
+	uint32_t Win[4] = {};       // per-layer: pixels where layer wins compositing
+	uint32_t HdLayers[4] = {};  // per-layer: HD tile found count
+	uint32_t MultiLayer = 0;    // pixels where bottom HD layer also found
+	uint32_t HdmaSplit = 0;     // scanlines whose registers differ from previous line
+	uint32_t SubOpHd = 0;       // P4.0: CM operand sampled from a sub-screen HD tile
+	uint32_t SubOpFixed = 0;    // P4.0: empty sub-screen -> FixedColor operand
+	uint32_t MainNatHd = 0;     // P4.0: native main color + HD sub operand (overlay case)
+	uint32_t SprSub = 0;        // P4.1e: sprite is the final sub-screen winner
+	uint32_t SprSubMainHd = 0;  // P4.1e: of those, pixels with a main-winner HD match
+};
+
+static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
+{
+	dst.TotalPixels += src.TotalPixels;
+	dst.BgPixels += src.BgPixels;
+	dst.HdMatch += src.HdMatch;
+	dst.HdMiss += src.HdMiss;
+	dst.HdCm += src.HdCm;
+	dst.LayerRetry += src.LayerRetry;
+	dst.SpriteWon += src.SpriteWon;
+	dst.MaskZero += src.MaskZero;
+	dst.MultiLayer += src.MultiLayer;
+	dst.HdmaSplit += src.HdmaSplit;
+	dst.SubOpHd += src.SubOpHd;
+	dst.SubOpFixed += src.SubOpFixed;
+	dst.MainNatHd += src.MainNatHd;
+	dst.SprSub += src.SprSub;
+	dst.SprSubMainHd += src.SprSubMainHd;
+	for(int i = 0; i < 4; i++) {
+		dst.LayerBits[i] += src.LayerBits[i];
+		dst.Win[i] += src.Win[i];
+		dst.HdLayers[i] += src.HdLayers[i];
+	}
+}
+
+// Renders native rows [yStart, yEnd) at HD scale -- the P4.0 pixel loop,
+// semantics unchanged, extracted from ApplyFilter for row-parallel execution.
+static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t yEnd,
+	HdFilterFrameStats& st, TileLookupEntry* tileLookupCache);
+
+// Persistent worker pool. An atomic row counter hands out ChunkRows-sized
+// row chunks to the workers AND the calling thread until the frame is
+// drained; RunFrame returns only after every chunk completed.
+struct HdFilterWorkPool
+{
+	static constexpr uint32_t ChunkRows = 4;
+	static constexpr int MaxWorkers = 7;
+
+	std::vector<std::thread> threads;
+	std::mutex mtx;
+	std::condition_variable cvStart;
+	std::condition_variable cvDone;
+
+	const HdFilterFrameCtx* ctx = nullptr;
+	HdFilterFrameStats* workerStats = nullptr;
+	std::atomic<uint32_t> nextRow{ 0 };
+	uint32_t rowEnd = 0;
+	uint64_t generation = 0;
+	uint32_t pending = 0;
+
+	void EnsureStarted()
+	{
+		if(!threads.empty()) {
+			return;
+		}
+		unsigned cores = std::thread::hardware_concurrency();
+		// Leave headroom for the emulation thread; the calling (video decode)
+		// thread renders too, so spawn cores-2 workers, at least 1, capped.
+		int workers = cores > 3 ? (int)cores - 2 : 1;
+		if(workers > MaxWorkers) {
+			workers = MaxWorkers;
+		}
+		for(int i = 0; i < workers; i++) {
+			threads.emplace_back(&HdFilterWorkPool::WorkerLoop, this, i);
+		}
+	}
+
+	void WorkerLoop(int index)
+	{
+		uint64_t seenGeneration = 0;
+		for(;;) {
+			{
+				std::unique_lock<std::mutex> lock(mtx);
+				while(generation == seenGeneration) {
+					cvStart.wait(lock);
+				}
+				seenGeneration = generation;
+			}
+			DrainRows(workerStats[index]);
+			{
+				std::lock_guard<std::mutex> lock(mtx);
+				pending--;
+				if(pending == 0) {
+					cvDone.notify_one();
+				}
+			}
+		}
+	}
+
+	void DrainRows(HdFilterFrameStats& st)
+	{
+		// Tile-lookup memo lives per thread per frame -- content-hash keys
+		// stay valid for the whole frame (P4.1c).
+		TileLookupEntry tileLookupCache[16];
+		for(;;) {
+			uint32_t y0 = nextRow.fetch_add(ChunkRows);
+			if(y0 >= rowEnd) {
+				break;
+			}
+			uint32_t y1 = std::min(y0 + ChunkRows, rowEnd);
+			RenderHdRows(*ctx, y0, y1, st, tileLookupCache);
+		}
+	}
+
+	void RunFrame(const HdFilterFrameCtx& frameCtx, uint32_t yStart, uint32_t yEndArg,
+		HdFilterFrameStats* statsSlots, HdFilterFrameStats& callerStats)
+	{
+		EnsureStarted();
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			ctx = &frameCtx;
+			workerStats = statsSlots;
+			nextRow.store(yStart);
+			rowEnd = yEndArg;
+			pending = (uint32_t)threads.size();
+			generation++;
+		}
+		cvStart.notify_all();
+		DrainRows(callerStats);
+		{
+			std::unique_lock<std::mutex> lock(mtx);
+			while(pending != 0) {
+				cvDone.wait(lock);
+			}
+		}
+	}
+};
+
+// Intentionally leaked singleton: joining threads from a static destructor
+// would run during DLL unload (loader lock held) and can deadlock -- the OS
+// reclaims the worker threads at process exit instead.
+static HdFilterWorkPool& GetHdFilterPool()
+{
+	static HdFilterWorkPool* pool = new HdFilterWorkPool();
+	return *pool;
+}
+
+static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t yEnd,
+	HdFilterFrameStats& st, TileLookupEntry* tileLookupCache)
+{
+	SnesHdScreenInfo* hdScreen = ctx.hdScreen;
+	SnesHdPackData* hdData = ctx.hdData;
+	uint32_t* outputBuffer = ctx.outputBuffer;
+	uint16_t* ppuOutputBuffer = ctx.ppuOutput;
+	const uint32_t* calculatedPalette = ctx.calculatedPalette;
+	const OverscanDimensions& overscan = ctx.overscan;
+	const uint32_t frameWidth = ctx.frameWidth;
+	const uint32_t frameHeight = ctx.frameHeight;
+	const uint32_t hdScale = ctx.hdScale;
+	const uint32_t ppuWidth = ctx.ppuWidth;
+	const bool isHiRes = ctx.isHiRes;
+	const bool isWorldmap = ctx.isWorldmap;
+	const uint64_t vramSig = ctx.vramSig;
+	const bool anyPalTransform = ctx.anyPalTransform;
+	const bool* palRowActive = ctx.palRowActive;
+	const uint8_t (*palLut)[3][256] = ctx.palLut;
+	const uint32_t baseWidth = 256;
+
+	for(uint32_t y = yStart; y < yEnd; y++) {
+
+		// HDMA split detection: track per-scanline register changes
+		if(y > overscan.Top) {
+			SnesHdScanlineInfo& prev = hdScreen->ScanlineInfo[y - 1];
+			SnesHdScanlineInfo& cur = hdScreen->ScanlineInfo[y];
+			if(cur.MainScreenLayers != prev.MainScreenLayers ||
+			   cur.SubScreenLayers != prev.SubScreenLayers ||
+			   cur.ColorMathEnabled != prev.ColorMathEnabled ||
+			   cur.FixedColor != prev.FixedColor ||
+			   cur.ScreenBrightness != prev.ScreenBrightness)
+				st.HdmaSplit++;
+		}
+
+		for(uint32_t x = overscan.Left; x < baseWidth - overscan.Right; x++) {
+			uint32_t srcIndex = y * SnesHdScreenInfo::ScreenWidth + x;
+			SnesHdPpuPixelInfo& pixelInfo = hdScreen->ScreenTiles[srcIndex];
+
+			// Index into ppuOutputBuffer (accounts for hi-res doubling)
+			uint32_t ppuIndex = isHiRes ? (y * 2 * ppuWidth + x * 2) : (y * ppuWidth + x);
+
+			st.TotalPixels++;
+
+			// Sprite detection (P4.0): only a sprite winning the MAIN screen forces
+			// the native path (no HD sprites yet). A sprite on the SUB screen no
+			// longer blocks HD — its color is correctly included in the native
+			// SubScreenColor used as the color math operand.
+			bool spriteWon = (pixelInfo.MainScreenFlags & 0x40) != 0;
+			if(spriteWon) {
+				st.SpriteWon++;
+			} else if(pixelInfo.BgLayerMask == 0) {
+				st.MaskZero++;
+			}
+
+			// =============================================================
+			// Phase 3.1: Winner-first with bottom-layer enhancement
+			// =============================================================
+			// The PPU winner is ALWAYS the top layer (avoids P2.0 bugs).
+			// If the winner has no HD tile → native pixel (winner is opaque).
+			// If the winner HAS an HD tile with transparency → find bottom
+			// layer below in priority order for compositing behind it.
+
+			SnesHdPackTileInfo* hdTile = nullptr;
+			SnesHdPpuTileInfo* hdTileInfo = nullptr;
+			SnesHdPackTileInfo* hdTileBot = nullptr;
+			SnesHdPpuTileInfo* hdTileInfoBot = nullptr;
+			SnesHdPackTileInfo* subTile = nullptr;     // P4.0: sub-screen winner HD tile (CM operand)
+			SnesHdPpuTileInfo* subTileInfo = nullptr;
+			bool cmActive = false;  // hoisted so the rendering section (below) can see it too
+			uint8_t winLayer = 0xFF;  // hoisted so the rendering section (below) can see it too
+			bool spriteIsSubOperand = false;  // P4.1f: sprite is the final sub winner AND the CM operand → force native
+
+			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
+				st.BgPixels++;
+
+				winLayer = pixelInfo.BgWinnerLayer;
+				if(winLayer < 4) st.Win[winLayer]++;
+
+				// Count per-layer content bits (diagnostic only)
+				for(int li = 0; li < 4; li++) {
+					if(pixelInfo.BgLayerMask & (1 << li)) st.LayerBits[li]++;
+				}
+
+				// Check if Color Math is active for this pixel
+				cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
+
+				// ---------------------------------------------------------
+				// Unified HD tile lookup (P4.0):
+				//
+				// 1. Try winner layer for HD tile (+ BG1↔BG2 retry)
+				// 2. If found → find bottom layer tile for soft-alpha edges
+				// 3. Sub-screen CM operand tile — independent of 1./2.:
+				//    the PPU blends main with the SUB-SCREEN WINNER pixel, so
+				//    an HD tile for that winner improves both the full-HD case
+				//    and the "native overlay over HD content" case.
+				//
+				// No level-specific detection, no overlay heuristics.
+				// ---------------------------------------------------------
+				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
+
+				// --- Step 1: Try winner layer ---
+				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+					hdTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[winLayer].Key);
+
+					// BG1↔BG2 layer retry
+					if(!hdTile && (winLayer == 0 || winLayer == 1)) {
+						SnesHdTileKey altKey = pixelInfo.BgTiles[winLayer].Key;
+						altKey.LayerIndex = (winLayer == 0) ? 1 : 0;
+						hdTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, altKey);
+						if(hdTile) st.LayerRetry++;
+					}
+				}
+
+				if(hdTile) {
+					// --- Step 2: Winner found → render with CM + bottom layer ---
+					hdTileInfo = &pixelInfo.BgTiles[winLayer];
+					st.HdMatch++;
+					st.HdLayers[winLayer]++;
+					if(cmActive) {
+						st.HdCm++;
+					}
+
+					// DIAGNOSTIC: Log first 5 unique matches per context
+					// (R6: shared sampling state -> s_diagMutex, recheck after lock)
+					if(diagMatchCount < 5) {
+						auto& key = pixelInfo.BgTiles[winLayer].Key;
+						if(key.ContentHash != 0) {
+							std::lock_guard<std::mutex> diagLock(s_diagMutex);
+							if(diagMatchCount < 5
+								&& diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
+								diagLoggedHashes.insert(key.ContentHash);
+								char buf[320];
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d win=%d cm=%d set=%d",
+									(unsigned long long)key.ContentHash, key.PaletteIndex,
+									key.LayerIndex, winLayer, cmActive ? 1 : 0,
+									(int)hdTile->GfxsetIndex);
+								DiagLog(buf);
+								diagMatchCount++;
+							}
+						}
+					}
+
+					// DIAGNOSTIC: Sample CM pixels — log SubScreenColor when CM+AddSubscreen active
+					// Generic: works for any level where winner has CM (Lockjaw, etc.)
+					if(diagCmSampleCount < 20
+						&& cmActive && sl.ColorMathAddSubscreen && hdTile) {
+						std::lock_guard<std::mutex> diagLock(s_diagMutex);
+						if(diagCmSampleCount < 20) {
+							uint16_t ssc = pixelInfo.SubScreenColor;
+							char buf[400];
+							snprintf(buf, sizeof(buf),
+								"[SNES HD diag] CM-SAMPLE win=%d SubScreenColor=0x%04X "
+								"(R=%d G=%d B=%d) MainFlags=0x%02X SubLayers=0x%02X "
+								"MainLayers=0x%02X CMEnabled=0x%02X x=%d y=%d sig=%016llX",
+								winLayer, ssc, ssc & 0x1F, (ssc >> 5) & 0x1F, (ssc >> 10) & 0x1F,
+								pixelInfo.MainScreenFlags, sl.SubScreenLayers,
+								sl.MainScreenLayers, sl.ColorMathEnabled, x, y,
+								(unsigned long long)vramSig);
+							DiagLog(buf);
+							diagCmSampleCount++;
+						}
+					}
+					// Find bottom layer (for transparency compositing)
+					uint8_t prioOrder[6];
+					int prioCount = 0;
+
+					uint8_t bg1P = pixelInfo.BgTiles[0].Priority;
+					uint8_t bg2P = pixelInfo.BgTiles[1].Priority;
+					uint8_t bg3P = pixelInfo.BgTiles[2].Priority;
+
+					if(sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
+					if(bg1P) prioOrder[prioCount++] = 0;
+					if(bg2P) prioOrder[prioCount++] = 1;
+					if(!bg1P) prioOrder[prioCount++] = 0;
+					if(!bg2P) prioOrder[prioCount++] = 1;
+					if(!sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
+					if(!bg3P) prioOrder[prioCount++] = 2;
+
+					bool pastWinner = false;
+					for(int pi = 0; pi < prioCount && !hdTileBot; pi++) {
+						uint8_t layer = prioOrder[pi];
+						if(layer == winLayer) {
+							pastWinner = true;
+							continue;
+						}
+						if(!pastWinner) continue;
+						if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
+						if(!((sl.MainScreenLayers | sl.SubScreenLayers) & (1 << layer))) continue;
+
+						SnesHdPackTileInfo* tile2 = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[layer].Key);
+						if(!tile2 && (layer == 0 || layer == 1)) {
+							SnesHdTileKey altKey2 = pixelInfo.BgTiles[layer].Key;
+							altKey2.LayerIndex = (layer == 0) ? 1 : 0;
+							tile2 = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, altKey2);
+						}
+						if(tile2) {
+							hdTileBot = tile2;
+							hdTileInfoBot = &pixelInfo.BgTiles[layer];
+							st.MultiLayer++;
+						}
+					}
+				}
+				else {
+					// Winner has no HD tile (or winner is sprite/backdrop 0xFF).
+					// The native main color becomes the base — the pixel can
+					// still render at HD resolution if the sub-screen operand
+					// below finds an HD tile (overlay case: fog/honey/water).
+					st.HdMiss++;
+
+					// DIAGNOSTIC: Log first 60 unique misses per context
+					// (R6: shared sampling state -> s_diagMutex, recheck after lock)
+					if(diagMissCount < 60 && winLayer < 4) {
+						SnesHdPpuTileInfo* missInfo = &pixelInfo.BgTiles[winLayer];
+						if(missInfo->Key.ContentHash != 0) {
+							std::lock_guard<std::mutex> diagLock(s_diagMutex);
+							if(diagMissCount < 60
+								&& diagLoggedHashes.find(missInfo->Key.ContentHash) == diagLoggedHashes.end()) {
+								diagLoggedHashes.insert(missInfo->Key.ContentHash);
+								bool inDmaRange = (missInfo->VramWordAddr >= 0x2000
+									&& missInfo->VramWordAddr <= 0x21D0);
+								char buf[512];
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d vram=0x%04X%s "
+									"mask=0x%02X win=%d",
+									(unsigned long long)missInfo->Key.ContentHash,
+									missInfo->Key.PaletteIndex, missInfo->Key.LayerIndex,
+									missInfo->VramWordAddr, inDmaRange ? " [DMA_RANGE]" : "",
+									pixelInfo.BgLayerMask, winLayer);
+								DiagLog(buf);
+								diagMissCount++;
+							}
+						}
+					}
+				}
+
+				// --- Step 3 (P4.0): Sub-screen CM operand HD lookup ---
+				// Runs regardless of the main winner result. The PPU adds the
+				// sub-screen WINNER pixel to the main pixel — sampling that
+				// tile in HD is what shows HD detail through overlay effects
+				// (Mainbrace fog, Rambi honey, Lockjaw water) without any
+				// overlay detection code.
+				if(cmActive && sl.ColorMathAddSubscreen) {
+					if(pixelInfo.SubScreenEmpty) {
+						// PPU special case: FixedColor + halve disabled (applied in rendering)
+						st.SubOpFixed++;
+					} else if(!pixelInfo.SubScreenHasSprite) {
+						uint8_t swp = pixelInfo.SubScreenWinnerPlus1;
+						if(swp >= 1 && swp <= 4 && (pixelInfo.BgLayerMask & (1 << (swp - 1)))) {
+							uint8_t sLayer = swp - 1;
+							subTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[sLayer].Key);
+							if(!subTile && sLayer <= 1) {
+								SnesHdTileKey altKey = pixelInfo.BgTiles[sLayer].Key;
+								altKey.LayerIndex = sLayer ^ 1;
+								subTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, altKey);
+								if(subTile) st.LayerRetry++;
+							}
+							if(subTile) {
+								subTileInfo = &pixelInfo.BgTiles[sLayer];
+								st.SubOpHd++;
+								if(!hdTile) st.MainNatHd++;
+							}
+						}
+					} else {
+						// P4.1f (Issue R fix): a sprite is the final sub-screen winner —
+						// the CHARACTER ITSELF is the color-math operand. Rendering the
+						// main winner's HD tile here paints semi-transparent HD art
+						// (Lockjaw water overlay) over the pixel before the sprite is
+						// added; native water texels are dark so the PPU's ADD leaves
+						// the character dominant, while brighter HD art washes it out
+						// ("half-transparent characters", confirmed via SPR-SAMPLE).
+						// Force the native path — exact PPU output (water + sprite ADD)
+						// at these few pixels; the surrounding water stays HD.
+						spriteIsSubOperand = true;
+						st.SprSub++;
+						if(hdTile) st.SprSubMainHd++; // pixels the forced-native rule affects
+						if(diagSprSampleCount < 12 && x >= 48 && x <= 208 && y >= 40 && y <= 200) {
+							std::lock_guard<std::mutex> diagLock(s_diagMutex);
+							if(diagSprSampleCount < 12) {
+								char buf[400];
+								snprintf(buf, sizeof(buf),
+									"[SNES HD diag] SPR-SAMPLE x=%d y=%d win=%d mainHd=%d bot=%d "
+									"mask=0x%02X swp=%d MainCol=0x%04X SubCol=0x%04X "
+									"MainFlags=0x%02X set=%d",
+									x, y, winLayer, hdTile ? 1 : 0, hdTileBot ? 1 : 0,
+									pixelInfo.BgLayerMask, pixelInfo.SubScreenWinnerPlus1,
+									pixelInfo.MainScreenColor, pixelInfo.SubScreenColor,
+									pixelInfo.MainScreenFlags,
+									hdTile ? (int)hdTile->GfxsetIndex : -1);
+								DiagLog(buf);
+								diagSprSampleCount++;
+							}
+						}
+					}
+
+					// DIAGNOSTIC: Log first 10 sub-operand decisions per context
+					if(diagSubOpSampleCount < 10) {
+						std::lock_guard<std::mutex> diagLock(s_diagMutex);
+						if(diagSubOpSampleCount < 10) {
+							char buf[300];
+							snprintf(buf, sizeof(buf),
+								"[SNES HD diag] SUBOP-SAMPLE win=%d swp=%d empty=%d spr=%d "
+								"subHd=%d mainHd=%d subSet=%d x=%d y=%d Main=$%02X Sub=$%02X",
+								winLayer, pixelInfo.SubScreenWinnerPlus1,
+								pixelInfo.SubScreenEmpty ? 1 : 0,
+								pixelInfo.SubScreenHasSprite ? 1 : 0,
+								subTile ? 1 : 0, hdTile ? 1 : 0,
+								subTile ? (int)subTile->GfxsetIndex : -1, x, y,
+								sl.MainScreenLayers, sl.SubScreenLayers);
+							DiagLog(buf);
+							diagSubOpSampleCount++;
+						}
+					}
+				}
+			}
+
+			// =============================================================
+			// Rendering (P4.0): reproduce the PPU composite at HD resolution
+			//
+			//   main = HD(top) over HD(bottom) over native pre-math color
+			//   out  = ColorMath(main, operand) — exact ApplyColorMathToPixel port
+			//   out  = Brightness(out)
+			//
+			// Renders in HD when the main winner OR the sub-screen operand
+			// has an HD tile. Overlay effects are just "main native + sub HD".
+			// =============================================================
+			uint32_t outX = (x - overscan.Left) * hdScale;
+			uint32_t outY = (y - overscan.Top) * hdScale;
+
+			bool hasMainHd = hdTile && hdTileInfo && !hdTile->HdTileData.empty();
+			bool hasSubHd = subTile && subTileInfo && !subTile->HdTileData.empty();
+
+			// P4.1f: when the character is the color-math operand, render the
+			// exact PPU output instead of compositing HD art over it (Issue R).
+			if((hasMainHd || hasSubHd) && !spriteIsSubOperand) {
+				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
+				uint8_t brightness = sl.ScreenBrightness;
+
+				// Native pre-math main screen color — base under the HD layers
+				uint8_t nmR = ColorUtilities::Convert5BitTo8Bit(pixelInfo.MainScreenColor & 0x1F);
+				uint8_t nmG = ColorUtilities::Convert5BitTo8Bit((pixelInfo.MainScreenColor >> 5) & 0x1F);
+				uint8_t nmB = ColorUtilities::Convert5BitTo8Bit((pixelInfo.MainScreenColor >> 10) & 0x1F);
+
+				// Native sub-screen color and fixed color — CM operand bases
+				uint8_t nsR = ColorUtilities::Convert5BitTo8Bit(pixelInfo.SubScreenColor & 0x1F);
+				uint8_t nsG = ColorUtilities::Convert5BitTo8Bit((pixelInfo.SubScreenColor >> 5) & 0x1F);
+				uint8_t nsB = ColorUtilities::Convert5BitTo8Bit((pixelInfo.SubScreenColor >> 10) & 0x1F);
+				uint8_t fxR = ColorUtilities::Convert5BitTo8Bit(sl.FixedColor & 0x1F);
+				uint8_t fxG = ColorUtilities::Convert5BitTo8Bit((sl.FixedColor >> 5) & 0x1F);
+				uint8_t fxB = ColorUtilities::Convert5BitTo8Bit((sl.FixedColor >> 10) & 0x1F);
+
+				// Color window state — windows are register-level x ranges,
+				// evaluated once per native pixel (no sub-pixel windows needed)
+				bool isInsideWindow = IsInsideColorWindow(sl, (int)x);
+
+				// P4.1c perf: everything that is constant across the hdScale×hdScale
+				// sub-pixel block is decided once per native pixel. Semantics are an
+				// exact match of the previous per-sub-pixel ApplyColorMathToPixel port.
+				HdTileSampler botSampler, mainSampler, subSampler;
+				botSampler.Init(hdTileBot, hdTileInfoBot, hdScale);
+				if(hasMainHd) mainSampler.Init(hdTile, hdTileInfo, hdScale);
+				if(hasSubHd) subSampler.Init(subTile, subTileInfo, hdScale);
+
+				// R3: per-tile palette-row transform (live CGRAM vs reference).
+				// Resolved once per native pixel; nullptr = identity.
+				// R3.1: pointer to the row's 3×256 LUT — one load per channel per sample.
+				typedef const uint8_t (*PalLutRow)[256];
+				PalLutRow botLut = nullptr, mainLut = nullptr, subLut = nullptr;
+				if(anyPalTransform) {
+					if(botSampler.valid && palRowActive[hdTileInfoBot->Key.PaletteIndex & 7]) {
+						botLut = palLut[hdTileInfoBot->Key.PaletteIndex & 7];
+					}
+					if(mainSampler.valid && palRowActive[hdTileInfo->Key.PaletteIndex & 7]) {
+						mainLut = palLut[hdTileInfo->Key.PaletteIndex & 7];
+					}
+					if(subSampler.valid && palRowActive[subTileInfo->Key.PaletteIndex & 7]) {
+						subLut = palLut[subTileInfo->Key.PaletteIndex & 7];
+					}
+				}
+
+				// 1. Clip main color to black (runs even without AllowColorMath;
+				//    Always mode does NOT reset halfShift — matches PPU)
+				int halfShift = sl.ColorMathHalveResult ? 1 : 0;
+				bool clipMain = false;
+				switch(sl.ColorMathClipMode) {
+					default:
+					case ColorWindowMode::Never: break;
+					case ColorWindowMode::OutsideWindow:
+						if(!isInsideWindow) { clipMain = true; halfShift = 0; }
+						break;
+					case ColorWindowMode::InsideWindow:
+						if(isInsideWindow) { clipMain = true; halfShift = 0; }
+						break;
+					case ColorWindowMode::Always: clipMain = true; break;
+				}
+
+				// 2. AllowColorMath (per-pixel PPU flag) + prevent window
+				bool prevented = false;
+				switch(sl.ColorMathPreventMode) {
+					default:
+					case ColorWindowMode::Never: break;
+					case ColorWindowMode::OutsideWindow: prevented = !isInsideWindow; break;
+					case ColorWindowMode::InsideWindow: prevented = isInsideWindow; break;
+					case ColorWindowMode::Always: prevented = true; break;
+				}
+				bool doMath = cmActive && !prevented;
+				// 3. Second operand: fixed color when AddSubscreen is off, or on the
+				//    PPU's empty-sub-screen special case (which also disables halve)
+				bool operandFixed = !sl.ColorMathAddSubscreen || pixelInfo.SubScreenEmpty;
+				if(doMath && sl.ColorMathAddSubscreen && pixelInfo.SubScreenEmpty) {
+					halfShift = 0;
+				}
+
+				// Per sub-pixel: compose pre-math main pixel → color math → brightness
+				for(uint32_t dy = 0; dy < hdScale; dy++) {
+					for(uint32_t dx = 0; dx < hdScale; dx++) {
+						uint32_t outIndex = (outY + dy) * frameWidth + (outX + dx);
+						if(outIndex >= frameWidth * frameHeight) continue;
+
+						// --- Compose pre-math main pixel (HD layers over native) ---
+						int r = 0, g = 0, b = 0;
+						if(!clipMain) {
+							r = nmR; g = nmG; b = nmB;
+							if(botSampler.valid) {
+								uint32_t c = botSampler.Sample(dx, dy);
+								uint32_t ha = c >> 24;
+								if(ha > 0) {
+									int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
+									if(botLut) {
+										// R3: follow live CGRAM (rgb is premultiplied; alpha unchanged)
+										hr = botLut[0][hr]; hg = botLut[1][hg]; hb = botLut[2][hb];
+									}
+									// premultiplied alpha blend
+									r = hr + (r * (255 - (int)ha)) / 255;
+									g = hg + (g * (255 - (int)ha)) / 255;
+									b = hb + (b * (255 - (int)ha)) / 255;
+								}
+							}
+							if(mainSampler.valid) {
+								uint32_t c = mainSampler.Sample(dx, dy);
+								uint32_t ha = c >> 24;
+								if(ha > 0) {
+									int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
+									if(mainLut) {
+										hr = mainLut[0][hr]; hg = mainLut[1][hg]; hb = mainLut[2][hb];
+									}
+									r = hr + (r * (255 - (int)ha)) / 255;
+									g = hg + (g * (255 - (int)ha)) / 255;
+									b = hb + (b * (255 - (int)ha)) / 255;
+								}
+							}
+						}
+
+						// --- Color math: exact port of SnesPpu::ApplyColorMathToPixel ---
+						if(doMath) {
+							// 3. Second operand
+							int oR, oG, oB;
+							if(operandFixed) {
+								oR = fxR; oG = fxG; oB = fxB;
+							} else {
+								oR = nsR; oG = nsG; oB = nsB;
+								if(subSampler.valid) {
+									uint32_t c = subSampler.Sample(dx, dy);
+									uint32_t ha = c >> 24;
+									if(ha > 0) {
+										int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
+										if(subLut) {
+											hr = subLut[0][hr]; hg = subLut[1][hg]; hb = subLut[2][hb];
+										}
+										oR = hr + (oR * (255 - (int)ha)) / 255;
+										oG = hg + (oG * (255 - (int)ha)) / 255;
+										oB = hb + (oB * (255 - (int)ha)) / 255;
+									}
+								}
+							}
+
+							// 4. Arithmetic — 8-bit equivalent of the PPU's 5-bit math
+							if(sl.ColorMathSubtractMode) {
+								r = std::max(0, r - oR) >> halfShift;
+								g = std::max(0, g - oG) >> halfShift;
+								b = std::max(0, b - oB) >> halfShift;
+							} else {
+								r = std::min(255, r + oR) >> halfShift;
+								g = std::min(255, g + oG) >> halfShift;
+								b = std::min(255, b + oB) >> halfShift;
+							}
+						}
+
+						// --- Brightness (after color math, like the PPU) ---
+						if(brightness < 15) {
+							r = r * brightness / 15;
+							g = g * brightness / 15;
+							b = b * brightness / 15;
+						}
+
+						outputBuffer[outIndex] = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+					}
+				}
+			} else {
+				// No HD replacement — use original SNES color, scaled up
+				uint32_t color = calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
+				for(uint32_t dy = 0; dy < hdScale; dy++) {
+					for(uint32_t dx = 0; dx < hdScale; dx++) {
+						uint32_t outIndex = (outY + dy) * frameWidth + (outX + dx);
+						if(outIndex < frameWidth * frameHeight) {
+							outputBuffer[outIndex] = color;
+						}
+					}
+				}
+			}
+		} // end for(x)
+	} // end for(y)
+}
+
 void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 {
 	if(_frameData == nullptr) {
@@ -305,7 +1031,6 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	OverscanDimensions overscan = GetOverscan();
 
 	uint32_t hdScale = _hdScale;
-	uint32_t baseWidth = 256;
 
 	// The PPU output buffer width depends on hi-res mode
 	uint32_t ppuWidth = _baseFrameInfo.Width;
@@ -322,13 +1047,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static uint64_t diagPrevContextKey = 0;
 	static int diagFrameCount = 0;
 	static int diagBgFrameCount = 0;
-	static int diagMissCount = 0;
-	static int diagMatchCount = 0;
-	static int diagCmSampleCount = 0;    // generic CM+AddSubscreen pixel samples
-	static int diagSubOpSampleCount = 0; // P4.0: sub-screen operand decision samples
-	static int diagSprSampleCount = 0;   // P4.1e: sub-screen SPRITE pixel samples (transparency bug hunt)
+	// R6: diagMissCount/diagMatchCount/diagCmSampleCount/diagSubOpSampleCount/
+	// diagSprSampleCount/diagLoggedHashes moved to file scope — they are sampled
+	// from the parallel render threads (under s_diagMutex) and reset below.
 	static int diagPalLogCount = 0;      // R3: CGRAM-diff transform detail lines
-	static std::unordered_set<uint64_t> diagLoggedHashes;
 	static bool hdmaDumped = false;
 	static int diagContextCount = 0;     // total context changes seen
 
@@ -495,507 +1217,62 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 	diagPrevContextKey = contextKey;
 
-	// Per-frame counters
-	uint32_t frameTotalPixels = 0;
-	uint32_t frameBgPixels = 0;
-	uint32_t frameHdMatch = 0;       // pixels where HD tile found for winner layer
-	uint32_t frameHdMiss = 0;        // BG pixels where NO HD tile found for winner
-	uint32_t frameHdCm = 0;         // HD pixels that had color math applied
-	uint32_t frameLayerRetry = 0;    // BG1↔BG2 layer-agnostic retry matches
-	uint32_t frameSpriteWon = 0;     // pixels where sprite won the MAIN screen (HD BG skipped)
-	uint32_t frameMaskZero = 0;      // non-sprite pixels with BgLayerMask == 0
-	uint32_t frameLayerBits[4] = {}; // per-layer: pixels where layer has content
-	uint32_t frameWin[4] = {};       // per-layer: pixels where layer wins compositing
-	uint32_t frameHdLayers[4] = {};  // per-layer: HD tile found count
-	uint32_t frameMultiLayer = 0;   // pixels where bottom HD layer also found
-	uint32_t frameHdmaSplit = 0;    // scanlines where MainScreenLayers differs from previous
-	uint32_t frameSubOpHd = 0;      // P4.0: CM operand sampled from a sub-screen HD tile
-	uint32_t frameSubOpFixed = 0;   // P4.0: empty sub-screen → FixedColor operand (PPU special case)
-	uint32_t frameMainNatHd = 0;    // P4.0: rendered with native main color + HD sub operand (overlay case)
-	uint32_t frameSprSub = 0;       // P4.1e: pixels where a sprite is the final sub-screen winner (operand stays native)
-	uint32_t frameSprSubMainHd = 0; // P4.1e: of those, pixels that STILL render HD because the main winner matched
-
-	// P4.1c perf: per-frame memoized tile lookup (see CachedGetMatchingTile).
-	TileLookupEntry tileLookupCache[16];
-
 	// =====================================================================
-	// Main pixel loop
+	// R6: Main pixel loop -- rendered in parallel row chunks on the worker
+	// pool (see RenderHdRows above). Per-frame counters accumulate per
+	// thread and are summed below; log values stay identical.
 	// =====================================================================
-	for(uint32_t y = overscan.Top; y < 239 - overscan.Bottom; y++) {
+	HdFilterFrameCtx renderCtx;
+	renderCtx.hdScreen = hdScreen;
+	renderCtx.hdData = _hdData;
+	renderCtx.outputBuffer = outputBuffer;
+	renderCtx.ppuOutput = ppuOutputBuffer;
+	renderCtx.calculatedPalette = _calculatedPalette;
+	renderCtx.overscan = overscan;
+	renderCtx.frameWidth = frameInfo.Width;
+	renderCtx.frameHeight = frameInfo.Height;
+	renderCtx.hdScale = hdScale;
+	renderCtx.ppuWidth = ppuWidth;
+	renderCtx.isHiRes = isHiRes;
+	renderCtx.isWorldmap = isWorldmap;
+	renderCtx.vramSig = vramSig;
+	renderCtx.anyPalTransform = anyPalTransform;
+	renderCtx.palRowActive = palRowActive;
+	renderCtx.palLut = palLut;
 
-		// HDMA split detection: track per-scanline register changes
-		if(y > overscan.Top) {
-			SnesHdScanlineInfo& prev = hdScreen->ScanlineInfo[y - 1];
-			SnesHdScanlineInfo& cur = hdScreen->ScanlineInfo[y];
-			if(cur.MainScreenLayers != prev.MainScreenLayers ||
-			   cur.SubScreenLayers != prev.SubScreenLayers ||
-			   cur.ColorMathEnabled != prev.ColorMathEnabled ||
-			   cur.FixedColor != prev.FixedColor ||
-			   cur.ScreenBrightness != prev.ScreenBrightness)
-				frameHdmaSplit++;
-		}
+	HdFilterFrameStats statsSlots[HdFilterWorkPool::MaxWorkers];
+	HdFilterFrameStats callerStats;
+	GetHdFilterPool().RunFrame(renderCtx, overscan.Top, 239 - overscan.Bottom, statsSlots, callerStats);
 
-		for(uint32_t x = overscan.Left; x < baseWidth - overscan.Right; x++) {
-			uint32_t srcIndex = y * SnesHdScreenInfo::ScreenWidth + x;
-			SnesHdPpuPixelInfo& pixelInfo = hdScreen->ScreenTiles[srcIndex];
-
-			// Index into ppuOutputBuffer (accounts for hi-res doubling)
-			uint32_t ppuIndex = isHiRes ? (y * 2 * ppuWidth + x * 2) : (y * ppuWidth + x);
-
-			frameTotalPixels++;
-
-			// Sprite detection (P4.0): only a sprite winning the MAIN screen forces
-			// the native path (no HD sprites yet). A sprite on the SUB screen no
-			// longer blocks HD — its color is correctly included in the native
-			// SubScreenColor used as the color math operand.
-			bool spriteWon = (pixelInfo.MainScreenFlags & 0x40) != 0;
-			if(spriteWon) {
-				frameSpriteWon++;
-			} else if(pixelInfo.BgLayerMask == 0) {
-				frameMaskZero++;
-			}
-
-			// =============================================================
-			// Phase 3.1: Winner-first with bottom-layer enhancement
-			// =============================================================
-			// The PPU winner is ALWAYS the top layer (avoids P2.0 bugs).
-			// If the winner has no HD tile → native pixel (winner is opaque).
-			// If the winner HAS an HD tile with transparency → find bottom
-			// layer below in priority order for compositing behind it.
-
-			SnesHdPackTileInfo* hdTile = nullptr;
-			SnesHdPpuTileInfo* hdTileInfo = nullptr;
-			SnesHdPackTileInfo* hdTileBot = nullptr;
-			SnesHdPpuTileInfo* hdTileInfoBot = nullptr;
-			SnesHdPackTileInfo* subTile = nullptr;     // P4.0: sub-screen winner HD tile (CM operand)
-			SnesHdPpuTileInfo* subTileInfo = nullptr;
-			bool cmActive = false;  // hoisted so the rendering section (below) can see it too
-			uint8_t winLayer = 0xFF;  // hoisted so the rendering section (below) can see it too
-			bool spriteIsSubOperand = false;  // P4.1f: sprite is the final sub winner AND the CM operand → force native
-
-			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
-				frameBgPixels++;
-
-				winLayer = pixelInfo.BgWinnerLayer;
-				if(winLayer < 4) frameWin[winLayer]++;
-
-				// Count per-layer content bits (diagnostic only)
-				for(int li = 0; li < 4; li++) {
-					if(pixelInfo.BgLayerMask & (1 << li)) frameLayerBits[li]++;
-				}
-
-				// Check if Color Math is active for this pixel
-				cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
-
-				// ---------------------------------------------------------
-				// Unified HD tile lookup (P4.0):
-				//
-				// 1. Try winner layer for HD tile (+ BG1↔BG2 retry)
-				// 2. If found → find bottom layer tile for soft-alpha edges
-				// 3. Sub-screen CM operand tile — independent of 1./2.:
-				//    the PPU blends main with the SUB-SCREEN WINNER pixel, so
-				//    an HD tile for that winner improves both the full-HD case
-				//    and the "native overlay over HD content" case.
-				//
-				// No level-specific detection, no overlay heuristics.
-				// ---------------------------------------------------------
-				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
-
-				// --- Step 1: Try winner layer ---
-				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
-					hdTile = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[winLayer].Key);
-
-					// BG1↔BG2 layer retry
-					if(!hdTile && (winLayer == 0 || winLayer == 1)) {
-						SnesHdTileKey altKey = pixelInfo.BgTiles[winLayer].Key;
-						altKey.LayerIndex = (winLayer == 0) ? 1 : 0;
-						hdTile = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, altKey);
-						if(hdTile) frameLayerRetry++;
-					}
-				}
-
-				if(hdTile) {
-					// --- Step 2: Winner found → render with CM + bottom layer ---
-					hdTileInfo = &pixelInfo.BgTiles[winLayer];
-					frameHdMatch++;
-					frameHdLayers[winLayer]++;
-					if(cmActive) {
-						frameHdCm++;
-					}
-
-					// DIAGNOSTIC: Log first 5 unique matches per context
-					if(diagMatchCount < 5) {
-						auto& key = pixelInfo.BgTiles[winLayer].Key;
-						if(key.ContentHash != 0
-							&& diagLoggedHashes.find(key.ContentHash) == diagLoggedHashes.end()) {
-							diagLoggedHashes.insert(key.ContentHash);
-							char buf[320];
-							snprintf(buf, sizeof(buf),
-								"[SNES HD diag] MATCH hash=%016llX pal=%d layer=%d win=%d cm=%d set=%d",
-								(unsigned long long)key.ContentHash, key.PaletteIndex,
-								key.LayerIndex, winLayer, cmActive ? 1 : 0,
-								(int)hdTile->GfxsetIndex);
-							DiagLog(buf);
-							diagMatchCount++;
-						}
-				}
-
-					// DIAGNOSTIC: Sample CM pixels — log SubScreenColor when CM+AddSubscreen active
-					// Generic: works for any level where winner has CM (Lockjaw, etc.)
-					if(diagCmSampleCount < 20
-						&& cmActive && sl.ColorMathAddSubscreen && hdTile) {
-						uint16_t ssc = pixelInfo.SubScreenColor;
-						char buf[400];
-						snprintf(buf, sizeof(buf),
-							"[SNES HD diag] CM-SAMPLE win=%d SubScreenColor=0x%04X "
-							"(R=%d G=%d B=%d) MainFlags=0x%02X SubLayers=0x%02X "
-							"MainLayers=0x%02X CMEnabled=0x%02X x=%d y=%d sig=%016llX",
-							winLayer, ssc, ssc & 0x1F, (ssc >> 5) & 0x1F, (ssc >> 10) & 0x1F,
-							pixelInfo.MainScreenFlags, sl.SubScreenLayers,
-							sl.MainScreenLayers, sl.ColorMathEnabled, x, y,
-							(unsigned long long)vramSig);
-						DiagLog(buf);
-						diagCmSampleCount++;
-					}
-					// Find bottom layer (for transparency compositing)
-					uint8_t prioOrder[6];
-					int prioCount = 0;
-
-					uint8_t bg1P = pixelInfo.BgTiles[0].Priority;
-					uint8_t bg2P = pixelInfo.BgTiles[1].Priority;
-					uint8_t bg3P = pixelInfo.BgTiles[2].Priority;
-
-					if(sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
-					if(bg1P) prioOrder[prioCount++] = 0;
-					if(bg2P) prioOrder[prioCount++] = 1;
-					if(!bg1P) prioOrder[prioCount++] = 0;
-					if(!bg2P) prioOrder[prioCount++] = 1;
-					if(!sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
-					if(!bg3P) prioOrder[prioCount++] = 2;
-
-					bool pastWinner = false;
-					for(int pi = 0; pi < prioCount && !hdTileBot; pi++) {
-						uint8_t layer = prioOrder[pi];
-						if(layer == winLayer) {
-							pastWinner = true;
-							continue;
-						}
-						if(!pastWinner) continue;
-						if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
-						if(!((sl.MainScreenLayers | sl.SubScreenLayers) & (1 << layer))) continue;
-
-						SnesHdPackTileInfo* tile2 = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[layer].Key);
-						if(!tile2 && (layer == 0 || layer == 1)) {
-							SnesHdTileKey altKey2 = pixelInfo.BgTiles[layer].Key;
-							altKey2.LayerIndex = (layer == 0) ? 1 : 0;
-							tile2 = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, altKey2);
-						}
-						if(tile2) {
-							hdTileBot = tile2;
-							hdTileInfoBot = &pixelInfo.BgTiles[layer];
-							frameMultiLayer++;
-						}
-					}
-				}
-				else {
-					// Winner has no HD tile (or winner is sprite/backdrop 0xFF).
-					// The native main color becomes the base — the pixel can
-					// still render at HD resolution if the sub-screen operand
-					// below finds an HD tile (overlay case: fog/honey/water).
-					frameHdMiss++;
-
-					// DIAGNOSTIC: Log first 60 unique misses per context
-					if(diagMissCount < 60 && winLayer < 4) {
-						SnesHdPpuTileInfo* missInfo = &pixelInfo.BgTiles[winLayer];
-						if(missInfo->Key.ContentHash != 0
-							&& diagLoggedHashes.find(missInfo->Key.ContentHash) == diagLoggedHashes.end()) {
-							diagLoggedHashes.insert(missInfo->Key.ContentHash);
-							bool inDmaRange = (missInfo->VramWordAddr >= 0x2000
-								&& missInfo->VramWordAddr <= 0x21D0);
-							char buf[512];
-							snprintf(buf, sizeof(buf),
-								"[SNES HD diag] MISS hash=%016llX pal=%d layer=%d vram=0x%04X%s "
-								"mask=0x%02X win=%d",
-								(unsigned long long)missInfo->Key.ContentHash,
-								missInfo->Key.PaletteIndex, missInfo->Key.LayerIndex,
-								missInfo->VramWordAddr, inDmaRange ? " [DMA_RANGE]" : "",
-								pixelInfo.BgLayerMask, winLayer);
-							DiagLog(buf);
-							diagMissCount++;
-						}
-					}
-				}
-
-				// --- Step 3 (P4.0): Sub-screen CM operand HD lookup ---
-				// Runs regardless of the main winner result. The PPU adds the
-				// sub-screen WINNER pixel to the main pixel — sampling that
-				// tile in HD is what shows HD detail through overlay effects
-				// (Mainbrace fog, Rambi honey, Lockjaw water) without any
-				// overlay detection code.
-				if(cmActive && sl.ColorMathAddSubscreen) {
-					if(pixelInfo.SubScreenEmpty) {
-						// PPU special case: FixedColor + halve disabled (applied in rendering)
-						frameSubOpFixed++;
-					} else if(!pixelInfo.SubScreenHasSprite) {
-						uint8_t swp = pixelInfo.SubScreenWinnerPlus1;
-						if(swp >= 1 && swp <= 4 && (pixelInfo.BgLayerMask & (1 << (swp - 1)))) {
-							uint8_t sLayer = swp - 1;
-							subTile = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[sLayer].Key);
-							if(!subTile && sLayer <= 1) {
-								SnesHdTileKey altKey = pixelInfo.BgTiles[sLayer].Key;
-								altKey.LayerIndex = sLayer ^ 1;
-								subTile = CachedGetMatchingTile(_hdData, hdScreen->Vram, tileLookupCache, altKey);
-								if(subTile) frameLayerRetry++;
-							}
-							if(subTile) {
-								subTileInfo = &pixelInfo.BgTiles[sLayer];
-								frameSubOpHd++;
-								if(!hdTile) frameMainNatHd++;
-							}
-						}
-					} else {
-						// P4.1f (Issue R fix): a sprite is the final sub-screen winner —
-						// the CHARACTER ITSELF is the color-math operand. Rendering the
-						// main winner's HD tile here paints semi-transparent HD art
-						// (Lockjaw water overlay) over the pixel before the sprite is
-						// added; native water texels are dark so the PPU's ADD leaves
-						// the character dominant, while brighter HD art washes it out
-						// ("half-transparent characters", confirmed via SPR-SAMPLE).
-						// Force the native path — exact PPU output (water + sprite ADD)
-						// at these few pixels; the surrounding water stays HD.
-						spriteIsSubOperand = true;
-						frameSprSub++;
-						if(hdTile) frameSprSubMainHd++; // pixels the forced-native rule affects
-						if(diagSprSampleCount < 12 && x >= 48 && x <= 208 && y >= 40 && y <= 200) {
-							char buf[400];
-							snprintf(buf, sizeof(buf),
-								"[SNES HD diag] SPR-SAMPLE x=%d y=%d win=%d mainHd=%d bot=%d "
-								"mask=0x%02X swp=%d MainCol=0x%04X SubCol=0x%04X "
-								"MainFlags=0x%02X set=%d",
-								x, y, winLayer, hdTile ? 1 : 0, hdTileBot ? 1 : 0,
-								pixelInfo.BgLayerMask, pixelInfo.SubScreenWinnerPlus1,
-								pixelInfo.MainScreenColor, pixelInfo.SubScreenColor,
-								pixelInfo.MainScreenFlags,
-								hdTile ? (int)hdTile->GfxsetIndex : -1);
-							DiagLog(buf);
-							diagSprSampleCount++;
-						}
-					}
-
-					// DIAGNOSTIC: Log first 10 sub-operand decisions per context
-					if(diagSubOpSampleCount < 10) {
-						char buf[300];
-						snprintf(buf, sizeof(buf),
-							"[SNES HD diag] SUBOP-SAMPLE win=%d swp=%d empty=%d spr=%d "
-							"subHd=%d mainHd=%d subSet=%d x=%d y=%d Main=$%02X Sub=$%02X",
-							winLayer, pixelInfo.SubScreenWinnerPlus1,
-							pixelInfo.SubScreenEmpty ? 1 : 0,
-							pixelInfo.SubScreenHasSprite ? 1 : 0,
-							subTile ? 1 : 0, hdTile ? 1 : 0,
-							subTile ? (int)subTile->GfxsetIndex : -1, x, y,
-							sl.MainScreenLayers, sl.SubScreenLayers);
-						DiagLog(buf);
-						diagSubOpSampleCount++;
-					}
-				}
-			}
-
-			// =============================================================
-			// Rendering (P4.0): reproduce the PPU composite at HD resolution
-			//
-			//   main = HD(top) over HD(bottom) over native pre-math color
-			//   out  = ColorMath(main, operand) — exact ApplyColorMathToPixel port
-			//   out  = Brightness(out)
-			//
-			// Renders in HD when the main winner OR the sub-screen operand
-			// has an HD tile. Overlay effects are just "main native + sub HD".
-			// =============================================================
-			uint32_t outX = (x - overscan.Left) * hdScale;
-			uint32_t outY = (y - overscan.Top) * hdScale;
-
-			bool hasMainHd = hdTile && hdTileInfo && !hdTile->HdTileData.empty();
-			bool hasSubHd = subTile && subTileInfo && !subTile->HdTileData.empty();
-
-			// P4.1f: when the character is the color-math operand, render the
-			// exact PPU output instead of compositing HD art over it (Issue R).
-			if((hasMainHd || hasSubHd) && !spriteIsSubOperand) {
-				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
-				uint8_t brightness = sl.ScreenBrightness;
-
-				// Native pre-math main screen color — base under the HD layers
-				uint8_t nmR = ColorUtilities::Convert5BitTo8Bit(pixelInfo.MainScreenColor & 0x1F);
-				uint8_t nmG = ColorUtilities::Convert5BitTo8Bit((pixelInfo.MainScreenColor >> 5) & 0x1F);
-				uint8_t nmB = ColorUtilities::Convert5BitTo8Bit((pixelInfo.MainScreenColor >> 10) & 0x1F);
-
-				// Native sub-screen color and fixed color — CM operand bases
-				uint8_t nsR = ColorUtilities::Convert5BitTo8Bit(pixelInfo.SubScreenColor & 0x1F);
-				uint8_t nsG = ColorUtilities::Convert5BitTo8Bit((pixelInfo.SubScreenColor >> 5) & 0x1F);
-				uint8_t nsB = ColorUtilities::Convert5BitTo8Bit((pixelInfo.SubScreenColor >> 10) & 0x1F);
-				uint8_t fxR = ColorUtilities::Convert5BitTo8Bit(sl.FixedColor & 0x1F);
-				uint8_t fxG = ColorUtilities::Convert5BitTo8Bit((sl.FixedColor >> 5) & 0x1F);
-				uint8_t fxB = ColorUtilities::Convert5BitTo8Bit((sl.FixedColor >> 10) & 0x1F);
-
-				// Color window state — windows are register-level x ranges,
-				// evaluated once per native pixel (no sub-pixel windows needed)
-				bool isInsideWindow = IsInsideColorWindow(sl, (int)x);
-
-				// P4.1c perf: everything that is constant across the hdScale×hdScale
-				// sub-pixel block is decided once per native pixel. Semantics are an
-				// exact match of the previous per-sub-pixel ApplyColorMathToPixel port.
-				HdTileSampler botSampler, mainSampler, subSampler;
-				botSampler.Init(hdTileBot, hdTileInfoBot, hdScale);
-				if(hasMainHd) mainSampler.Init(hdTile, hdTileInfo, hdScale);
-				if(hasSubHd) subSampler.Init(subTile, subTileInfo, hdScale);
-
-				// R3: per-tile palette-row transform (live CGRAM vs reference).
-				// Resolved once per native pixel; nullptr = identity.
-				// R3.1: pointer to the row's 3×256 LUT — one load per channel per sample.
-				typedef const uint8_t (*PalLutRow)[256];
-				PalLutRow botLut = nullptr, mainLut = nullptr, subLut = nullptr;
-				if(anyPalTransform) {
-					if(botSampler.valid && palRowActive[hdTileInfoBot->Key.PaletteIndex & 7]) {
-						botLut = palLut[hdTileInfoBot->Key.PaletteIndex & 7];
-					}
-					if(mainSampler.valid && palRowActive[hdTileInfo->Key.PaletteIndex & 7]) {
-						mainLut = palLut[hdTileInfo->Key.PaletteIndex & 7];
-					}
-					if(subSampler.valid && palRowActive[subTileInfo->Key.PaletteIndex & 7]) {
-						subLut = palLut[subTileInfo->Key.PaletteIndex & 7];
-					}
-				}
-
-				// 1. Clip main color to black (runs even without AllowColorMath;
-				//    Always mode does NOT reset halfShift — matches PPU)
-				int halfShift = sl.ColorMathHalveResult ? 1 : 0;
-				bool clipMain = false;
-				switch(sl.ColorMathClipMode) {
-					default:
-					case ColorWindowMode::Never: break;
-					case ColorWindowMode::OutsideWindow:
-						if(!isInsideWindow) { clipMain = true; halfShift = 0; }
-						break;
-					case ColorWindowMode::InsideWindow:
-						if(isInsideWindow) { clipMain = true; halfShift = 0; }
-						break;
-					case ColorWindowMode::Always: clipMain = true; break;
-				}
-
-				// 2. AllowColorMath (per-pixel PPU flag) + prevent window
-				bool prevented = false;
-				switch(sl.ColorMathPreventMode) {
-					default:
-					case ColorWindowMode::Never: break;
-					case ColorWindowMode::OutsideWindow: prevented = !isInsideWindow; break;
-					case ColorWindowMode::InsideWindow: prevented = isInsideWindow; break;
-					case ColorWindowMode::Always: prevented = true; break;
-				}
-				bool doMath = cmActive && !prevented;
-				// 3. Second operand: fixed color when AddSubscreen is off, or on the
-				//    PPU's empty-sub-screen special case (which also disables halve)
-				bool operandFixed = !sl.ColorMathAddSubscreen || pixelInfo.SubScreenEmpty;
-				if(doMath && sl.ColorMathAddSubscreen && pixelInfo.SubScreenEmpty) {
-					halfShift = 0;
-				}
-
-				// Per sub-pixel: compose pre-math main pixel → color math → brightness
-				for(uint32_t dy = 0; dy < hdScale; dy++) {
-					for(uint32_t dx = 0; dx < hdScale; dx++) {
-						uint32_t outIndex = (outY + dy) * frameInfo.Width + (outX + dx);
-						if(outIndex >= frameInfo.Width * frameInfo.Height) continue;
-
-						// --- Compose pre-math main pixel (HD layers over native) ---
-						int r = 0, g = 0, b = 0;
-						if(!clipMain) {
-							r = nmR; g = nmG; b = nmB;
-							if(botSampler.valid) {
-								uint32_t c = botSampler.Sample(dx, dy);
-								uint32_t ha = c >> 24;
-								if(ha > 0) {
-									int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
-									if(botLut) {
-										// R3: follow live CGRAM (rgb is premultiplied; alpha unchanged)
-										hr = botLut[0][hr]; hg = botLut[1][hg]; hb = botLut[2][hb];
-									}
-									// premultiplied alpha blend
-									r = hr + (r * (255 - (int)ha)) / 255;
-									g = hg + (g * (255 - (int)ha)) / 255;
-									b = hb + (b * (255 - (int)ha)) / 255;
-								}
-							}
-							if(mainSampler.valid) {
-								uint32_t c = mainSampler.Sample(dx, dy);
-								uint32_t ha = c >> 24;
-								if(ha > 0) {
-									int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
-									if(mainLut) {
-										hr = mainLut[0][hr]; hg = mainLut[1][hg]; hb = mainLut[2][hb];
-									}
-									r = hr + (r * (255 - (int)ha)) / 255;
-									g = hg + (g * (255 - (int)ha)) / 255;
-									b = hb + (b * (255 - (int)ha)) / 255;
-								}
-							}
-						}
-
-						// --- Color math: exact port of SnesPpu::ApplyColorMathToPixel ---
-						if(doMath) {
-							// 3. Second operand
-							int oR, oG, oB;
-							if(operandFixed) {
-								oR = fxR; oG = fxG; oB = fxB;
-							} else {
-								oR = nsR; oG = nsG; oB = nsB;
-								if(subSampler.valid) {
-									uint32_t c = subSampler.Sample(dx, dy);
-									uint32_t ha = c >> 24;
-									if(ha > 0) {
-										int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
-										if(subLut) {
-											hr = subLut[0][hr]; hg = subLut[1][hg]; hb = subLut[2][hb];
-										}
-										oR = hr + (oR * (255 - (int)ha)) / 255;
-										oG = hg + (oG * (255 - (int)ha)) / 255;
-										oB = hb + (oB * (255 - (int)ha)) / 255;
-									}
-								}
-							}
-
-							// 4. Arithmetic — 8-bit equivalent of the PPU's 5-bit math
-							if(sl.ColorMathSubtractMode) {
-								r = std::max(0, r - oR) >> halfShift;
-								g = std::max(0, g - oG) >> halfShift;
-								b = std::max(0, b - oB) >> halfShift;
-							} else {
-								r = std::min(255, r + oR) >> halfShift;
-								g = std::min(255, g + oG) >> halfShift;
-								b = std::min(255, b + oB) >> halfShift;
-							}
-						}
-
-						// --- Brightness (after color math, like the PPU) ---
-						if(brightness < 15) {
-							r = r * brightness / 15;
-							g = g * brightness / 15;
-							b = b * brightness / 15;
-						}
-
-						outputBuffer[outIndex] = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-					}
-				}
-			} else {
-				// No HD replacement — use original SNES color, scaled up
-				uint32_t color = _calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
-				for(uint32_t dy = 0; dy < hdScale; dy++) {
-					for(uint32_t dx = 0; dx < hdScale; dx++) {
-						uint32_t outIndex = (outY + dy) * frameInfo.Width + (outX + dx);
-						if(outIndex < frameInfo.Width * frameInfo.Height) {
-							outputBuffer[outIndex] = color;
-						}
-					}
-				}
-			}
-		} // end for(x)
-	} // end for(y)
+	// Sum per-thread counters -- local names keep the diagnostics code below unchanged
+	HdFilterFrameStats total;
+	AddFilterStats(total, callerStats);
+	for(int si = 0; si < HdFilterWorkPool::MaxWorkers; si++) {
+		AddFilterStats(total, statsSlots[si]);
+	}
+	uint32_t frameTotalPixels = total.TotalPixels;
+	uint32_t frameBgPixels = total.BgPixels;
+	uint32_t frameHdMatch = total.HdMatch;
+	uint32_t frameHdMiss = total.HdMiss;
+	uint32_t frameHdCm = total.HdCm;
+	uint32_t frameLayerRetry = total.LayerRetry;
+	uint32_t frameSpriteWon = total.SpriteWon;
+	uint32_t frameMaskZero = total.MaskZero;
+	uint32_t frameMultiLayer = total.MultiLayer;
+	uint32_t frameHdmaSplit = total.HdmaSplit;
+	uint32_t frameSubOpHd = total.SubOpHd;
+	uint32_t frameSubOpFixed = total.SubOpFixed;
+	uint32_t frameMainNatHd = total.MainNatHd;
+	uint32_t frameSprSub = total.SprSub;
+	uint32_t frameSprSubMainHd = total.SprSubMainHd;
+	uint32_t frameLayerBits[4];
+	uint32_t frameWin[4];
+	uint32_t frameHdLayers[4];
+	for(int li = 0; li < 4; li++) {
+		frameLayerBits[li] = total.LayerBits[li];
+		frameWin[li] = total.Win[li];
+		frameHdLayers[li] = total.HdLayers[li];
+	}
 
 	// =====================================================================
 	// DIAGNOSTIC: Deferred context log — emitted on first frame with BG content
