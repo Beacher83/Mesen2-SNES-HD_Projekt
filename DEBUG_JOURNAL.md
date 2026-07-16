@@ -1,6 +1,86 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-16 | Mesen Build: R6.0 (BUILD+TEST PENDING) | R3.0+R3.1 bestätigt+committed (`cdfa8703`) | Architektur: P4.0-Composite-Engine, Filter jetzt multithreaded
+Stand: 2026-07-16 | Mesen Build: R6.1 (BUILD+TEST PENDING) | R6.0 bestätigt+committed (`9aefc368`) | Architektur: P4.0-Composite-Engine, Filter multithreaded
+
+---
+
+## R6.1 — Opaque-Skip + Filter-Zeitmessung (2026-07-16)
+
+**Ziel:** R6.0 brachte deutlichen Perf-Gewinn, aber vereinzelte Ruckler bei
+viel Bildinhalt bleiben. R6.1 senkt die Arbeit pro Subpixel und macht die
+Filterzeit im Log sichtbar. NUR `SnesHdVideoFilter.cpp` → inkrementeller Build.
+
+**Änderungen:**
+1. **Opaque-Top-Skip (Subpixel):** Main-Winner-Texel wird ZUERST gesampelt.
+   Alpha=255 (Tile-Inneres) → Ergebnis ist direkt das Main-Texel (+R3-LUT);
+   Bottom-Blend UND Native-Base entfallen komplett. Semantisch identisch
+   (Blend mit a=255 ergibt exakt r=hr). Gleicher Fast-Path im Bottom- und
+   Sub-Operand-Blend.
+2. **Bottom-Lookup-Gate (Pixel):** Bottom-Layer-Suche (bis 2 Map-Lookups/px)
+   läuft nur noch, wenn `hdTile->HasTransparentPixels` — hinter voll opaken
+   Tiles ist der Bottom-Layer nie sichtbar. **ACHTUNG Log-Semantik: `multi=`
+   zählt jetzt nur noch Suchen bei transparentem Top-Tile** (Wert sinkt in
+   Lockjaw/Gangplank deutlich — das ist der eingesparte Aufwand, kein Bug).
+3. **`ms=cur/max` in der FRAME-Zeile:** steady_clock um RunFrame; `max` =
+   schlechtester Frame seit Kontextwechsel. Budget 16,7 ms — Frames darüber
+   stauen den Emu-Thread (P4.1b-Wait) = sichtbarer Ruckler.
+
+**Erwartung:** Bild pixel-identisch. Lockjaw/Gangplank (viel opakes Terrain)
+deutlich schneller; Mainbrace kaum (Fog ist semi-transparent, nimmt weiter
+den Blend-Pfad). ms-Werte zeigen, ob Restruckler vom Filter kommen.
+
+**Test:** Perf + Bild wie üblich; FRAME-Zeilen: ms-Werte in schweren Szenen
+nahe/über 16,7? multi= gesunken bei gleichem Bild?
+
+### R6.1-Testergebnis (2026-07-16)
+
+**Perf "ok", subjektiv nicht merklich besser als R6.0 — und die ms=-Werte
+erklären warum: DER FILTER IST NICHT MEHR DER ENGPASS.** Aus dem Log
+(462 Gameplay-Frames):
+- Lockjaw (E10E): avg **2,31 ms**, Peak 3,84 ms
+- Pirate/Gangplank (1DF33): avg 2,50 ms, Peak 6,04 ms
+- Mainbrace (LEVEL2-Sigs): avg ~3 ms, EIN Ausreißer 14,96 ms (einzelner
+  Frame, vermutlich Kontextwechsel/Scheduling)
+Budget = 16,7 ms → Filter liegt bei ~15-20% Auslastung. **Die verbleibenden
+gelegentlichen Ruckler kommen also woanders her** — Hauptverdächtiger:
+**Emu-Thread-Seite der HD-Erfassung** (RenderTilemap schreibt pro Pixel
+~200 B SnesHdPpuPixelInfo ≈ 11 MB/Frame + SendFrame-memsets derselben
+Größe = Speicherbandbreite auf dem PPU-Thread), oder vereinzelte
+Scheduling-Spikes wie der 15-ms-Ausreißer. Nächster Perf-Hebel (falls
+nötig) wäre dort — NICHT weiter im Filter.
+
+### Issue S — Gelber Rahmen um Algen unter Wasser (Lockjaw, OFFEN)
+
+**Symptom (User):** BG1-Holzkisten mit herabhängenden grünen Algen; sobald
+die Algen unter die Wasserlinie tauchen, zeigt sich ein leichter GELBER
+Rahmen um das Grün. Über Wasser nicht sichtbar.
+
+**Hypothese (noch unbestätigt, Haupt-Verdacht ART-seitig + Unterwasser-Pfad
+macht es sichtbar):** Der KI-Upscaler hat an den Algen-Kanten
+semi-transparente Halo-Texel mit eingebackener HINTERGRUND-Farbe erzeugt
+(gelblich-braunes Kistenholz). Über Wasser ist die Alge der Main-Winner und
+wird über einen ähnlichen Hintergrund geblendet → Halo unsichtbar. Unter
+Wasser läuft die Alge über den SUB-OPERAND-Pfad (Wasser=Main-Winner,
+Alge=Sub-Winner): operand = blend(HD-Algen-Texel über nativem SubScreenColor),
+dann per ADD aufs Wasser gerechnet — **Halo-Texel werden zu additivem
+gelbem Leuchten auf blauem Grund**; ADD-Clamping (B sättigt zuerst) schiebt
+den Farbton zusätzlich Richtung Gelb. Die native PPU addiert dagegen saubere
+Palettenfarben — jeder Halo in der HD-Art wird in diesem Pfad zu Glow.
+
+**Verifikation (nächster Schritt):** Algen-Tile-PNGs im Viewer/Export
+(bg/bg1/) öffnen und Kanten zoomen — sind dort halbtransparente
+gelb-bräunliche Texel um das Grün? Falls ja: Art-Fix (Alpha-Kanten
+säubern / Re-Upscale mit Maskierung; ggf. Viewer-Feature "Edge-Cleanup").
+Falls die Kanten SAUBER sind: Filter-seitig weiterdebuggen (dann wäre der
+Verdacht R3-LUT-Zeilenzuordnung an Kantentexeln o.ä.).
+**Filter-seitige Notlösung (riskant, erst wenn Art-Fix nicht reicht):**
+Alpha-Schwelle für Sub-Operand-Texel — würde aber auch legitime weiche
+Kanten (Nebel!) beschneiden.
+
+**Ausgeschlossen:** R6.0/R6.1 als Ursache — Opaque-Skip ist mathematisch
+identisch (Blend mit a=255 ⇒ r=hr), Bug betrifft semi-transparente Kanten,
+die unverändert den alten Blend-Pfad nehmen. Vermutlich seit P4.0 vorhanden
+und erst durch die korrekten R3-Farben aufgefallen.
 
 ---
 

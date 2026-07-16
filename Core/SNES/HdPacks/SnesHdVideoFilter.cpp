@@ -10,12 +10,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "R6.0"
+#define SNES_HD_BUILD_VERSION "R6.1"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -668,43 +669,49 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							diagCmSampleCount++;
 						}
 					}
-					// Find bottom layer (for transparency compositing)
-					uint8_t prioOrder[6];
-					int prioCount = 0;
+					// Find bottom layer (for transparency compositing).
+					// R6.1: only worth doing when the winner tile has transparent
+					// pixels at all — behind a fully opaque tile the bottom layer
+					// is never visible, so lookup AND per-sub-pixel blending are
+					// skipped entirely. (multi= now counts only these searches.)
+					if(hdTile->HasTransparentPixels) {
+						uint8_t prioOrder[6];
+						int prioCount = 0;
 
-					uint8_t bg1P = pixelInfo.BgTiles[0].Priority;
-					uint8_t bg2P = pixelInfo.BgTiles[1].Priority;
-					uint8_t bg3P = pixelInfo.BgTiles[2].Priority;
+						uint8_t bg1P = pixelInfo.BgTiles[0].Priority;
+						uint8_t bg2P = pixelInfo.BgTiles[1].Priority;
+						uint8_t bg3P = pixelInfo.BgTiles[2].Priority;
 
-					if(sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
-					if(bg1P) prioOrder[prioCount++] = 0;
-					if(bg2P) prioOrder[prioCount++] = 1;
-					if(!bg1P) prioOrder[prioCount++] = 0;
-					if(!bg2P) prioOrder[prioCount++] = 1;
-					if(!sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
-					if(!bg3P) prioOrder[prioCount++] = 2;
+						if(sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
+						if(bg1P) prioOrder[prioCount++] = 0;
+						if(bg2P) prioOrder[prioCount++] = 1;
+						if(!bg1P) prioOrder[prioCount++] = 0;
+						if(!bg2P) prioOrder[prioCount++] = 1;
+						if(!sl.Mode1Bg3Priority && bg3P) prioOrder[prioCount++] = 2;
+						if(!bg3P) prioOrder[prioCount++] = 2;
 
-					bool pastWinner = false;
-					for(int pi = 0; pi < prioCount && !hdTileBot; pi++) {
-						uint8_t layer = prioOrder[pi];
-						if(layer == winLayer) {
-							pastWinner = true;
-							continue;
-						}
-						if(!pastWinner) continue;
-						if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
-						if(!((sl.MainScreenLayers | sl.SubScreenLayers) & (1 << layer))) continue;
+						bool pastWinner = false;
+						for(int pi = 0; pi < prioCount && !hdTileBot; pi++) {
+							uint8_t layer = prioOrder[pi];
+							if(layer == winLayer) {
+								pastWinner = true;
+								continue;
+							}
+							if(!pastWinner) continue;
+							if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
+							if(!((sl.MainScreenLayers | sl.SubScreenLayers) & (1 << layer))) continue;
 
-						SnesHdPackTileInfo* tile2 = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[layer].Key);
-						if(!tile2 && (layer == 0 || layer == 1)) {
-							SnesHdTileKey altKey2 = pixelInfo.BgTiles[layer].Key;
-							altKey2.LayerIndex = (layer == 0) ? 1 : 0;
-							tile2 = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, altKey2);
-						}
-						if(tile2) {
-							hdTileBot = tile2;
-							hdTileInfoBot = &pixelInfo.BgTiles[layer];
-							st.MultiLayer++;
+							SnesHdPackTileInfo* tile2 = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[layer].Key);
+							if(!tile2 && (layer == 0 || layer == 1)) {
+								SnesHdTileKey altKey2 = pixelInfo.BgTiles[layer].Key;
+								altKey2.LayerIndex = (layer == 0) ? 1 : 0;
+								tile2 = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, altKey2);
+							}
+							if(tile2) {
+								hdTileBot = tile2;
+								hdTileInfoBot = &pixelInfo.BgTiles[layer];
+								st.MultiLayer++;
+							}
 						}
 					}
 				}
@@ -925,35 +932,54 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 						if(outIndex >= frameWidth * frameHeight) continue;
 
 						// --- Compose pre-math main pixel (HD layers over native) ---
+						// R6.1: sample the main winner FIRST — a fully opaque texel
+						// hides bottom layer and native base completely, so both
+						// blends are skipped (interior texels are usually opaque;
+						// only tile edges/effects carry partial alpha). Identical
+						// result: blend with ha=255 reduces to r=hr anyway.
 						int r = 0, g = 0, b = 0;
 						if(!clipMain) {
-							r = nmR; g = nmG; b = nmB;
-							if(botSampler.valid) {
-								uint32_t c = botSampler.Sample(dx, dy);
-								uint32_t ha = c >> 24;
-								if(ha > 0) {
-									int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
-									if(botLut) {
-										// R3: follow live CGRAM (rgb is premultiplied; alpha unchanged)
-										hr = botLut[0][hr]; hg = botLut[1][hg]; hb = botLut[2][hb];
-									}
-									// premultiplied alpha blend
-									r = hr + (r * (255 - (int)ha)) / 255;
-									g = hg + (g * (255 - (int)ha)) / 255;
-									b = hb + (b * (255 - (int)ha)) / 255;
-								}
-							}
+							uint32_t mc = 0;
+							uint32_t mha = 0;
 							if(mainSampler.valid) {
-								uint32_t c = mainSampler.Sample(dx, dy);
-								uint32_t ha = c >> 24;
-								if(ha > 0) {
-									int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
+								mc = mainSampler.Sample(dx, dy);
+								mha = mc >> 24;
+							}
+							if(mha == 255) {
+								r = (mc >> 16) & 0xFF; g = (mc >> 8) & 0xFF; b = mc & 0xFF;
+								if(mainLut) {
+									// R3: follow live CGRAM (rgb is premultiplied; alpha unchanged)
+									r = mainLut[0][r]; g = mainLut[1][g]; b = mainLut[2][b];
+								}
+							} else {
+								r = nmR; g = nmG; b = nmB;
+								if(botSampler.valid) {
+									uint32_t c = botSampler.Sample(dx, dy);
+									uint32_t ha = c >> 24;
+									if(ha == 255) {
+										r = (c >> 16) & 0xFF; g = (c >> 8) & 0xFF; b = c & 0xFF;
+										if(botLut) {
+											r = botLut[0][r]; g = botLut[1][g]; b = botLut[2][b];
+										}
+									} else if(ha > 0) {
+										int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
+										if(botLut) {
+											hr = botLut[0][hr]; hg = botLut[1][hg]; hb = botLut[2][hb];
+										}
+										// premultiplied alpha blend
+										r = hr + (r * (255 - (int)ha)) / 255;
+										g = hg + (g * (255 - (int)ha)) / 255;
+										b = hb + (b * (255 - (int)ha)) / 255;
+									}
+								}
+								if(mha > 0) {
+									int hr = (mc >> 16) & 0xFF, hg = (mc >> 8) & 0xFF, hb = mc & 0xFF;
 									if(mainLut) {
 										hr = mainLut[0][hr]; hg = mainLut[1][hg]; hb = mainLut[2][hb];
 									}
-									r = hr + (r * (255 - (int)ha)) / 255;
-									g = hg + (g * (255 - (int)ha)) / 255;
-									b = hb + (b * (255 - (int)ha)) / 255;
+									r = hr + (r * (255 - (int)mha)) / 255;
+									g = hg + (g * (255 - (int)mha)) / 255;
+									b = hb + (b * (255 - (int)mha)) / 255;
 								}
 							}
 						}
@@ -969,7 +995,13 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								if(subSampler.valid) {
 									uint32_t c = subSampler.Sample(dx, dy);
 									uint32_t ha = c >> 24;
-									if(ha > 0) {
+									if(ha == 255) {
+										// R6.1: opaque fast path (blend reduces to o=h)
+										oR = (c >> 16) & 0xFF; oG = (c >> 8) & 0xFF; oB = c & 0xFF;
+										if(subLut) {
+											oR = subLut[0][oR]; oG = subLut[1][oG]; oB = subLut[2][oB];
+										}
+									} else if(ha > 0) {
 										int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
 										if(subLut) {
 											hr = subLut[0][hr]; hg = subLut[1][hg]; hb = subLut[2][hb];
@@ -1047,6 +1079,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static uint64_t diagPrevContextKey = 0;
 	static int diagFrameCount = 0;
 	static int diagBgFrameCount = 0;
+	static double diagMsMax = 0;         // R6.1: worst filter time (ms) since context change
 	// R6: diagMissCount/diagMatchCount/diagCmSampleCount/diagSubOpSampleCount/
 	// diagSprSampleCount/diagLoggedHashes moved to file scope — they are sampled
 	// from the parallel render threads (under s_diagMutex) and reset below.
@@ -1197,6 +1230,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagPalLogCount = 0;
 		diagLoggedHashes.clear();
 		hdmaDumped = false;
+		diagMsMax = 0;
 		diagContextCount++;
 	}
 
@@ -1242,7 +1276,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 	HdFilterFrameStats statsSlots[HdFilterWorkPool::MaxWorkers];
 	HdFilterFrameStats callerStats;
+	std::chrono::steady_clock::time_point filterT0 = std::chrono::steady_clock::now();
 	GetHdFilterPool().RunFrame(renderCtx, overscan.Top, 239 - overscan.Bottom, statsSlots, callerStats);
+	// R6.1: filter time for this frame — logged in the FRAME line (ms=cur/max).
+	// Budget is 16.7 ms; frames above it stall the emu thread (P4.1b wait).
+	double filterMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - filterT0).count();
+	if(filterMs > diagMsMax) {
+		diagMsMax = filterMs;
+	}
 
 	// Sum per-thread counters -- local names keep the diagnostics code below unchanged
 	HdFilterFrameStats total;
@@ -1342,7 +1383,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
-			" sprWon=%u sprSub=%u sprSubHd=%u mask0=%u hdmaSplit=%u"
+			" sprWon=%u sprSub=%u sprSubHd=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
@@ -1352,6 +1393,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameTotalPixels, frameBgPixels, frameHdMatch,
 			frameHdMiss, frameHdCm, frameMainNatHd, frameSubOpHd, frameSubOpFixed, frameLayerRetry, frameMultiLayer,
 			frameSpriteWon, frameSprSub, frameSprSubMainHd, frameMaskZero, frameHdmaSplit,
+			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
 			frameWin[0], frameWin[1], frameWin[2], frameWin[3],
