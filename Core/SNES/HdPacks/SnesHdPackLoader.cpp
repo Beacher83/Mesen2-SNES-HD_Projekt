@@ -74,6 +74,9 @@ bool SnesHdPackLoader::LoadPack()
 	// Load gfxset fingerprints for active-gfxset detection (optional)
 	LoadFingerprints();
 
+	// R3: load reference BG palettes for the CGRAM-diff transform (optional)
+	LoadPalettes();
+
 	bool anyLoaded = false;
 
 	// Load BG tiles for each layer (bg1 through bg4).
@@ -490,6 +493,47 @@ bool SnesHdPackLoader::LoadFingerprints()
 			+ " gfxsets (" + std::to_string(totalRefs) + " reference tiles)");
 	}
 	return !_data->GfxsetFingerprints.empty();
+}
+
+bool SnesHdPackLoader::LoadPalettes()
+{
+	// palettes.bin format (all little-endian):
+	//   uint8_t gfxsetCount
+	//   gfxsetCount × {
+	//     uint8_t gfxsetIndex
+	//     128 × uint16_t bgr555   (8 BG palette rows × 16 colors, CGRAM 0-127
+	//                              as captured at export time in the viewer)
+	//   }
+	string palPath = FolderUtilities::CombinePath(_hdPackFolder, "palettes.bin");
+
+	ifstream file(palPath, std::ios::binary);
+	if(!file) {
+		return false;  // No palettes file — no CGRAM-diff transform (HD colors stay baked in)
+	}
+
+	uint8_t gfxsetCount = 0;
+	file.read((char*)&gfxsetCount, 1);
+	if(file.fail() || gfxsetCount == 0 || gfxsetCount > 128) {
+		return false;
+	}
+
+	for(uint8_t g = 0; g < gfxsetCount; g++) {
+		uint8_t gfxsetIdx = 0;
+		file.read((char*)&gfxsetIdx, 1);
+		if(file.fail()) break;
+
+		vector<uint16_t> palette(128);
+		file.read((char*)palette.data(), 128 * sizeof(uint16_t));
+		if(file.fail()) break;
+
+		_data->GfxsetPalettes[gfxsetIdx] = std::move(palette);
+	}
+
+	if(!_data->GfxsetPalettes.empty()) {
+		MessageManager::Log("[SNES HD Pack] Loaded reference palettes for "
+			+ std::to_string(_data->GfxsetPalettes.size()) + " gfxsets");
+	}
+	return !_data->GfxsetPalettes.empty();
 }
 
 // Implement SnesHdBitmapInfo::Init (declared in SnesHdData.h)

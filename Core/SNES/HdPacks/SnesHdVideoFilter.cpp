@@ -11,7 +11,7 @@
 #include <cstdlib>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P4.1f"
+#define SNES_HD_BUILD_VERSION "R3.1"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -327,6 +327,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	static int diagCmSampleCount = 0;    // generic CM+AddSubscreen pixel samples
 	static int diagSubOpSampleCount = 0; // P4.0: sub-screen operand decision samples
 	static int diagSprSampleCount = 0;   // P4.1e: sub-screen SPRITE pixel samples (transparency bug hunt)
+	static int diagPalLogCount = 0;      // R3: CGRAM-diff transform detail lines
 	static std::unordered_set<uint64_t> diagLoggedHashes;
 	static bool hdmaDumped = false;
 	static int diagContextCount = 0;     // total context changes seen
@@ -351,6 +352,65 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// blue squares: BG3 sub-op tiles matching with wrong-set colors).
 	if(hdScreen->Vram && _hdData->HasFingerprints()) {
 		_hdData->DetectActiveGfxset(hdScreen->Vram);
+	}
+
+	// =====================================================================
+	// R3: per-palette-row CGRAM-diff transform.
+	//
+	// HD tiles have their colors baked in at export time. When the game
+	// shifts CGRAM afterwards (Lockjaw underwater darkening, Gangplank
+	// sunset HDMA, Mainbrace palette cycling), native pixels follow but HD
+	// art doesn't. With reference palettes in the pack (palettes.bin, the
+	// CGRAM state at export time) we compute — once per frame — a per-
+	// palette-row, per-channel ratio live/reference (8.8 fixed point) and
+	// scale every HD sample by its tile's row ratio. Rows that match the
+	// reference exactly are skipped, so levels without CGRAM effects (and
+	// packs without palettes.bin) are completely unaffected.
+	// =====================================================================
+	uint16_t palRatio[8][3];
+	bool palRowActive[8] = {};
+	bool anyPalTransform = false;
+	// R3.1 perf: the live palettes differ from the ROM reference in EVERY row
+	// of EVERY level (the game post-processes palettes at load — the transform
+	// therefore also corrects the HD tiles' global color fidelity, confirmed
+	// visually). That defeats the "identical row → skip" fast path, so the
+	// per-sample cost matters: precomputed 8×3×256 LUTs (6 KB, L1-resident)
+	// replace per-sample multiply/shift/clamp with one table load per channel.
+	uint8_t palLut[8][3][256];
+	if(_hdData->ActiveGfxset >= 0 && !_hdData->GfxsetPalettes.empty()) {
+		auto palIt = _hdData->GfxsetPalettes.find((uint8_t)_hdData->ActiveGfxset);
+		if(palIt != _hdData->GfxsetPalettes.end() && palIt->second.size() >= 128) {
+			const uint16_t* ref = palIt->second.data();
+			for(int row = 0; row < 8; row++) {
+				const uint16_t* refRow = ref + row * 16;
+				const uint16_t* liveRow = hdScreen->Cgram + row * 16;
+				// Index 0 of each row is the transparent color — not part of
+				// any visible tile pixel, so it is excluded from comparison.
+				uint32_t refSum[3] = {}, liveSum[3] = {};
+				bool differs = false;
+				for(int i = 1; i < 16; i++) {
+					uint16_t rc = refRow[i] & 0x7FFF;
+					uint16_t lc = liveRow[i] & 0x7FFF;
+					if(rc != lc) differs = true;
+					refSum[0] += rc & 0x1F;  refSum[1] += (rc >> 5) & 0x1F;  refSum[2] += (rc >> 10) & 0x1F;
+					liveSum[0] += lc & 0x1F; liveSum[1] += (lc >> 5) & 0x1F; liveSum[2] += (lc >> 10) & 0x1F;
+				}
+				if(!differs) continue;
+				for(int ch = 0; ch < 3; ch++) {
+					// Ratio capped at 4x brightening; ref channel sum 0 → identity
+					uint32_t ratio = refSum[ch]
+						? std::min<uint32_t>(1024, (liveSum[ch] * 256) / refSum[ch])
+						: 256;
+					palRatio[row][ch] = (uint16_t)ratio;
+					uint8_t* lut = palLut[row][ch];
+					for(uint32_t v = 0; v < 256; v++) {
+						lut[v] = (uint8_t)std::min<uint32_t>(255, (v * ratio) >> 8);
+					}
+				}
+				palRowActive[row] = true;
+				anyPalTransform = true;
+			}
+		}
 	}
 
 	// PPU config snapshot at scanline 120 (mid-screen, stable reference)
@@ -412,6 +472,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagCmSampleCount = 0;
 		diagSubOpSampleCount = 0;
 		diagSprSampleCount = 0;
+		diagPalLogCount = 0;
 		diagLoggedHashes.clear();
 		hdmaDumped = false;
 		diagContextCount++;
@@ -786,6 +847,23 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				if(hasMainHd) mainSampler.Init(hdTile, hdTileInfo, hdScale);
 				if(hasSubHd) subSampler.Init(subTile, subTileInfo, hdScale);
 
+				// R3: per-tile palette-row transform (live CGRAM vs reference).
+				// Resolved once per native pixel; nullptr = identity.
+				// R3.1: pointer to the row's 3×256 LUT — one load per channel per sample.
+				typedef const uint8_t (*PalLutRow)[256];
+				PalLutRow botLut = nullptr, mainLut = nullptr, subLut = nullptr;
+				if(anyPalTransform) {
+					if(botSampler.valid && palRowActive[hdTileInfoBot->Key.PaletteIndex & 7]) {
+						botLut = palLut[hdTileInfoBot->Key.PaletteIndex & 7];
+					}
+					if(mainSampler.valid && palRowActive[hdTileInfo->Key.PaletteIndex & 7]) {
+						mainLut = palLut[hdTileInfo->Key.PaletteIndex & 7];
+					}
+					if(subSampler.valid && palRowActive[subTileInfo->Key.PaletteIndex & 7]) {
+						subLut = palLut[subTileInfo->Key.PaletteIndex & 7];
+					}
+				}
+
 				// 1. Clip main color to black (runs even without AllowColorMath;
 				//    Always mode does NOT reset halfShift — matches PPU)
 				int halfShift = sl.ColorMathHalveResult ? 1 : 0;
@@ -833,19 +911,28 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 								uint32_t c = botSampler.Sample(dx, dy);
 								uint32_t ha = c >> 24;
 								if(ha > 0) {
+									int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
+									if(botLut) {
+										// R3: follow live CGRAM (rgb is premultiplied; alpha unchanged)
+										hr = botLut[0][hr]; hg = botLut[1][hg]; hb = botLut[2][hb];
+									}
 									// premultiplied alpha blend
-									r = ((c >> 16) & 0xFF) + (r * (255 - (int)ha)) / 255;
-									g = ((c >> 8) & 0xFF) + (g * (255 - (int)ha)) / 255;
-									b = (c & 0xFF) + (b * (255 - (int)ha)) / 255;
+									r = hr + (r * (255 - (int)ha)) / 255;
+									g = hg + (g * (255 - (int)ha)) / 255;
+									b = hb + (b * (255 - (int)ha)) / 255;
 								}
 							}
 							if(mainSampler.valid) {
 								uint32_t c = mainSampler.Sample(dx, dy);
 								uint32_t ha = c >> 24;
 								if(ha > 0) {
-									r = ((c >> 16) & 0xFF) + (r * (255 - (int)ha)) / 255;
-									g = ((c >> 8) & 0xFF) + (g * (255 - (int)ha)) / 255;
-									b = (c & 0xFF) + (b * (255 - (int)ha)) / 255;
+									int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
+									if(mainLut) {
+										hr = mainLut[0][hr]; hg = mainLut[1][hg]; hb = mainLut[2][hb];
+									}
+									r = hr + (r * (255 - (int)ha)) / 255;
+									g = hg + (g * (255 - (int)ha)) / 255;
+									b = hb + (b * (255 - (int)ha)) / 255;
 								}
 							}
 						}
@@ -862,9 +949,13 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 									uint32_t c = subSampler.Sample(dx, dy);
 									uint32_t ha = c >> 24;
 									if(ha > 0) {
-										oR = ((c >> 16) & 0xFF) + (oR * (255 - (int)ha)) / 255;
-										oG = ((c >> 8) & 0xFF) + (oG * (255 - (int)ha)) / 255;
-										oB = (c & 0xFF) + (oB * (255 - (int)ha)) / 255;
+										int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
+										if(subLut) {
+											hr = subLut[0][hr]; hg = subLut[1][hg]; hb = subLut[2][hb];
+										}
+										oR = hr + (oR * (255 - (int)ha)) / 255;
+										oG = hg + (oG * (255 - (int)ha)) / 255;
+										oB = hb + (oB * (255 - (int)ha)) / 255;
 									}
 								}
 							}
@@ -994,6 +1085,20 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagFrameCount++;
 		if(frameBgPixels > 0) {
 			diagBgFrameCount++;
+		}
+
+		// R3: log the active CGRAM-diff transform (first few frames per context)
+		if(anyPalTransform && diagPalLogCount < 5) {
+			char palBuf[512];
+			int off = snprintf(palBuf, sizeof(palBuf),
+				"[SNES HD diag] PALDIFF gfx=%d rows:", (int)_hdData->ActiveGfxset);
+			for(int row = 0; row < 8 && off < (int)sizeof(palBuf) - 48; row++) {
+				if(!palRowActive[row]) continue;
+				off += snprintf(palBuf + off, sizeof(palBuf) - off,
+					" P%d=%u/%u/%u", row, palRatio[row][0], palRatio[row][1], palRatio[row][2]);
+			}
+			DiagLog(palBuf);
+			diagPalLogCount++;
 		}
 	}
 

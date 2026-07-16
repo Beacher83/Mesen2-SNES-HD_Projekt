@@ -367,6 +367,14 @@ public:
 	// Populated from fingerprints.bin. Empty = no scoping (all tiles match any context).
 	unordered_map<uint8_t, vector<GfxsetFingerprintEntry>> GfxsetFingerprints;
 
+	// R3: reference BG palettes per gfxset (palettes.bin) — the CGRAM state the
+	// HD tiles were exported under. 128 entries = 8 BG palette rows × 16 colors
+	// (BGR555, CGRAM 0-127). At runtime the filter diffs live CGRAM against this
+	// reference to derive a per-palette-row color transform, making the HD tiles
+	// follow CGRAM effects (underwater darkening, sunset HDMA, palette cycling).
+	// Empty = no transform (HD tiles keep their baked-in colors).
+	unordered_map<uint8_t, vector<uint16_t>> GfxsetPalettes;
+
 	// Currently detected active gfxset.
 	// -1 = no gfxset detected (no fingerprints loaded, or no match found)
 	int16_t ActiveGfxset = -1;

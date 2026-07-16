@@ -1,6 +1,98 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-15 | Mesen Build: P4.1f (BUILD+TEST PENDING) | Issue R Root Cause per SPR-SAMPLE bestätigt + Fix gebaut | WICHTIG: Sig-Level-Zuordnung korrigiert (s.u.) | Architektur: P4.0-Composite-Engine
+Stand: 2026-07-16 | Mesen Build: R3.1 (Farben bestätigt gut, Perf weiter zu schwach → R6 Multithreading) | R3 CGRAM-Diff-Transform bestätigt (Mesen+Viewer) | Architektur: P4.0-Composite-Engine
+
+---
+
+## R3.0 — CGRAM-Diff-Transform: palettendynamische HD-Tiles (2026-07-15)
+
+**Ziel (Bug-Familie 2):** HD-Tiles haben Export-Farben eingebacken — CGRAM-
+Effekte (Lockjaw-Unterwasser-Verdunklung "Farbe zu hell", Gangplank-Sunset-HDMA,
+Mainbrace-Paletten-Zyklus) waren auf HD unsichtbar. Plan aus ARCHITECTURE.md
+R3: Referenz-Paletten ins Pack, Laufzeit-Diff, Transform pro Palette-Zeile.
+
+**Format `palettes.bin`** (little-endian):
+`uint8 gfxsetCount` × { `uint8 gfxsetIndex`, `128 × uint16 bgr555` } —
+die 8 BG-Palette-Zeilen × 16 Farben (CGRAM 0-127) zum Export-Zeitpunkt.
+
+**Mesen-Seite:**
+- `SnesHdData.h`: `GfxsetPalettes` (Map gfxsetIndex → 128 uint16).
+- `SnesHdPackLoader`: `LoadPalettes()` — optional, ohne Datei kein Transform.
+- `SnesHdVideoFilter::ApplyFilter`: einmal pro Frame, wenn ActiveGfxset
+  Referenz-Paletten hat: pro Palette-Zeile (Index 0 = transparent,
+  ausgenommen) Live-CGRAM (`hdScreen->Cgram`, P4.0-R1-Snapshot) gegen
+  Referenz vergleichen. Zeile identisch → skip. Sonst pro RGB-Kanal
+  Ratio = Summe(live)/Summe(ref) in 8.8-Fixed-Point (Cap 4x).
+  Anwendung: jedes HD-Sample (Main/Bottom/SubOp) wird vor dem Blend mit der
+  Ratio seiner Tile-Palette-Zeile skaliert (rgb premultipliziert, Alpha
+  unverändert — Skalierung bleibt konsistent). Auflösung der Ratio-Zeiger
+  einmal pro Nativ-Pixel. Neue `PALDIFF`-Diagnose-Zeile (max 5/Kontext):
+  aktive Zeilen + Ratios.
+- Erwartung: Level ohne CGRAM-Effekte → Zeilen identisch → exakt 0 Verhalten-
+  Änderung. Lockjaw unter Wasser: Ratios < 256 (Verdunklung+Blaustich folgt
+  live). Gangplank Sunset: Ratios wandern Richtung Orange über die Zeit.
+
+**Viewer-Seite (DKC2-HD-Tools, separates Repo):**
+- `hdSaveSet`: neues Feld `paletteSnapshot` (currentPalette, 128 Einträge).
+- `exportAsTexturePack()`: schreibt `palettes.bin` + Manifest-Flag
+  `has_palettes`. Alte Sets ohne Snapshot → Warnung + übersprungen.
+
+**WORKFLOW für den User (WICHTIG — der Transform ist erst aktiv, wenn das
+Pack neu exportiert ist; KEIN Neu-Upscalen/Neu-Speichern der Sets nötig —
+der Export leitet fehlende Referenz-Paletten automatisch aus dem ROM ab):**
+1. Mesen R3.0 bauen (SnesHdData.h geändert → inkrementeller Build zieht
+   PPU+Filter+Loader nach, dauert etwas länger).
+2. Viewer öffnen (ROM geladen) → Container laden → Texture-Pack exportieren
+   → in den Mesen-HdPacks-Ordner kopieren. Console zeigt pro Gfxset die
+   Paletten-Quelle (`snapshot` oder `ROM (level ...)`).
+3. Test: Lockjaw unter Wasser (dunkler+blauer?), Gangplank-Sunset (Färbung
+   wandert mit?), Mainbrace+Pirate als Regression (sollten unverändert sein;
+   Mainbrace-Zyklus darf jetzt auf HD "schimmern" wie nativ).
+   Log: `PALDIFF`-Zeilen prüfen (Ratios plausibel? Lockjaw <256?).
+
+**Risiko/Grenze:** Transform ist global pro Palette-Zeile (HD-Art ist
+True-Color, Zuordnung Texel→CGRAM-Eintrag existiert nicht mehr) — nicht-
+uniforme Verschiebungen innerhalb einer Zeile werden gemittelt. Für
+Verdunklung/Sunset (uniforme Row-Shifts) exakt genug.
+
+### R3.0-Testergebnis (2026-07-15) + R3.1 LUT-Perf-Fix
+
+**FUNKTIONIERT:** Gangplank-Sunset-Farbverlauf "sehr cool", Lockjaw-Farbe
+passt, Wasser sieht sehr gut aus. ÜBERRASCHUNGS-BONUS: "alle tile farben
+sehen jetzt deutlich näher am original aus" — PALDIFF zeigt warum: die
+Live-Paletten weichen in JEDER Zeile JEDES Levels dauerhaft von den
+ROM-Rohpaletten ab (das Spiel verarbeitet Paletten beim Laden nach). Der
+Transform korrigiert damit nebenbei die generelle Farbtreue aller HD-Tiles,
+die seit jeher leicht daneben lag (HD-Art wurde aus ROM-Rohpaletten gerendert).
+
+**ABER: starke Perf-Einbrüche in ALLEN Leveln** (schlimmst Mainbrace, dann
+Lockjaw) — Folge desselben Befunds: "Zeile identisch → skip" greift NIE,
+jedes HD-Sample zahlte 9 Mul + 3 Clamp im innersten Loop (~1,7M Samples/Frame
+in Mainbrace). **R3.1-Fix:** 8×3×256-LUTs (6 KB, L1-resident) einmal pro
+Frame aus den Ratios gebaut; pro Sample nur noch 3 Tabellenzugriffe.
+Kein Header, kein Pack-Neuexport — nur Filter-cpp neu bauen.
+
+**ROM-Ableitungs-Zuordnung (Console-Beleg):** Set 3→"Lava Lagoon" (teilt
+Set mit Lockjaw), 4→Rambi, 7→Pirate, 29→"Gusty Glade" (teilt mit Gangplank
+Galley!), 32→Hot-Head, 37→"Krow's Nest" (teilt mit Mainbrace). Referenzen
+kommen also z.T. vom Set-Schwesterlevel. In den GETESTETEN Leveln (Lockjaw,
+Gangplank, Pirate, Mainbrace) stimmen die Farben. **UNGETESTET: die
+Schwesterlevel selbst** — Lava Lagoon ist laut User deutlich röter als
+Lockjaw, dort könnte die Referenz danebenliegen. Falls ja: betroffenes Level
+im Viewer laden → Container Save (exakter paletteSnapshot hat Vorrang) →
+Pack neu exportieren.
+
+**Falls Perf nach R3.1 weiter zu knapp (Mainbrace/Lockjaw waren schon vor R3
+grenzwertig):** nächste Stufe = Filter-Multithreading (Zeilenbänder parallel;
+Puffer read-only, nur Diag-Statics/Counter brauchen Behandlung) — R6-Perf.
+
+### R3.1-Testergebnis (2026-07-16)
+
+**Farben:** weiterhin gut (Lockjaw + Gangplank getestet, keine Regression).
+**Performance: WEITER ZU SCHWACH** — beide Level ruckeln stark, sobald etwas
+mehr Elemente im Bild sind. R3.1 hat also die R3-Zusatzkosten beseitigt
+(zurück auf Vor-R3-Niveau), aber die Grundlast des P4.0-Filters selbst ist
+das Bottleneck. **→ Nächster Schritt: R6 Filter-Multithreading.**
 
 ---
 
