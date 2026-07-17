@@ -1,6 +1,43 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-16 | Mesen Build: R6.1 (BUILD+TEST PENDING) | R6.0 bestätigt+committed (`9aefc368`) | Architektur: P4.0-Composite-Engine, Filter multithreaded
+Stand: 2026-07-17 | Mesen Build: R6.1 bestätigt+committed (`61183ecd`) | Architektur: P4.0-Composite-Engine, Filter multithreaded (2-3 ms avg)
+
+---
+
+## R6.2 — Issue T: Main-Winner ignoriert per-Scanline MainScreenLayers → Unterwasser ~2x zu hell (2026-07-17, BUILD+TEST AUSSTEHEND)
+
+**Symptom (User-Screenshots nativ vs HD, Lockjaw + Lava Lagoon):** Unter der
+Wasser-/Lava-Linie sind BG-HD-Tiles viel zu hell/kräftig — Lockjaw-Kiste
+unter Wasser nativ (85,74,74) vs HD (169,115,65) ≈ Faktor 2; in Lava ist
+nativ unter der Linie fast alles rot verschluckt, HD zeigt die Kisten hell.
+Kontrolle: Regionen OHNE HD-Anteil (Treppe) sind nativ==HD → nur der
+HD-Composite-Pfad betroffen.
+
+**Root Cause (Log + Code):** DKC2 schaltet unter der Wasserlinie per HDMA
+den Main-Screen auf $00/$04 (nichts bzw. nur BG3-Wasser); BG1/BG2 liegen
+dort NUR auf dem Sub-Screen ($13), die PPU rechnet Main(dunkles Wasser/
+Backdrop, korrekt erfasst als MainCol=0x1440) + Sub-Winner per CM-ADD mit
+HALVE → (dunkel+Kiste)/2. Die Pixel-Erfassung liefert an diesen Zeilen aber
+einen BgWinnerLayer von der SUB-Seite (SUBOP-SAMPLE: win=0, mainHd=1 bei
+Main=$00!), und ApplyFilter Step 1 prüfte nur `BgLayerMask`, NICHT ob der
+Winner an dieser Scanline auf dem MAIN-Screen aktiv ist → helles HD-Tile
+ersetzte die dunkle native Main-Basis: (Kiste+Kiste)/2 = volle Helligkeit.
+**Das war der wahre Kern von "Lockjaw unter Wasser zu hell" (seit P4.0
+latent)** — vorher durch die falsche R3-Lava-Referenz (Türkis-Tint)
+teilmaskiert. Halve-Port selbst ist korrekt.
+
+**Fix (nur SnesHdVideoFilter.cpp → inkrementeller Build):** Step-1-Gate um
+`(sl.MainScreenLayers & (1 << winLayer))` erweitert. Ist der Winner nicht
+auf Main, bleibt die native Basis (dunkel) und das HD-Detail kommt weiter
+über den Sub-Operand-Pfad → (nativ dunkel + HD-Kiste)/2 wie die PPU.
+Version "R6.2".
+
+**Erwartung:** Lockjaw unter Wasser deutlich dunkler/blauer (nahe nativ,
+HD-Textur bleibt via Sub-Operand); Lava Lagoon unter der Lava-Linie stark
+rot wie nativ. Über Wasser ÜBERALL unverändert (Winner ist dort auf Main).
+Regression prüfen: Mainbrace-Fog, Pirate, Gangplank (deren Winner-Pfade
+normal auf Main → Gate greift nie). Zähler: hdBG1/hdBG2 sinken in
+Unterwasser-Kontexten, mNat/subOpHd steigen — kein Bug.
 
 ---
 
@@ -49,38 +86,149 @@ Größe = Speicherbandbreite auf dem PPU-Thread), oder vereinzelte
 Scheduling-Spikes wie der 15-ms-Ausreißer. Nächster Perf-Hebel (falls
 nötig) wäre dort — NICHT weiter im Filter.
 
-### Issue S — Gelber Rahmen um Algen unter Wasser (Lockjaw, OFFEN)
+### Issue S — Gelber Rahmen um Algen unter Wasser (Lockjaw) — ROOT CAUSE VERIFIZIERT, EXPERIMENTELLER ART-FIX DRIN (2026-07-17)
 
 **Symptom (User):** BG1-Holzkisten mit herabhängenden grünen Algen; sobald
 die Algen unter die Wasserlinie tauchen, zeigt sich ein leichter GELBER
 Rahmen um das Grün. Über Wasser nicht sichtbar.
 
-**Hypothese (noch unbestätigt, Haupt-Verdacht ART-seitig + Unterwasser-Pfad
-macht es sichtbar):** Der KI-Upscaler hat an den Algen-Kanten
-semi-transparente Halo-Texel mit eingebackener HINTERGRUND-Farbe erzeugt
-(gelblich-braunes Kistenholz). Über Wasser ist die Alge der Main-Winner und
-wird über einen ähnlichen Hintergrund geblendet → Halo unsichtbar. Unter
-Wasser läuft die Alge über den SUB-OPERAND-Pfad (Wasser=Main-Winner,
-Alge=Sub-Winner): operand = blend(HD-Algen-Texel über nativem SubScreenColor),
-dann per ADD aufs Wasser gerechnet — **Halo-Texel werden zu additivem
-gelbem Leuchten auf blauem Grund**; ADD-Clamping (B sättigt zuerst) schiebt
-den Farbton zusätzlich Richtung Gelb. Die native PPU addiert dagegen saubere
-Palettenfarben — jeder Halo in der HD-Art wird in diesem Pfad zu Glow.
+**Befund (programmatische PNG-Analyse, 2026-07-17):** Die ursprüngliche
+Alpha-Halo-Hypothese ist WIDERLEGT — **kein einziges der 385 PNGs in
+`bg/bg1/gfxset_03` hat semi-transparente Texel** (327 voll opak, 58 mit nur
+harter Alpha-0-Transparenz). Stattdessen: Die Algen-Tiles sind KOMPLETT OPAK
+(Holz-Hintergrund eingebacken), und der KI-Upscaler hat an den
+Grün↔Braun-Kanten **opake gelb-olive Blend-Säume** erzeugt — auffällig oft
+an den TILE-RÄNDERN (Blend lief beim Upscaling über Tile-Grenzen hinweg,
+Nachbar-Tile = Holz). Hue-Analyse der 4 untersuchten Algen-Tiles: Holz liegt
+bei Hue 10–49°, Algen-Grün bei 100–149°, der Saum füllt das nativ LEERE Band
+50–99° (26–142 px pro Tile). Nativ hat die PPU dort harte Palettenkanten
+(beide Seiten dunkel); unter Wasser macht der Sub-Operand-ADD (+blaues
+Wasser) die helleren Gelb-Säume zum Leuchtrahmen — über Wasser tarnen sie
+sich als Antialiasing gegen das ähnliche Holz. Mechanismus wie vermutet,
+nur opak statt via Alpha.
 
-**Verifikation (nächster Schritt):** Algen-Tile-PNGs im Viewer/Export
-(bg/bg1/) öffnen und Kanten zoomen — sind dort halbtransparente
-gelb-bräunliche Texel um das Grün? Falls ja: Art-Fix (Alpha-Kanten
-säubern / Re-Upscale mit Maskierung; ggf. Viewer-Feature "Edge-Cleanup").
-Falls die Kanten SAUBER sind: Filter-seitig weiterdebuggen (dann wäre der
-Verdacht R3-LUT-Zeilenzuordnung an Kantentexeln o.ä.).
-**Filter-seitige Notlösung (riskant, erst wenn Art-Fix nicht reicht):**
-Alpha-Schwelle für Sub-Operand-Texel — würde aber auch legitime weiche
-Kanten (Nebel!) beschneiden.
+**ACHTUNG bei generischem Cleanup:** Das Set enthält Tiles mit LEGITIMEM
+hellem Gelb im selben Hue-Band (2f00/2ab0/2ef0/2ac0 u.a., große gelbe
+Objekte/Buchstaben, P07!) — ein pauschaler Gelb-Filter über das Set würde
+echte Art zerstören. Saum-Erkennung muss pro Tile-Kontext laufen (Blend-Band
+zwischen zwei vorhandenen Farbclustern), oder besser gegen die nativen
+Palettenfarben des Tiles validieren (Viewer hat die Daten → "Edge-Cleanup"-
+Feature).
+
+**Experimenteller Fix (2026-07-17, im Pack, NICHT im Repo):** In den 4
+Tiles `29b0/29a0/3540/3590_P07.png` alle Saum-Pixel (Hue 45–100°, s≥0.15,
+l≥0.10) durch die Farbe des räumlich nächsten Nicht-Saum-Pixels ersetzt
+(harte Kante wie nativ); 26/100/142/102 px ersetzt. **Originale gesichert
+in `HdPacks\_backup_issueS_gfxset03\`.** A/B-Test: andere Algen-Tiles des
+Levels (2530, 3530, 3550, 2980, 2ad0 …) sind absichtlich NICHT gefixt —
+verschwindet der Rahmen nur an den gefixten Algen, ist die Diagnose final
+bestätigt → dann Edge-Cleanup als Viewer-Feature bauen und ganzes Set
+behandeln.
 
 **Ausgeschlossen:** R6.0/R6.1 als Ursache — Opaque-Skip ist mathematisch
-identisch (Blend mit a=255 ⇒ r=hr), Bug betrifft semi-transparente Kanten,
-die unverändert den alten Blend-Pfad nehmen. Vermutlich seit P4.0 vorhanden
-und erst durch die korrekten R3-Farben aufgefallen.
+identisch (Blend mit a=255 ⇒ r=hr). Filter-Seite rechnet korrekt; das
+Problem ist eingebackene Upscaler-Farbe in der Art. Vermutlich seit P4.0
+vorhanden und erst durch die korrekten R3-Farben aufgefallen.
+
+**UPDATE 2026-07-17b — HAUPTURSACHE IST DIE R3-REFERENZPALETTE (Säume nur
+sekundär):** Neue User-Beobachtung: Rahmen hat HARTE, tile-genaue Kanten und
+der Gelbschleier liegt jetzt auch auf Algen ÜBER Wasser (seit R3); in Lava
+Lagoon derselbe Stich, schwächer. Das passt nicht zu weichen Pixelsäumen,
+sondern zur R3-Transform (wirkt pro Palette-Zeile aufs ganze Tile).
+**Beweis (Log 2026-07-17 + palettes.bin dekodiert):** PALDIFF gfx=3 zeigt
+P1–P6 einheitlich ≈210/340/340 (R×0.83 G×1.33 B×1.33, die gewollte
+Korrektur), aber **P7=287/423/192 (R×1.12 G×1.65 B×0.75) = Gelb-Grün-Shift
+NUR für Zeile 7**. palettes.bin Set 3 Zeile 7 ist eine rot-braune Palette
+OHNE Grün (16,7,3 / 13,5,2 / 14,9,0 … refSum R=122 G=81 B=36) = Lava-
+Lagoon-Ableitung (bekannte Schwesterlevel-Falle der ROM-Herleitung),
+während Lockjaws Live-Zeile-7 grüner ist (liveSum ≈ R136 G133 B27). Die
+Algen-Art wurde unter Lockjaws grüner Palette upscaled → live/ref
+"korrigiert" bereits grüne Art nochmal Richtung Gelbgrün → Schleier auf
+allen P07-Tiles, hart an Tile-Grenzen (Nachbar-Tiles = andere Zeile).
+Unter Wasser verstärkt der Sub-Operand-ADD den Effekt zum Leuchtrahmen.
+Lava Lagoon: Referenz dort näher an live → schwächerer Rest-Stich (nur
+Spiel-Nachbearbeitung der Paletten), konsistent.
+**FIX (Daten, nicht Code):** Lockjaw im Viewer laden → Container Save
+(schreibt exakten paletteSnapshot für Set 3, hat Vorrang vor ROM-Ableitung)
+→ Pack re-exportieren → in HdPacks kopieren → Mesen-Neustart. Erwartung:
+Gelbschleier über Wasser weg, Rahmen unter Wasser weg/deutlich reduziert;
+Lava Lagoon bekommt dann live_LL/ref_Lockjaw = Algen folgen dort dem
+rötlichen Level-Licht (gewünschtes Verhalten). Die 4 Tile-Säume-Fixes von
+2026-07-17a bleiben drin (echte, aber kleinere Artefakte).
+
+**UPDATE 2026-07-17c — Erster Re-Export-Versuch OHNE Wirkung, Ursache
+gefunden, Viewer gepatcht (Test ausstehend):** User-Export lief WEITER über
+ROM-Ableitung (Console: `reference palette from ROM (level "Lava Lagoon")`),
+neue palettes.bin byte-gleich (Set 3 Row 7 = R122/G81/B36), Lockjaw-PALDIFF
+unverändert P7=287/423/192 → paletteSnapshot war nie im Container
+(Container-Save mit geladenem Lockjaw fehlte; `currentPalette` wird NUR beim
+Level-Laden gesetzt). **Neue Log-Erkenntnisse aus dem Lauf (Route Lava →
+Map → Shop → Lockjaw):**
+- **Lava Lagoon TEILT sig `E10E4686` mit Lockjaw** (Schwesterlevel, gleiche
+  VRAM-Hash-Adressen) und sogar dieselben Register (Main=$17 Sub=$13
+  CM=$24) → Kontext-Key kollidiert komplett; nur Reihenfolge im Log
+  unterscheidet sie. Ältere "E10E=Lockjaw"-Zuordnung gilt für BEIDE.
+- **In Lava Lagoon ist der R3-Transform im Gameplay STILL (live==ref exakt,
+  keine PALDIFF-Zeilen in den $17-Kontexten)** → beweist: loadTileParts-
+  ROM-Palette IST die Live-CGRAM des zugehörigen Levels. Die R3.1-Theorie
+  "Spiel bearbeitet Paletten beim Laden nach (jede Zeile jedes Levels)"
+  ist WIDERLEGT — sie war ein Artefakt der falschen Referenz. User-
+  Beobachtung "Lava: rote Färbung weg / Tiles nicht mehr eingefärbt" ist
+  dieser datengemäße Identitäts-Zustand.
+- Shop (F88DC3) und Worldmap gfx=-1 wie bekannt, keine Auffälligkeit.
+**Viewer-Patch (index.html, uncommitted):** (1) Snapshot-Suche über ALLE
+Level-Einträge pro Gfxset (Iterationsreihenfolge kann Snapshot nicht mehr
+verschatten), (2) ROM-Fallback-Meldung warnt explizit vor Schwesterlevel-
+Falle, (3) Container-Save loggt ob paletteSnapshot gefüllt wurde.
+
+**UPDATE 2026-07-17e — AUTO-DETECT ERFOLGREICH, KORREKTE BASELINE ERREICHT,
+REST = SÄUME (Art):** Export wählte per Scoring für ALLE 6 Sets plausible
+Referenzen (Set 3: Lockjaw avgErr 140 vs Lava 982; Set 7: Pirate/Gangplank
+141 vs Rattle Battle 1026; Set 32: Hot-Head 117 vs Fiery Furnace 1631).
+User-Test + Log danach: **Lockjaw-Transform in ALLEN Zuständen still
+(live==ref, auch unter Wasser!)** → Lockjaws Unterwasser-Färbung kommt NICHT
+aus CGRAM, sondern nur aus Color-Math-ADD; die frühere "Level-Färbung" war
+der konstante Lava-Fehl-Tint (Türkis-Shift), ihr Verlust ist KEINE
+Regression sondern die ehrliche Baseline. **Lava Lagoon: Transform aktiv+
+korrekt** (P1–P6 ≈ R×1.2 G×0.74 B×0.74 = Lockjaw-Art → Lava-Licht; User
+bestätigt "Färbung funktioniert"). **Drift-Messung (Python, HD-Pixel vs
+Soll-Palette per Nearest-Match, 90k+ Samples):** alle Zeilen 1,00–1,06 →
+KEIN nennenswerter Upscaler-Farbdrift, Art ist palettentreu. Verbleibender
+(schwächerer) Gelb-/Blaurand an Algen in beiden Leveln = die OPAKEN
+BLEND-SÄUME (2026-07-17-Befund) — Re-Export hatte die 4 Säume-Fix-Tiles
+überschrieben, Fix erneut angewendet (gleiche Counts 26/100/142/102).
+In Lava tönt der Transform dieselben Säume bläulich (P7 B×1.33) = Users
+"bläulicher Rand", bestätigt die Saum-Diagnose. **Offene Prüfungen:**
+(1) A/B gefixte vs. ungefixte Algen in Lockjaw, (2) Wasserfärbungs-Frage
+per HD-Pack-Toggle gegen NATIV vergleichen (nicht gegen gestern!). Falls
+Säume bestätigt: Edge-Cleanup in den Viewer-Export einbauen (Säume kommen
+mit jedem Export wieder). Sighinweis: Route enthielt auch Gusty (02D047A0,
+gfx=-1, blaue Quadrate erwartet bis P4.2).
+
+**UPDATE 2026-07-17d — Auf User-Wunsch: PALETTE-AUTO-DETECT im Export
+(level-load-unabhängig, kein Container-Save-Schritt nötig):** Der Export
+sammelt pro Gfxset bis zu 192 Subtile-Samples (native 8×8-Palettenindizes
+per 4bpp-Decode aus chrRawData, flip-korrigiert, + HD-Region auf 8×8
+gemittelt) und scored damit ALLE Kandidaten-Paletten — Container-Snapshot
+(falls vorhanden) + loadTileParts-Palette JEDES Levels des Sets — über den
+mittleren quadratischen RGB-Fehler (erwartete Palettenfarbe am nativen
+Index vs. tatsächliches HD-Pixel; nur Alpha≥200, Index≠0, min. 256 Pixel
+Evidenz). Die Palette, unter der die Art wirklich gerendert wurde, erklärt
+die Pixel am besten und gewinnt — egal welches Level im Viewer geladen ist;
+ein falsch gespeicherter Snapshot kann nicht mehr gewinnen. Console listet
+alle Scores. Fallback ohne chrRawData: altes Verhalten + Warnung. Syntax
+aller Script-Blöcke node-geprüft. Details CHANGELOG (Viewer-Repo).
+Erwartung für Set 3: ROM "Lockjaw's Locker" scored deutlich unter
+"Lava Lagoon" → palettes.bin Row 7 wird grün → Schleier weg.
+**Prognose für den Test nach korrektem Re-Export (ref=Lockjaw):** Lockjaw-
+Oberfläche → PALDIFF still (Identität), Schleier weg; unter Wasser nur
+echte CGRAM-Diffs. Falls Lockjaw-Farben dann wieder "wie eingebacken"
+wirken (der frühere R3-Gewinn "näher am Original" beruhte teilweise auf der
+zufälligen Lava-Korrektur), ist das ein ART-Helligkeitsthema (Upscaler),
+kein Filter-Bug. ACHTUNG: Der Re-Export hat die 4 Säume-Fix-Tiles von
+2026-07-17a ÜBERSCHRIEBEN (Backups liegen noch in
+`HdPacks\_backup_issueS_gfxset03\` — enthalten aber die UNGEFIXTEN
+Originale; der Säume-Fix müsste bei Bedarf neu angewendet werden).
 
 ---
 

@@ -16,7 +16,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "R6.1"
+#define SNES_HD_BUILD_VERSION "R6.2"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -607,7 +607,16 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
 
 				// --- Step 1: Try winner layer ---
-				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))) {
+				// R6.2 (Issue T): the winner must be enabled on the MAIN screen at
+				// THIS scanline. DKC2 underwater rows (HDMA: Main=$00/$04, BG1/BG2
+				// only on the sub screen) record a sub-side BgWinnerLayer; rendering
+				// its HD tile as the main pixel replaced the PPU's dark water/backdrop
+				// base with bright art — (HDtile+operand)/2 instead of the PPU's
+				// (dark+operand)/2 → underwater terrain rendered ~2x too bright.
+				// Without main-screen membership the pixel keeps the native base and
+				// still gets HD detail via the sub-operand path below.
+				if(winLayer < 4 && (pixelInfo.BgLayerMask & (1 << winLayer))
+					&& (sl.MainScreenLayers & (1 << winLayer))) {
 					hdTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[winLayer].Key);
 
 					// BG1↔BG2 layer retry
