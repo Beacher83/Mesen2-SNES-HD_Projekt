@@ -31,7 +31,24 @@ der BGs (Gusty-Blätter, Wind-Tiles, Wasser/Lava-Anims) als Nebenprodukt.**
 
 ---
 
-## S5a — Sprite-Capture-Recording (2026-07-19, BUILD+TEST AUSSTEHEND)
+## S5 — ABGESCHLOSSEN (2026-07-19): ERSTE ECHTE HD-SPRITES IM SPIEL
+
+**User-bestätigt: Diddy Idle/Walk/Run laufen in HD.** Kompletter Durchstich
+an einem Tag: S1 Capture → S2 ROM==VRAM-Beweis → S3 Format+Loader →
+S4 Renderpfad → S5a Runtime-Recording → S5b Viewer-Export (Manifest v2
+tiles[], Auswahl-UI, Spritecap-Ingestion, Frame-Slicing). Workflow ab
+jetzt: Galerie-Auswahl exportieren → 4× upscalen (ZIP mit manifest) →
+Import HD → Spritecap → Texture Pack → HdPacks. Viewer-Stand `93c43bc`.
+
+**Offene Sprite-Punkte (später):** Sub-Screen-Sprites (Sprites[1]) im
+Filter nutzen (P4.1f-Fall komplett lösen); OBJ-Referenzpaletten für
+CGRAM-Transform (R3-Analogon); Paletten-VARIANTEN (gleicher Hash, mehrere
+Slots mit unterschiedlichem CGRAM-Inhalt — aktuell gleiche Art für alle
+Slots); die 5% Runtime-Hashes ohne Galerie-Match (Effekte/Partikel).
+
+---
+
+## S5a — Sprite-Capture-Recording (2026-07-19, BESTÄTIGT — s.o.)
 
 **Zweck:** Der Viewer-Pack-Export braucht die ECHTEN Runtime-Palette-Slots
 pro Sprite-Tile (OBJ-Slot-Zuweisung ist Spiellogik, aus dem ROM nicht
