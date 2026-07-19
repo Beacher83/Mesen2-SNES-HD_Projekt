@@ -117,6 +117,23 @@ private:
 	uint8_t _spritePaletteCopy[256] = {};
 	uint8_t _spriteColorsCopy[256] = {};
 
+	// HD sprites (S1): per-pixel identity of the OBJ tile that produced the
+	// sprite pixel. Double-buffered like the sprite line buffers above (fetch
+	// fills *Copy during the previous scanline, swapped at scanline start).
+	// Only maintained while an HD pack is active.
+	struct HdSpritePixel
+	{
+		uint64_t ContentHash = 0;
+		uint16_t TileVramAddr = 0;  // word address of the 8x8 OBJ tile
+		uint8_t OffsetX = 0;        // native column 0-7 (mirror already resolved)
+		uint8_t OffsetY = 0;        // native row 0-7 (mirror already resolved)
+		uint8_t Palette = 0;        // OBJ palette 0-7 (CGRAM row = 8 + palette)
+		bool HMirror = false;       // subpixel orientation for HD sampling
+		bool VMirror = false;
+	};
+	HdSpritePixel _hdSpritePixels[256] = {};
+	HdSpritePixel _hdSpritePixelsCopy[256] = {};
+
 	int32_t _debugMode7StartX = 0;
 	int32_t _debugMode7StartY = 0;
 	int32_t _debugMode7EndX = 0;

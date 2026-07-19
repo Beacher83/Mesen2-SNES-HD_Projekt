@@ -147,8 +147,15 @@ struct SnesHdPpuPixelInfo
 	// disables the halve operation (SnesPpu::ApplyColorMathToPixel special case).
 	bool SubScreenEmpty = false;
 
-	SnesHdPpuTileInfo Sprites[4] = {};   // Up to 4 sprite tiles at this pixel
-	uint8_t SpriteCount = 0;
+	// S1: OBJ tile identity of the composited sprite pixel, captured in
+	// RenderSprites from the fetch-time line buffer. Sprites[0] = tile that
+	// won the MAIN screen, Sprites[1] = tile that won the SUB screen.
+	// OffsetX/OffsetY are NATIVE tile coordinates (mirror already resolved);
+	// HorizontalMirror/VerticalMirror define the subpixel orientation for HD
+	// sampling. LayerIndex = 4. NOTE: sprites render before the tilemaps —
+	// check the final winner (IsSpritePixel / SubScreenHasSprite) before use.
+	SnesHdPpuTileInfo Sprites[4] = {};
+	uint8_t SpriteCount = 0;             // Validity bitmask: bit0 = Sprites[0], bit1 = Sprites[1]
 
 	uint16_t MainScreenColor = 0;        // P4.0: pre-color-math, pre-brightness main screen color (BGR555)
 	uint16_t SubScreenColor = 0;

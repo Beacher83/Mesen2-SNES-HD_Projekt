@@ -1,6 +1,104 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-19 | Mesen Build: P4.2 gebaut (BUILD+TEST AUSSTEHEND), R6.2 bestätigt+committed (`442d9f5f`) | Architektur: P4.0-Composite-Engine, Filter multithreaded (2-3 ms avg)
+Stand: 2026-07-19 | Mesen Build: S1.0 gebaut (BUILD+TEST AUSSTEHEND), P4.2 bestätigt+committed (`11cd0744`) | Architektur: P4.0-Composite-Engine, Filter multithreaded (2-3 ms avg)
+
+---
+
+## S-ROADMAP — HD-SPRITES (Workstream-Design, 2026-07-19)
+
+**Kernidee: hash-adressierte Art.** DKC2 streamt Sprite-Frames per DMA in
+OBJ-VRAM — jede Animationsphase jedes Charakters ist ein Satz 8x8-Tiles mit
+EIGENEN, stabilen Content-Hashes. HD-Sprite-Art wird daher per Content-Hash
+adressiert (nicht per VRAM-Adresse): das Matching zeigt automatisch die
+richtige Art zur richtigen Animationsphase, ohne jede Timing-Logik.
+**Dasselbe Multi-Hash-pro-Adresse-Format löst später die CHR-Anim-Limitation
+der BGs (Gusty-Blätter, Wind-Tiles, Wasser/Lava-Anims) als Nebenprodukt.**
+
+- **S1 (GEBAUT, s.u.):** PPU-Erfassung der OBJ-Tile-Identität pro Pixel +
+  Diagnose (SPRCAP/SPRTILE). Beweist Hash-Stabilität, misst Pack-Größe.
+- **S2:** Offline-Abgleich Runtime-Hashes (SPRTILE-Log) vs. ROM/Viewer-
+  Sprite-Daten — klärt, ob die Viewer-Galerie die VRAM-Bytes exakt
+  reproduziert (→ Hash-Quelle für den Export).
+- **S3:** Pack-Format + Loader: `sprites/`-Ordner, hash-keyed (z.B.
+  `<hash16>_P<pal>.png` + sprites.bin), Loader → TileByKey LayerIndex=4.
+- **S4:** Filter-Renderpfad: Main-Sprite-Pixel aus HD-Tile samplen
+  (OffsetX/Y nativ + HMirror/VMirror für Subpixel-Orientierung);
+  Sub-Operand-Sprites → löst den P4.1f-Kompromiss (SD-Wasser in Silhouette).
+- **S5:** Viewer-Export: upscaled Sprite-FRAMES (Galerie-Pipeline existiert:
+  exportSpritesAsZip/importHDSpritePack) in 8x8-HD-Zellen slicen, Hash je
+  Zelle aus den nativen Frame-Bytes.
+- **S6:** CHR-Anim-Frames für BGs über dasselbe Format (Blätter etc.).
+
+---
+
+## S1.0 — TESTERGEBNIS (2026-07-19): VOLLER ERFOLG, ALLE HYPOTHESEN BESTÄTIGT
+
+**Log-Auswertung (User spielte Lockjaw/Mainbrace/Pirate, 827 SPRCAP-Frames):**
+- **Capture läuft:** main≈5000 px/Frame (plausibel vs sprWon), sub≈1100 px
+  in Lockjaw (Unterwasser-Charakter über Sub-Screen — der P4.1f-Fall wird
+  erfasst!). tiles= 60–133 distinkte OBJ-Tiles pro Frame.
+- **Hash-Stabilität BEWIESEN:** 244 distinkte Hashes in den Samples, 180
+  davon mehrfach über Frames/Kontexte (bis 46×) — gleiche Animationsphase
+  = gleicher Hash.
+- **Cross-Session/Cross-Level-Konsistenz BEWIESEN:** 46 der 244 Hashes
+  identisch im Gusty-VRAM-Dump (andere Session!), 27 im Shop-Dump —
+  Diddy/Dixie-Tiles. Gleicher Inhalt liegt dabei an ANDEREN Adressen
+  ($1C00+ in Gusty, $0000+ im Shop) → Hash-Keying ist zwingend richtig,
+  Adress-Keying wäre tot. 9/244 Hashes schon in EINER Session an mehreren
+  Adressen (Relokation zur Laufzeit — vom Hash-Ansatz abgedeckt).
+- **Perf unverändert:** ms=2.4–2.75 avg (max 4.14) = R6.1-Niveau.
+- **Pack-Dimensionierung:** OBJ-Bereich niedrig ($0000-$1FFF), pro Frame
+  ~130 Tiles → pro Level einige hundert bis wenige tausend distinkte
+  Sprite-Tiles über alle Animationsphasen. Machbar.
+
+**→ S2 freigegeben:** Offline-Abgleich der Runtime-Hashes gegen ROM-
+decodierte Sprite-Grafiken (klärt, ob der Viewer-Galerie-Export die
+VRAM-Bytes byte-exakt reproduziert = Hash-Quelle für den Pack-Export).
+
+---
+
+## S1.0 — HD-Sprite-Erfassung + Diagnose (2026-07-19, BUILD+TEST AUSSTEHEND)
+
+**Befund vorab:** `Sprites[4]`/`SpriteCount` existierten im Struct, wurden
+aber NIRGENDS befüllt (alte "wird erfasst"-Notiz war falsch). Die Identität
+geht früh verloren: RenderSprites liest nur Zeilenpuffer (Farbe/Prio/Pal);
+Tile-Adresse+Koordinaten existieren nur während des Sprite-Fetch.
+
+**Implementierung (rein additiv, Bild UNVERÄNDERT — nur Erfassung+Log):**
+1. `SnesPpuTypes.h` SpriteInfo: +TileVramAddr/TileRowOffset/VerticalMirror
+   (FetchSpriteAttributes merkt sich Tile-Basis + native Zeile; xOffset/
+   yOffset sind bereits mirror-bereinigt = NATIVE Tile-Koordinaten).
+2. `SnesPpu.h`: `HdSpritePixel`-Zeilenpuffer (hash/addr/offX/offY/pal/
+   hMirror/vMirror), doppelt gepuffert wie _spriteColorsCopy.
+3. `SnesPpu.cpp` FetchSpriteTile: pro Tile-Slice EIN ComputeTileContentHash
+   (16 Worte, identisch zum BG-Pfad → direkt vergleichbar mit hashes.bin);
+   Capture nur bei color!=0 und aktivem HD-Pack. Swap bei Zeilenstart
+   (4KB memcpy, HD-gated).
+4. `SnesPpu.cpp` RenderSprites: beim tatsächlichen Compositing →
+   `Sprites[0]`=Main-Winner, `Sprites[1]`=Sub-Winner, SpriteCount=Bitmaske
+   (bit0/bit1). ACHTUNG Konsument: Sprites rendern VOR Tilemaps — finalen
+   Winner (IsSpritePixel/SubScreenHasSprite) prüfen (P4.1d-Lektion).
+5. Filter: SPRCAP-Zeile pro geloggtem Frame (`main=/sub=/tiles=` mit
+   DISTINCT-Hash-Zählung, nur auf Log-Frames ≤70/Kontext) + bis 3×16
+   SPRTILE-Sample-Zeilen pro Kontext (hash/vram/pal/prio/hm/vm).
+   Version "S1.0".
+
+**Erwartete Testergebnisse:**
+- Bild + Perf identisch zu P4.2 (Capture passiv; ms= im FRAME-Log
+  vergleichen — Hash-Kosten ~34/Scanline sind vernachlässigbar).
+- SPRCAP: main= in der Größenordnung von sprWon; tiles= = Anzahl distinkter
+  8x8-OBJ-Tiles auf dem Schirm (Erwartung: zweistellig bis ~200).
+- SPRTILE-Hashes über mehrere Frames desselben Anim-Zustands STABIL
+  (gleiche Werte tauchen wieder auf) — DER Machbarkeitsbeweis für S3-S5.
+- vram= meist im OBJ-Bereich (OamBaseAddress, typisch $6000-$7FFF o.ä.) —
+  zeigt uns den OBJ-CHR-Bereich von DKC2.
+
+**Build-Hinweis:** Header geändert (SnesPpuTypes.h, SnesPpu.h, SnesHdData.h)
+→ inkrementeller Build zieht mehr TUs nach als reine Filter-Builds.
+
+**User-Test:** Lockjaw/Mainbrace/Pirate normal spielen (Charaktere+Gegner
+im Bild), snes_hd_diag.txt schicken. Regression: Bild identisch, keine
+neuen Ruckler.
 
 ---
 

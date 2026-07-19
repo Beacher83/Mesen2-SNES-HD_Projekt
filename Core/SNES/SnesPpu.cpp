@@ -458,6 +458,11 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
 
 			memcpy(_spritePalette, _spritePaletteCopy, sizeof(_spritePalette));
 			memcpy(_spriteColors, _spriteColorsCopy, sizeof(_spriteColors));
+			if(_hdData && _hdActiveScreen) {
+				// HD sprites (S1): swap the OBJ tile identity buffer in lockstep
+				// with the sprite line buffers (4KB, only while HD is active)
+				memcpy(_hdSpritePixels, _hdSpritePixelsCopy, sizeof(_hdSpritePixels));
+			}
 
 			memset(_spriteIndexes, 0xFF, sizeof(_spriteIndexes));
 
@@ -753,6 +758,12 @@ void SnesPpu::FetchSpriteAttributes(uint16_t oamAddress)
 	uint16_t tileStart = (_state.OamBaseAddress + (tileIndex << 4) + (useSecondTable ? _state.OamAddressOffset : 0));
 	_currentSprite.FetchAddress = (tileStart + yOffset) & 0x7FFF;
 
+	// HD sprites (S1): remember the OBJ tile identity for the pixel capture
+	// in FetchSpriteTile (FetchAddress mutates during the fetch cycles).
+	_currentSprite.TileVramAddr = tileStart & 0x7FFF;
+	_currentSprite.TileRowOffset = yOffset;
+	_currentSprite.VerticalMirror = verticalMirror;
+
 	int16_t x = _currentSprite.X == -256 ? 0 : _currentSprite.X;
 	int16_t endTileX = x + ((columnCount - _currentSprite.ColumnOffset - 1) << 3) + 8;
 	_currentSprite.DrawX = _currentSprite.X + ((columnCount - _currentSprite.ColumnOffset - 1) << 3);
@@ -774,6 +785,17 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 		_currentSprite.FetchAddress = (_currentSprite.FetchAddress + 8) & 0x7FFF;
 	} else {
 		int16_t xPos = _currentSprite.DrawX;
+
+		// HD sprites (S1): capture the OBJ tile identity for visible pixels.
+		// One content hash per fetched tile slice (max 34/scanline) — same
+		// FNV-1a over the tile's 32 VRAM bytes as the BG path, so sprite
+		// hashes are directly comparable to pack hashes.
+		const bool hdCapture = _hdData && _hdActiveScreen;
+		uint64_t hdHash = 0;
+		if(hdCapture) {
+			hdHash = ComputeTileContentHash(_vram, _currentSprite.TileVramAddr, 16);
+		}
+
 		for(int x = 0; x < 8; x++) {
 			if(xPos + x < 0 || xPos + x > 255) {
 				continue;
@@ -786,6 +808,16 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 				_spriteColorsCopy[xPos + x] = color;
 				_spritePriorityCopy[xPos + x] = _currentSprite.Priority;
 				_spritePaletteCopy[xPos + x] = _currentSprite.Palette;
+				if(hdCapture) {
+					HdSpritePixel& sp = _hdSpritePixelsCopy[xPos + x];
+					sp.ContentHash = hdHash;
+					sp.TileVramAddr = _currentSprite.TileVramAddr;
+					sp.OffsetX = xOffset;
+					sp.OffsetY = _currentSprite.TileRowOffset;
+					sp.Palette = _currentSprite.Palette;
+					sp.HMirror = _currentSprite.HorizontalMirror;
+					sp.VMirror = _currentSprite.VerticalMirror;
+				}
 			}
 		}
 	}
@@ -1030,6 +1062,31 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 		subWindowCount = (uint8_t)_state.Window[0].ActiveLayers[SnesPpu::SpriteLayerIndex] + (uint8_t)_state.Window[1].ActiveLayers[SnesPpu::SpriteLayerIndex];
 	}
 
+	// HD sprites (S1): copy the fetched OBJ tile identity into the per-pixel
+	// info whenever a sprite pixel is actually composited. Sprites[0] = main
+	// screen, Sprites[1] = sub screen; SpriteCount is a validity bitmask
+	// (bit0 = main slot, bit1 = sub slot). NOTE: sprites render BEFORE the
+	// tilemaps — a BG layer may still win the pixel afterwards, so consumers
+	// must check the final winner (IsSpritePixel / SubScreenHasSprite).
+	const uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
+	const bool hdValid = _hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight;
+	auto hdCaptureSprite = [&](int x, int slot, uint8_t spritePrio) {
+		SnesHdPpuPixelInfo& pi = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
+		const HdSpritePixel& sp = _hdSpritePixels[x];
+		SnesHdPpuTileInfo& t = pi.Sprites[slot];
+		t.Key.ContentHash = sp.ContentHash;
+		t.Key.VramAddress = sp.TileVramAddr;
+		t.Key.PaletteIndex = sp.Palette;
+		t.Key.LayerIndex = 4;
+		t.OffsetX = sp.OffsetX;
+		t.OffsetY = sp.OffsetY;
+		t.HorizontalMirror = sp.HMirror;
+		t.VerticalMirror = sp.VMirror;
+		t.Priority = spritePrio;
+		t.VramWordAddr = sp.TileVramAddr;
+		pi.SpriteCount |= (1 << slot);
+	};
+
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
 		if(_spritePriority[x] <= 3) {
 			uint8_t spritePrio = priority[_spritePriority[x]];
@@ -1037,6 +1094,9 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 				uint16_t paletteRamOffset = 128 + (_spritePalette[x] << 4) + _spriteColors[x];
 				_mainScreenBuffer[x] = _cgram[paletteRamOffset];
 				_mainScreenFlags[x] = spritePrio | PixelFlags::IsSpritePixel | (((_state.ColorMathEnabled & 0x10) && _spritePalette[x] > 3) ? (PixelFlags::AllowColorMath | (_state.ColorMathSubtractMode ? PixelFlags::IsSubtractMode : 0)) : 0);
+				if(hdValid && x < SnesHdScreenInfo::ScreenWidth) {
+					hdCaptureSprite(x, 0, spritePrio);
+				}
 			}
 
 			if(drawSub && (_subScreenPriority[x] < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(subWindowCount, x)) {
@@ -1048,9 +1108,9 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 				// BG3 fog via color math (sub-screen only). IsSpritePixel is never set
 				// because BG3 wins the main screen. Without this flag the filter would
 				// apply a fallback BG tile and cover the sprite.
-				uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
-				if(_hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight && x < SnesHdScreenInfo::ScreenWidth) {
+				if(hdValid && x < SnesHdScreenInfo::ScreenWidth) {
 					_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].SubScreenHasSprite = true;
+					hdCaptureSprite(x, 1, spritePrio);
 				}
 			}
 		}

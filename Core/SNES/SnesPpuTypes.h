@@ -35,6 +35,13 @@ struct SpriteInfo
 	uint16_t FetchAddress;
 	uint16_t ChrData[2];
 
+	// HD sprites (S1): OBJ tile identity for the HD pixel capture.
+	// FetchAddress alone loses the tile base and the native row once the
+	// second fetch cycle advanced it, so FetchSpriteAttributes stores them.
+	uint16_t TileVramAddr;   // word address of the 8x8 OBJ tile (16 words)
+	uint8_t TileRowOffset;   // native row 0-7 inside the tile (V-mirror resolved)
+	bool VerticalMirror;
+
 	bool IsVisible(uint16_t scanline, bool interlace)
 	{
 		if(X != -256 && (X + Width <= 0 || X > 255)) {

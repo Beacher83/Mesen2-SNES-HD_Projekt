@@ -16,7 +16,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "P4.2"
+#define SNES_HD_BUILD_VERSION "S1.0"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -1093,6 +1093,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// diagSprSampleCount/diagLoggedHashes moved to file scope — they are sampled
 	// from the parallel render threads (under s_diagMutex) and reset below.
 	static int diagPalLogCount = 0;      // R3: CGRAM-diff transform detail lines
+	static int diagSprCapLogCount = 0;   // S1: SPRTILE sample-line batches per context
 	static bool hdmaDumped = false;
 	static int diagContextCount = 0;     // total context changes seen
 
@@ -1237,6 +1238,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagSubOpSampleCount = 0;
 		diagSprSampleCount = 0;
 		diagPalLogCount = 0;
+		diagSprCapLogCount = 0;
 		diagLoggedHashes.clear();
 		hdmaDumped = false;
 		diagMsMax = 0;
@@ -1427,6 +1429,52 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 			DiagLog(palBuf);
 			diagPalLogCount++;
+		}
+
+		// =================================================================
+		// S1: HD-sprite capture summary. Counts pixels whose OBJ tile
+		// identity was captured (Sprites[0]=main, Sprites[1]=sub) and the
+		// number of DISTINCT sprite tiles on screen — this sizes the future
+		// sprite pack and verifies hash stability. SPRTILE sample lines
+		// allow offline cross-checking of runtime hashes against ROM/viewer
+		// sprite data. Scan runs only on logged frames (≤70 per context).
+		// =================================================================
+		{
+			constexpr uint32_t pixelCount = (uint32_t)SnesHdScreenInfo::ScreenPixelCount;
+			std::unordered_set<uint64_t> sprHashes;
+			uint32_t sprCapMain = 0, sprCapSub = 0;
+			for(uint32_t i = 0; i < pixelCount; i++) {
+				const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[i];
+				if(pi.SpriteCount & 0x01) { sprCapMain++; sprHashes.insert(pi.Sprites[0].Key.ContentHash); }
+				if(pi.SpriteCount & 0x02) { sprCapSub++; sprHashes.insert(pi.Sprites[1].Key.ContentHash); }
+			}
+			char sprBuf[192];
+			snprintf(sprBuf, sizeof(sprBuf),
+				"[SNES HD diag] SPRCAP main=%u sub=%u tiles=%u",
+				sprCapMain, sprCapSub, (uint32_t)sprHashes.size());
+			DiagLog(sprBuf);
+
+			if(!sprHashes.empty() && diagSprCapLogCount < 3) {
+				diagSprCapLogCount++;
+				std::unordered_set<uint64_t> logged;
+				for(uint32_t i = 0; i < pixelCount && logged.size() < 16; i++) {
+					const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[i];
+					for(int s = 0; s < 2; s++) {
+						if(!(pi.SpriteCount & (1 << s))) continue;
+						const SnesHdPpuTileInfo& t = pi.Sprites[s];
+						if(!logged.insert(t.Key.ContentHash).second) continue;
+						char tileBuf[192];
+						snprintf(tileBuf, sizeof(tileBuf),
+							"[SNES HD diag] SPRTILE %s hash=%016llX vram=$%04X pal=%u prio=%u hm=%d vm=%d",
+							s == 0 ? "main" : "sub",
+							(unsigned long long)t.Key.ContentHash, t.VramWordAddr,
+							t.Key.PaletteIndex, t.Priority,
+							(int)t.HorizontalMirror, (int)t.VerticalMirror);
+						DiagLog(tileBuf);
+						if(logged.size() >= 16) break;
+					}
+				}
+			}
 		}
 	}
 
