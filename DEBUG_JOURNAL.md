@@ -31,6 +31,23 @@ der BGs (Gusty-Blätter, Wind-Tiles, Wasser/Lava-Anims) als Nebenprodukt.**
 
 ---
 
+## S2 — ERGEBNIS (2026-07-19): OBJ-VRAM = WÖRTLICHE ROM-KOPIE, EXPORT-WEG FREI
+
+**Byte-Suche (Python, scratchpad s2_rom_bytesearch.py): ALLE Live-Sprite-
+Tiles sind unveränderte ROM-Bytes.** 46/46 (Gusty-Dump ∩ S1-Log), 27/27
+(Shop-Dump ∩ S1-Log), und 98/98 nicht-leere Tiles des GESAMTEN OBJ-Bereichs
+($0000-$1FFF words) des Gusty-Dumps wörtlich im ROM gefunden (Fundstellen
+tw. unaligned, z.B. $1212DD — descriptor-basiertes Streaming beliebiger
+Spans, DKC2 komprimiert Sprites NICHT).
+
+**Konsequenz für S3-S5:** Der Viewer kann Pack-Hashes DIREKT aus ROM-Bytes
+rechnen — keine VRAM-Reproduktionslogik nötig. Die Sprite-Descriptoren der
+Galerie (gfxRef) liefern die ROM-Offsets der Frame-Tiles → HD-Frame-Art in
+Zellen slicen, jede Zelle mit dem FNV des zugehörigen 32-Byte-ROM-Tiles
+keyen. Damit ist die gesamte Sprite-Pipeline entrisikiert.
+
+---
+
 ## S1.0 — TESTERGEBNIS (2026-07-19): VOLLER ERFOLG, ALLE HYPOTHESEN BESTÄTIGT
 
 **Log-Auswertung (User spielte Lockjaw/Mainbrace/Pirate, 827 SPRCAP-Frames):**
