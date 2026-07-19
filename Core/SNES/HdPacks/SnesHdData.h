@@ -436,10 +436,24 @@ public:
 	SnesHdPackTileInfo* GetMatchingTile(const SnesHdTileKey& key, const uint16_t* vram = nullptr)
 	{
 		if(UseContentHash && key.ContentHash != 0) {
+			// P4.2 strict gfxset scoping: when fingerprints are loaded, only tiles
+			// of the currently detected gfxset may match; ActiveGfxset == -1
+			// (worldmap, unknown screen, NPC shop) blocks HD lookups entirely.
+			// Cross-gfxset hash+palette coincidences painted foreign tiles into
+			// unrelated scenes (Gusty Glade's blue squares: foreign BG3 tiles
+			// ADDed via the sub-operand path, sHd=3723 with ~0% real coverage).
+			// Unscoped tiles (GfxsetIndex 0xFF) stay matchable so packs without
+			// scoping info keep working. Known accepted loss: NPC shop (sig
+			// F88DC3…, 32% match, gfx=-1) until a shop fingerprint set exists.
+			const bool strictScope = HasFingerprints();
+			if(strictScope && ActiveGfxset < 0) {
+				return nullptr;
+			}
 			auto it = TileByKey.find(key);
 			if(it != TileByKey.end()) {
 				for(SnesHdPackTileInfo* tile : it->second) {
 					if(tile->IsFullyTransparent) continue;
+					if(strictScope && tile->GfxsetIndex != 0xFF && (int16_t)tile->GfxsetIndex != ActiveGfxset) continue;
 					return tile;
 				}
 			}

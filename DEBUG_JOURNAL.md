@@ -1,6 +1,48 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-17 | Mesen Build: R6.1 bestätigt+committed (`61183ecd`) | Architektur: P4.0-Composite-Engine, Filter multithreaded (2-3 ms avg)
+Stand: 2026-07-19 | Mesen Build: P4.2 gebaut (BUILD+TEST AUSSTEHEND), R6.2 bestätigt+committed (`442d9f5f`) | Architektur: P4.0-Composite-Engine, Filter multithreaded (2-3 ms avg)
+
+---
+
+## P4.2 — Strict Gfxset-Scoping in GetMatchingTile (2026-07-19, BUILD+TEST AUSSTEHEND)
+
+**Ziel:** Cross-Gfxset-Kontamination beenden — Gusty Glades "blaue Quadrate"
+(sHd=3723 konstant bei ~0% echter Coverage: fremde BG3-Tiles matchen per
+Hash+Palette-Zufall und werden über den Sub-Operand-Pfad ADDiert).
+
+**Vorarbeit (alles bereits validiert, P4.1-Volldurchläufe):** Fingerprints
+decken alle funktionierenden Level ab (Gangplank gfx=29 99,2%, Pirate gfx=7
+100%, Lockjaw gfx=3, Mainbrace gfx=37, Lava Lagoon teilt Sig mit Lockjaw =
+gleiches Set 3, harmlos). Einziger bekannter Verlust: NPC-Shop (Sig
+F88DC3D90C8C9EF7, 32% Match, gfx=-1) — akzeptiert, später Shop-Set
+fingerprinten. DetectActiveGfxset läuft seit P4.1 einmal pro Frame VOR dem
+Render-Dispatch (Decode-Thread schreibt ActiveGfxset, Worker lesen nur →
+racefrei); der P4.1c-Lookup-Cache ist frame-lokal → Scoping pro Frame
+konstant → Cache bleibt konsistent.
+
+**Änderung (NUR SnesHdData.h, GetMatchingTile Content-Hash-Pfad + Version
+in Filter-cpp):**
+1. `strictScope = HasFingerprints()` — Packs ohne Fingerprints verhalten
+   sich exakt wie bisher.
+2. Bei `strictScope && ActiveGfxset < 0` → sofort nullptr (Worldmap,
+   unbekannter Screen, NPC-Shop: kein HD statt Falsch-HD).
+3. Im Bucket-Loop: Tiles mit `GfxsetIndex != 0xFF` und `!= ActiveGfxset`
+   werden übersprungen (ein gleicher Hash aus dem RICHTIGEN Set kann weiter
+   gewinnen); 0xFF = unscoped/legacy bleibt matchbar.
+
+**Erwartete Testergebnisse:**
+- **Gusty Glade: blaue Quadrate WEG** (sHd → ~0; Level bleibt SD bis
+  VRAM-Dump+Set-Neuaufbau — das ist der nächste Roadmap-Schritt).
+- **Worldmap: unverändert sauber** (jetzt doppelt gesichert: isWorldmap-Gate
+  + Scoping-Block; das alte Gate bleibt als Belt-and-Suspenders drin).
+- **Regression NICHT erwartet:** Lockjaw/Lava/Mainbrace/Pirate/Gangplank
+  identisch zu R6.2 (alle mit erkanntem gfx; Log: match%-Werte vergleichen).
+- **Bekannter Verlust: NPC-Shop verliert seine 32% HD-Tiles** (gfx=-1) —
+  bitte kurz reinschauen, dass er nativ SAUBER aussieht (kein Misch-Zustand).
+- Log-Version "P4.2"; CONTEXT-Zeile `gfx=` wie gehabt beobachten.
+
+**Build-Hinweis:** SnesHdData.h ist ein Header → inkrementeller Build zieht
+PPU+Filter+Loader nach (etwas länger als reine Filter-cpp-Builds).
 
 ---
 
