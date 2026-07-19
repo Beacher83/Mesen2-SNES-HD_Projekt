@@ -31,6 +31,32 @@ der BGs (Gusty-Blätter, Wind-Tiles, Wasser/Lava-Anims) als Nebenprodukt.**
 
 ---
 
+## S5a — Sprite-Capture-Recording (2026-07-19, BUILD+TEST AUSSTEHEND)
+
+**Zweck:** Der Viewer-Pack-Export braucht die ECHTEN Runtime-Palette-Slots
+pro Sprite-Tile (OBJ-Slot-Zuweisung ist Spiellogik, aus dem ROM nicht
+statisch ableitbar) + Referenzdaten zur Validierung der ROM-Ableitung.
+
+**Implementierung (NUR Filter-cpp, Version "S5a"):** Jeder Frame scannt die
+Capture-Pixel (Decode-Thread, ~0,1 ms); jedes neue (contentHash, palette)-
+Paar wird an `%USERPROFILE%\Downloads\snes_hd_spritecap.txt` ANGEHÄNGT
+(sammelt über Sessions; Consumer dedupliziert):
+`SPR <hash16> P<pal> T<64 hex Tile-Bytes> C<64 hex CGRAM-Farben>`
+Tile-Bytes aus Live-VRAM nur wenn Re-Hash == Capture-Hash (VRAM ist kein
+Frame-Snapshot); CGRAM aus dem P4.0-Snapshot (Zeile 128+pal*16).
+
+**User-Workflow:** S5a bauen (nur Filter-cpp → schneller Build), dann
+NORMAL SPIELEN — je mehr Level/Gegner/Situationen, desto vollständiger die
+(hash,pal)-Datenbank fürs Sprite-Pack. Datei wächst nur bei NEUEN Paaren.
+
+**Viewer-Seite (S5b-1, GEBAUT, siehe Viewer-CHANGELOG):** Sprite-Export-
+Manifest v2 trägt pro Frame `tiles: [{x,y,hash}]` — Frame→Tile-Mapping fürs
+Slicing. **AUSSTEHEND (S5b-2):** exportAsTexturePack-Sektion, die upscaled
+Sprite-Frames anhand der tiles[] in `sprites/{hash16}_P{pal}.png` schneidet
+(Pal-Slots aus spritecap.txt; Ingestion-UI im Viewer nötig).
+
+---
+
 ## S3+S4 — TESTERGEBNIS (2026-07-19): BESTÄTIGT — ERSTE HD-SPRITES GERENDERT
 
 **User-Test mit Graustufen-Testpack:** Diddy/Dixie-Köpfe auf der WORLDMAP

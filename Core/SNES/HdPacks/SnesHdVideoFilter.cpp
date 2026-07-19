@@ -16,7 +16,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S4.0"
+#define SNES_HD_BUILD_VERSION "S5a"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -1502,6 +1502,70 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 			}
 		}
+	}
+
+	// =====================================================================
+	// S5a: sprite capture recording. Every distinct (contentHash, palette)
+	// pair seen on screen is appended to snes_hd_spritecap.txt together
+	// with the tile's 32 VRAM bytes and the OBJ palette's 16 CGRAM colors.
+	// This is the ground truth the viewer's sprite pack export consumes:
+	// which palette SLOT each tile really uses at runtime + reference data
+	// to verify ROM-derived art. Runs every frame (~0.1 ms decode-thread
+	// scan); dedup per session via in-memory set, consumers dedup across
+	// sessions. VRAM is live (not a frame snapshot), so entries are only
+	// recorded when the tile bytes still hash to the captured value — a
+	// tile replaced by OBJ streaming mid-frame is recorded on a later one.
+	// =====================================================================
+	if(hdScreen->Vram) {
+		static std::unordered_set<uint64_t> s_spriteCapSeen;
+		static FILE* s_spriteCapFile = nullptr;
+		static bool s_spriteCapAttempted = false;
+		constexpr uint32_t sprCapPixels = (uint32_t)SnesHdScreenInfo::ScreenPixelCount;
+		for(uint32_t i = 0; i < sprCapPixels; i++) {
+			const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[i];
+			if(!pi.SpriteCount) continue;
+			for(int s = 0; s < 2; s++) {
+				if(!(pi.SpriteCount & (1 << s))) continue;
+				const SnesHdPpuTileInfo& t = pi.Sprites[s];
+				if(t.Key.ContentHash == 0) continue;
+				uint64_t setKey = t.Key.ContentHash ^ ((uint64_t)t.Key.PaletteIndex * 0x9E3779B97F4A7C15ULL);
+				if(s_spriteCapSeen.find(setKey) != s_spriteCapSeen.end()) continue;
+				uint64_t liveHash = ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, 16);
+				if(liveHash != t.Key.ContentHash) continue;
+
+				if(!s_spriteCapAttempted) {
+					s_spriteCapAttempted = true;
+					const char* home = getenv("USERPROFILE");
+					if(!home) home = getenv("HOME");
+					if(home) {
+						char path[512];
+#ifdef _WIN32
+						snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_spritecap.txt", home);
+#else
+						snprintf(path, sizeof(path), "%s/Downloads/snes_hd_spritecap.txt", home);
+#endif
+						s_spriteCapFile = fopen(path, "a");  // append across sessions
+					}
+				}
+				if(!s_spriteCapFile) break;
+				s_spriteCapSeen.insert(setKey);
+
+				char line[320];
+				int off = snprintf(line, sizeof(line), "SPR %016llX P%d T",
+					(unsigned long long)t.Key.ContentHash, t.Key.PaletteIndex);
+				const uint8_t* tileBytes = reinterpret_cast<const uint8_t*>(hdScreen->Vram + t.VramWordAddr);
+				for(int b = 0; b < 32; b++) {
+					off += snprintf(line + off, sizeof(line) - off, "%02X", tileBytes[b]);
+				}
+				off += snprintf(line + off, sizeof(line) - off, " C");
+				for(int c = 0; c < 16; c++) {
+					off += snprintf(line + off, sizeof(line) - off, "%04X",
+						hdScreen->Cgram[128 + t.Key.PaletteIndex * 16 + c] & 0x7FFF);
+				}
+				fprintf(s_spriteCapFile, "%s\n", line);
+			}
+		}
+		if(s_spriteCapFile) fflush(s_spriteCapFile);
 	}
 
 	// =====================================================================
