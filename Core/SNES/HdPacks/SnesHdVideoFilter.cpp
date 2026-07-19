@@ -16,7 +16,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S5a"
+#define SNES_HD_BUILD_VERSION "S6a"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -1566,6 +1566,87 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 		}
 		if(s_spriteCapFile) fflush(s_spriteCapFile);
+	}
+
+	// =====================================================================
+	// S6a: BG miss recording — the data source for hash-keyed BG animation
+	// tiles (and a coverage-gap map as a byproduct). Every DISTINCT
+	// (hash, palette, layer) whose lookup would MISS the pack is appended
+	// to snes_hd_bgcap.txt with its VRAM bytes and CGRAM colors. CHR-DMA
+	// animation frames (Gusty wind foliage, water/lava cycles, flags) are
+	// exactly such misses at addresses whose base tile IS covered — the
+	// viewer derives per-frame art from the recorded bytes, upscales it and
+	// exports it hash-keyed, so the runtime hash matching animates the art
+	// with zero timing logic (same principle as sprites).
+	// Cost: sampling every 8th pixel in x AND y still visits every 8x8
+	// tile at least once (pigeonhole) → ~900 probes/frame, decode thread.
+	// Only recorded while a gfxset is detected (skips menus/transitions).
+	// =====================================================================
+	if(hdScreen->Vram && _hdData->ActiveGfxset >= 0) {
+		static std::unordered_set<uint64_t> s_bgCapSeen;
+		static FILE* s_bgCapFile = nullptr;
+		static bool s_bgCapAttempted = false;
+		for(uint32_t sy = overscan.Top; sy < (uint32_t)(239 - overscan.Bottom); sy += 8) {
+			for(uint32_t sx = 0; sx < 256; sx += 8) {
+				const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[sy * SnesHdScreenInfo::ScreenWidth + sx];
+				if(pi.BgLayerMask == 0) continue;
+				for(int layer = 0; layer < 4; layer++) {
+					if(!(pi.BgLayerMask & (1 << layer))) continue;
+					const SnesHdPpuTileInfo& t = pi.BgTiles[layer];
+					if(t.Key.ContentHash == 0) continue;
+					uint64_t seenKey = t.Key.ContentHash
+						^ ((uint64_t)t.Key.PaletteIndex * 0x9E3779B97F4A7C15ULL)
+						^ ((uint64_t)layer * 0xC2B2AE3D27D4EB4FULL);
+					if(s_bgCapSeen.find(seenKey) != s_bgCapSeen.end()) continue;
+					s_bgCapSeen.insert(seenKey);
+					if(_hdData->TileByKey.find(t.Key) != _hdData->TileByKey.end()) continue;  // covered
+
+					// Verify live VRAM still matches the captured hash (2bpp
+					// layers hash 8 words, 4bpp 16 words — same as the PPU)
+					const uint16_t words = (layer <= 1) ? 16 : 8;
+					if(ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, words) != t.Key.ContentHash) {
+						s_bgCapSeen.erase(seenKey);  // retry on a later frame
+						continue;
+					}
+
+					if(!s_bgCapAttempted) {
+						s_bgCapAttempted = true;
+						const char* home = getenv("USERPROFILE");
+						if(!home) home = getenv("HOME");
+						if(home) {
+							char path[512];
+#ifdef _WIN32
+							snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_bgcap.txt", home);
+#else
+							snprintf(path, sizeof(path), "%s/Downloads/snes_hd_bgcap.txt", home);
+#endif
+							s_bgCapFile = fopen(path, "a");  // append across sessions
+						}
+					}
+					if(!s_bgCapFile) break;
+
+					char line[320];
+					int off = snprintf(line, sizeof(line), "BGA G%d L%d P%d A%04X H%016llX T",
+						(int)_hdData->ActiveGfxset, layer, t.Key.PaletteIndex, t.VramWordAddr,
+						(unsigned long long)t.Key.ContentHash);
+					const uint8_t* tileBytes = reinterpret_cast<const uint8_t*>(hdScreen->Vram + t.VramWordAddr);
+					for(int b = 0; b < words * 2; b++) {
+						off += snprintf(line + off, sizeof(line) - off, "%02X", tileBytes[b]);
+					}
+					off += snprintf(line + off, sizeof(line) - off, " C");
+					// CGRAM colors of the palette row: 4bpp = 16 colors at pal*16,
+					// 2bpp (BG3 in mode 1) = 4 colors at pal*4
+					const int colBase = (layer <= 1) ? t.Key.PaletteIndex * 16 : t.Key.PaletteIndex * 4;
+					const int colCount = (layer <= 1) ? 16 : 4;
+					for(int c = 0; c < colCount; c++) {
+						off += snprintf(line + off, sizeof(line) - off, "%04X",
+							hdScreen->Cgram[colBase + c] & 0x7FFF);
+					}
+					fprintf(s_bgCapFile, "%s\n", line);
+				}
+			}
+		}
+		if(s_bgCapFile) fflush(s_bgCapFile);
 	}
 
 	// =====================================================================

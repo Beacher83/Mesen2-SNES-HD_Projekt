@@ -31,6 +31,38 @@ der BGs (Gusty-Blätter, Wind-Tiles, Wasser/Lava-Anims) als Nebenprodukt.**
 
 ---
 
+## S6a — BG-Miss-Recording für CHR-Anim-Tiles (2026-07-19, BUILD+TEST AUSSTEHEND)
+
+**Ziel (S6):** CHR-DMA-Animationen (Gusty-Wind-Blätter, Wasser/Lava-Zyklen,
+Piratenflagge) über dasselbe hash-adressierte Prinzip wie Sprites lösen:
+Art pro Animationsframe, Hash-Matching animiert automatisch. Mesens
+BG-MATCHING ist bereits hash-basiert und adressunabhängig — es fehlen nur
+(a) Art pro Frame und (b) ein Ladeweg für mehrere Hashes pro Adresse.
+
+**S6a (NUR Filter-cpp, Version "S6a"):** Statt ROM-Anim-Tabellen zu
+reversen: Runtime-Recording ALLER distinkten BG-Lookup-MISSES nach
+`Downloads\snes_hd_bgcap.txt` (append über Sessions):
+`BGA G<gfxset> L<layer> P<pal> A<addr4> H<hash16> T<tilebytes hex>
+C<cgram hex>` — 4bpp (L0/1): 32 Bytes+16 Farben, 2bpp (L2/3): 16 Bytes+
+4 Farben. Sampling jedes 8. Pixel in x UND y trifft jedes 8x8-Tile
+mindestens einmal (Schubfachprinzip) → ~900 Proben/Frame, Decode-Thread,
+~vernachlässigbar. Nur bei erkanntem Gfxset (keine Menü-Junk-Daten).
+Re-Hash-Verifikation gegen Live-VRAM (bei Mismatch: retry später).
+Nebenprodukt: vollständige Coverage-Lücken-Karte (alle fehlenden Tiles,
+nicht nur Anims).
+
+**AUSSTEHEND (S6b, Viewer):** bgcap-Ingestion; Anim-Frame-Erkennung
+(Miss an Adresse deren Basis-Tile im Pack ist); SD-Export der Anim-Tiles
+(decodiert aus recorded Bytes+CGRAM, Padding aus Basis-Tile-Kontext) →
+Upscale → hash-keyed Export `h{hash16}_P{pal}.png` in bg/bgN/gfxset_XX/
++ Loader-Erweiterung (Hash-im-Dateinamen für BG analog Sprites).
+
+**User-Test S6a:** bauen (nur Filter-cpp), Gusty+Lockjaw+Lava spielen
+(windige/animierte Stellen!), bgcap-Datei schicken. Erwartung: BGA-Zeilen
+mit G29/L0-Einträgen im $7010-$7110-Bereich (Wind-Tiles) u.v.m.
+
+---
+
 ## S5 — ABGESCHLOSSEN (2026-07-19): ERSTE ECHTE HD-SPRITES IM SPIEL
 
 **User-bestätigt: Diddy Idle/Walk/Run laufen in HD.** Kompletter Durchstich
