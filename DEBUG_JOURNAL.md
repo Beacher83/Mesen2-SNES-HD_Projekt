@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-19 | Mesen Build: S1.0 gebaut (BUILD+TEST AUSSTEHEND), P4.2 bestätigt+committed (`11cd0744`) | Architektur: P4.0-Composite-Engine, Filter multithreaded (2-3 ms avg)
+Stand: 2026-07-19 | Mesen Build: S6a bestätigt+committed (`ab83dfde`) — HD-Sprite-Pipeline S1-S5 KOMPLETT (Diddy läuft in HD), BG-Anim-Recording aktiv | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites, Filter multithreaded (~2 ms avg) | Nächstes: S6b (Viewer: bgcap→Anim-Tiles-Export)
 
 ---
 
