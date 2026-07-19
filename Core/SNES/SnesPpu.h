@@ -125,10 +125,10 @@ private:
 	{
 		uint64_t ContentHash = 0;
 		uint16_t TileVramAddr = 0;  // word address of the 8x8 OBJ tile
-		uint8_t OffsetX = 0;        // native column 0-7 (mirror already resolved)
-		uint8_t OffsetY = 0;        // native row 0-7 (mirror already resolved)
+		uint8_t OffsetX = 0;        // SCREEN-SPACE column 0-7 within the tile (mirror NOT applied —
+		uint8_t OffsetY = 0;        //   the filter's HdTileSampler applies it, same as BG tiles)
 		uint8_t Palette = 0;        // OBJ palette 0-7 (CGRAM row = 8 + palette)
-		bool HMirror = false;       // subpixel orientation for HD sampling
+		bool HMirror = false;
 		bool VMirror = false;
 	};
 	HdSpritePixel _hdSpritePixels[256] = {};

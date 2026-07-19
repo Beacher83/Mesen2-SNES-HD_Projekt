@@ -31,6 +31,60 @@ der BGs (Gusty-Blätter, Wind-Tiles, Wasser/Lava-Anims) als Nebenprodukt.**
 
 ---
 
+## S3+S4 — TESTERGEBNIS (2026-07-19): BESTÄTIGT — ERSTE HD-SPRITES GERENDERT
+
+**User-Test mit Graustufen-Testpack:** Diddy/Dixie-Köpfe auf der WORLDMAP
+grau (Sprite-HD läuft dort — kein Gate, wie designt), Bananen in den Leveln
+grau (Collectible-Sprites, Tiles lagen in der Dump-Schnittmenge). Keine
+Formfehler gemeldet → Offset/Mirror-Konvention korrekt. Log: sprHd>0 in
+109/151 Frames, max sprHd=1054, Worldmap konstant 431; Loader lud 63/63;
+Perf 1,5-1,9 ms (unverändert). **Damit ist die gesamte Mesen-Seite der
+Sprite-Pipeline funktionsfähig — es fehlt nur noch echte Art (S5).**
+
+---
+
+## S3+S4 (S4.0) — Sprite-Loader + Sprite-Renderpfad (2026-07-19, BESTÄTIGT — s.o.)
+
+**S3 — Pack-Format + Loader:**
+- Format: `sprites/{16-hex-FNV-Hash}_P{pal}.png` (32×32 = 4× vom 8×8-OBJ-
+  Tile). Hash IM Dateinamen = keine hashes.bin-Indirektion nötig (OBJ-Tiles
+  wandern zur Laufzeit zwischen VRAM-Adressen — Adress-Naming unmöglich).
+- Loader: `ParseSpriteFilename()` + Sprite-Zweig in LoadTilesFromDirectory
+  (Key.ContentHash direkt, LayerIndex=4, GfxsetIndex=0xFF). Benötigt
+  Content-Hash-Modus (hashes.bin vorhanden — bei unseren Packs immer).
+- `GetMatchingTile`: **Sprites (LayerIndex 4) sind vom P4.2-Scoping
+  AUSGENOMMEN** (strictScope && LayerIndex != 4) — Charaktere existieren
+  überall (auch gfx=-1-Screens/Worldmap); Hash-Match ist exakt.
+
+**S4 — Renderpfad (Filter):**
+- Neuer Zweig nach dem BG-Block: `spriteWon && (SpriteCount & 1)` →
+  Lookup Sprites[0].Key; Treffer wird als Main-Winner in den BESTEHENDEN
+  P4.0-Renderpfad eingespeist (HD-Sprite-Texel über nativer Pre-Math-Farbe
+  = der Sprite-Farbe selbst — korrekte Basis für semi-transparente Kanten;
+  Color Math + Brightness laufen unverändert → Unterwasser-ADD exakt).
+  KEIN Worldmap-Gate für Sprites.
+- **Konventions-Fix aus S1:** Sprite-Capture speichert jetzt SCREEN-SPACE-
+  Offsets (OffsetX=Slice-Spalte, OffsetY=yGap&7) + Mirror-Flags — exakt die
+  BG-Konvention, HdTileSampler funktioniert unverändert (vorher native
+  Koordinaten → Sampler hätte doppelt gespiegelt).
+- R3-Palette-LUT für Sprites DEAKTIVIERT (LUTs decken BG-CGRAM 0-127;
+  OBJ-Paletten liegen bei 128-255 — später eigene OBJ-Referenzpaletten).
+- Neuer FRAME-Counter `sprHd=` (Sprite-Pixel über HD-Pfad gerendert).
+  Version "S4.0".
+
+**TEST-PACK GENERIERT (scratchpad gen_test_sprite_pack.py):** 63 GRAUSTUFEN-
+PNGs (4× nearest, Index→Grau) für die (hash,pal)-Paare aus dem S1-Log deren
+Bytes in den VRAM-Dumps liegen → direkt in HdPacks\...\sprites\ geschrieben.
+**Erwartung im Test: Diddy/Dixie-Pixel werden bei gematchten Animations-
+frames GRAU (pixel-perfekt geformt, auch gespiegelt) und flackern zwischen
+grau (Test-Art vorhanden) und farbig (Frame ohne Test-Art) — das Flackern
+ist ERWARTET, die Test-Art deckt nur die 63 gesampelten Tiles ab.**
+Formfehler/versetzte Pixel = Offset/Mirror-Bug; gar kein Grau = Loader/
+Matching-Problem (Mesen-Log: "[SNES HD Pack] ... layer 4: loaded 63/63").
+Aufräumen: sprites\-Ordner löschen.
+
+---
+
 ## S2 — ERGEBNIS (2026-07-19): OBJ-VRAM = WÖRTLICHE ROM-KOPIE, EXPORT-WEG FREI
 
 **Byte-Suche (Python, scratchpad s2_rom_bytesearch.py): ALLE Live-Sprite-

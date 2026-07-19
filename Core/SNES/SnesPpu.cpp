@@ -760,8 +760,10 @@ void SnesPpu::FetchSpriteAttributes(uint16_t oamAddress)
 
 	// HD sprites (S1): remember the OBJ tile identity for the pixel capture
 	// in FetchSpriteTile (FetchAddress mutates during the fetch cycles).
+	// TileRowOffset is the SCREEN-SPACE row within the tile (same convention
+	// as the BG capture: mirror is applied by the filter's HdTileSampler).
 	_currentSprite.TileVramAddr = tileStart & 0x7FFF;
-	_currentSprite.TileRowOffset = yOffset;
+	_currentSprite.TileRowOffset = (uint8_t)(yGap & 0x07);
 	_currentSprite.VerticalMirror = verticalMirror;
 
 	int16_t x = _currentSprite.X == -256 ? 0 : _currentSprite.X;
@@ -809,10 +811,13 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 				_spritePriorityCopy[xPos + x] = _currentSprite.Priority;
 				_spritePaletteCopy[xPos + x] = _currentSprite.Palette;
 				if(hdCapture) {
+					// SCREEN-SPACE offsets (x = column within the displayed slice,
+					// TileRowOffset = displayed row) — HdTileSampler applies the
+					// mirror flags itself, exactly like the BG tile convention.
 					HdSpritePixel& sp = _hdSpritePixelsCopy[xPos + x];
 					sp.ContentHash = hdHash;
 					sp.TileVramAddr = _currentSprite.TileVramAddr;
-					sp.OffsetX = xOffset;
+					sp.OffsetX = (uint8_t)x;
 					sp.OffsetY = _currentSprite.TileRowOffset;
 					sp.Palette = _currentSprite.Palette;
 					sp.HMirror = _currentSprite.HorizontalMirror;

@@ -150,9 +150,9 @@ struct SnesHdPpuPixelInfo
 	// S1: OBJ tile identity of the composited sprite pixel, captured in
 	// RenderSprites from the fetch-time line buffer. Sprites[0] = tile that
 	// won the MAIN screen, Sprites[1] = tile that won the SUB screen.
-	// OffsetX/OffsetY are NATIVE tile coordinates (mirror already resolved);
-	// HorizontalMirror/VerticalMirror define the subpixel orientation for HD
-	// sampling. LayerIndex = 4. NOTE: sprites render before the tilemaps —
+	// OffsetX/OffsetY are SCREEN-SPACE tile coordinates with mirror flags set
+	// — the same convention as BgTiles, so HdTileSampler works unchanged.
+	// LayerIndex = 4. NOTE: sprites render before the tilemaps —
 	// check the final winner (IsSpritePixel / SubScreenHasSprite) before use.
 	SnesHdPpuTileInfo Sprites[4] = {};
 	uint8_t SpriteCount = 0;             // Validity bitmask: bit0 = Sprites[0], bit1 = Sprites[1]
@@ -452,7 +452,9 @@ public:
 			// Unscoped tiles (GfxsetIndex 0xFF) stay matchable so packs without
 			// scoping info keep working. Known accepted loss: NPC shop (sig
 			// F88DC3…, 32% match, gfx=-1) until a shop fingerprint set exists.
-			const bool strictScope = HasFingerprints();
+			// S3: sprites (LayerIndex 4) are exempt — characters exist across
+			// all levels/worldmap; their hash-keyed art is inherently exact.
+			const bool strictScope = HasFingerprints() && key.LayerIndex != 4;
 			if(strictScope && ActiveGfxset < 0) {
 				return nullptr;
 			}

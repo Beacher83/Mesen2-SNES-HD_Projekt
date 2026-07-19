@@ -16,7 +16,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S1.0"
+#define SNES_HD_BUILD_VERSION "S4.0"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -367,6 +367,7 @@ struct HdFilterFrameStats
 	uint32_t MainNatHd = 0;     // P4.0: native main color + HD sub operand (overlay case)
 	uint32_t SprSub = 0;        // P4.1e: sprite is the final sub-screen winner
 	uint32_t SprSubMainHd = 0;  // P4.1e: of those, pixels with a main-winner HD match
+	uint32_t SprHd = 0;         // S4: sprite-won pixels rendered via an HD sprite tile
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -386,6 +387,7 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.MainNatHd += src.MainNatHd;
 	dst.SprSub += src.SprSub;
 	dst.SprSubMainHd += src.SprSubMainHd;
+	dst.SprHd += src.SprHd;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -838,6 +840,26 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			}
 
 			// =============================================================
+			// S4: HD sprites — a sprite won the MAIN screen. Look up its
+			// hash-keyed HD tile (LayerIndex 4; exempt from gfxset scoping
+			// and the worldmap gate — hash matches are exact, characters
+			// exist everywhere). The shared rendering path below treats it
+			// as the main winner: HD sprite texels compose over the native
+			// pre-math color (which IS the sprite's own color, the correct
+			// base for semi-transparent HD edges), then color math and
+			// brightness run unchanged (underwater ADD etc. stay exact).
+			// =============================================================
+			if(spriteWon && (pixelInfo.SpriteCount & 0x01)) {
+				cmActive = (pixelInfo.MainScreenFlags & 0x80) != 0;
+				hdTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.Sprites[0].Key);
+				if(hdTile) {
+					hdTileInfo = &pixelInfo.Sprites[0];
+					st.SprHd++;
+					if(cmActive) st.HdCm++;
+				}
+			}
+
+			// =============================================================
 			// Rendering (P4.0): reproduce the PPU composite at HD resolution
 			//
 			//   main = HD(top) over HD(bottom) over native pre-math color
@@ -893,7 +915,10 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					if(botSampler.valid && palRowActive[hdTileInfoBot->Key.PaletteIndex & 7]) {
 						botLut = palLut[hdTileInfoBot->Key.PaletteIndex & 7];
 					}
-					if(mainSampler.valid && palRowActive[hdTileInfo->Key.PaletteIndex & 7]) {
+					// S4: no LUT for sprites — the R3 transform covers BG CGRAM rows
+					// 0-7 (entries 0-127) only; OBJ palettes live at CGRAM 128-255.
+					if(mainSampler.valid && hdTileInfo->Key.LayerIndex != 4
+						&& palRowActive[hdTileInfo->Key.PaletteIndex & 7]) {
 						mainLut = palLut[hdTileInfo->Key.PaletteIndex & 7];
 					}
 					if(subSampler.valid && palRowActive[subTileInfo->Key.PaletteIndex & 7]) {
@@ -1317,6 +1342,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameMainNatHd = total.MainNatHd;
 	uint32_t frameSprSub = total.SprSub;
 	uint32_t frameSprSubMainHd = total.SprSubMainHd;
+	uint32_t frameSprHd = total.SprHd;
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
@@ -1394,7 +1420,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
-			" sprWon=%u sprSub=%u sprSubHd=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
+			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
@@ -1403,7 +1429,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			diagFrameCount, diagBgFrameCount, ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch,
 			frameHdMiss, frameHdCm, frameMainNatHd, frameSubOpHd, frameSubOpFixed, frameLayerRetry, frameMultiLayer,
-			frameSpriteWon, frameSprSub, frameSprSubMainHd, frameMaskZero, frameHdmaSplit,
+			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],

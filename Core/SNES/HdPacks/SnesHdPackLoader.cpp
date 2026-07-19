@@ -293,8 +293,17 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 
 		uint16_t vramAddr = 0;
 		uint8_t paletteIndex = 0;
+		uint64_t spriteHash = 0;
 
-		if(!ParseTileFilename(filename, vramAddr, paletteIndex)) {
+		// S3: sprite tiles are hash-keyed directly in the filename
+		// ("{16-hex-FNV}_P{pal}.png") — OBJ tiles are streamed to varying
+		// VRAM addresses at runtime, so address-based naming cannot work.
+		if(isSprite) {
+			if(!ParseSpriteFilename(filename, spriteHash, paletteIndex)) {
+				MessageManager::Log("[SNES HD Pack] Skipping invalid sprite filename: " + filename);
+				continue;
+			}
+		} else if(!ParseTileFilename(filename, vramAddr, paletteIndex)) {
 			MessageManager::Log("[SNES HD Pack] Skipping invalid filename: " + filename);
 			continue;
 		}
@@ -322,7 +331,11 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		tile->Key.LayerIndex = layerIndex;
 
 		// Assign tile identity based on lookup mode
-		if(_useContentHash && gfxsetIndex != 0xFF) {
+		if(isSprite) {
+			// S3: hash from the filename. Requires content-hash mode at runtime
+			// (the sprite key carries ContentHash; packs always ship hashes.bin).
+			tile->Key.ContentHash = spriteHash;
+		} else if(_useContentHash && gfxsetIndex != 0xFF) {
 			// Content hash mode: look up hash from hashes.bin
 			uint32_t hashKey = ((uint32_t)gfxsetIndex << 24) | ((uint32_t)layerIndex << 16) | vramAddr;
 			auto hashIt = _hashMap.find(hashKey);
@@ -396,6 +409,41 @@ bool SnesHdPackLoader::LoadPngFile(const string& filePath, SnesHdBitmapInfo& bit
 		return true;
 	}
 	return false;
+}
+
+bool SnesHdPackLoader::ParseSpriteFilename(const string& filename, uint64_t& contentHash, uint8_t& paletteIndex)
+{
+	// S3 sprite format: "{16 hex chars}_P{decPalette}" (without extension)
+	// Example: "9A4ED6AC608A1BCD_P5" → contentHash=0x9A4ED6AC608A1BCD, palette=5
+	size_t underscorePos = filename.find('_');
+	if(underscorePos != 16) {
+		return false;
+	}
+
+	string hashStr = filename.substr(0, 16);
+	try {
+		contentHash = std::stoull(hashStr, nullptr, 16);
+	} catch(...) {
+		return false;
+	}
+	if(contentHash == 0) {
+		return false;  // 0 is the "no hash" sentinel in SnesHdTileKey
+	}
+
+	string palStr = filename.substr(underscorePos + 1);
+	if(palStr.empty() || (palStr[0] != 'P' && palStr[0] != 'p')) {
+		return false;
+	}
+	try {
+		unsigned long pal = std::stoul(palStr.substr(1), nullptr, 10);
+		if(pal > 7) {
+			return false;
+		}
+		paletteIndex = (uint8_t)pal;
+	} catch(...) {
+		return false;
+	}
+	return true;
 }
 
 bool SnesHdPackLoader::ParseTileFilename(const string& filename, uint16_t& vramAddr, uint8_t& paletteIndex)
