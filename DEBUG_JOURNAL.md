@@ -1,6 +1,6 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-20 | Mesen Build: S7 GETESTET+GUT (Sub-Screen-HD-Sprites für Overlay-Level, Mainbrace/Rambi Diddy HD, keine Lockjaw-Regression) — committen offen; S6a committed (`ab83dfde`) | OFFEN als KNOWN ISSUE (s.u.): Sprite-Flimmern bei Kong-Überlagerung unter Wasser (partiell, Bug-Verdacht, zurückgestellt) | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites, Filter multithreaded (~2 ms avg) | Nächstes Update: Sprite-Miss-Recorder + Known-Issue nachschärfen; parallel S6b (Viewer: bgcap→Anim-Tiles-Export)
+Stand: 2026-07-20 | Mesen Build: S7 COMMITTED+GEPUSHT (`8280cd71`) | S8+S9+S10 GEBAUT (UNCOMMITTED, Build „S10"): S8 Sprite-MISS-Recorder, S9 Window-SD-Sensor (hat den Bug gefunden), **S10 FIX** für den KNOWN ISSUE | KNOWN ISSUE GELÖST (Test ausstehend): Lockjaw Charakter-SD vor Fensteröffnungen = `BgLayerMask==0`-Loch → S7-Pfad (im BG-Block gated) übersprungen; S9 bewies `reason=mask0` 135/135; S10 behandelt Sub-Sprite über BG-Loch separat | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites, Filter multithreaded (~2 ms avg) | Nächstes: S10-Test (Lockjaw-Fenster: Charakter HD? keine `S9-SD`-Zeilen mehr?), dann S8+S9+S10 committen
 
 ---
 
@@ -45,10 +45,87 @@ Rest-Phänomen offen → siehe KNOWN ISSUE unten. S7 gilt als gut/committen.
 
 ---
 
-## KNOWN ISSUE (zu beobachten, S7-Rest) — SPRITE-FLIMMERN BEI ÜBERLAGERUNG UNTER WASSER
+## KNOWN ISSUE (S7-Rest) — SPRITE-SD BEI FENSTER-ÜBERLAGERUNG UNTER WASSER
 
-**Status: OFFEN, bewusst zurückgestellt (User-Wunsch: aufschreiben, später
-nachschärfen). NICHT vergessen.**
+**Status: GELÖST durch S10 (2026-07-20, Test ausstehend).** S9-Sensor ergab
+`reason=mask0` bei ALLEN 135 Treffern → die Fensteröffnungen sind BG-LÖCHER
+(`BgLayerMask==0`, nur Backdrop auf Main, Charakter = Sub-Operand). Der
+S7-Sub-Sprite-HD-Pfad wohnt im BG-Block, der auf `BgLayerMask != 0` gated ist →
+über dem Loch nie ausgeführt → nativ SD. Fix S10 (s.u.) behandelt genau diesen
+Fall. Zwei-Slot-Hypothese war falsch (S8: 0 `O1`), Coverage-Hypothese (a) war
+falsch (User: gepackte Tiles verschwinden positionsabhängig — unmöglich bei
+Coverage). Beweiskette lückenlos.
+
+---
+
+## S10 — FIX: SUB-SPRITE ÜBER BG-LOCH (2026-07-20, UNCOMMITTED, nur SnesHdVideoFilter.cpp)
+
+**Root Cause (S9-bewiesen):** `S9-SD reason=mask0` an x≈111-115 y≈131-137,
+`sprWon=0 subSpr=1 CM=1 addSub=1 Main=$04 Sub=$13`. Der große BG-Block
+(`if(BgLayerMask != 0 && !spriteWon && !isWorldmap)`) enthält den S7-Sub-Sprite-
+HD-Operanden-Pfad. Wo der Hintergrund kein Tile hat (Lockjaw-Bullaugen: nur
+Backdrop auf Main, Charakter per Color-Math-ADD auf Sub), ist `BgLayerMask==0` →
+Block+S7 übersprungen → Charakter nativ.
+
+**Fix:** Separater, eng begrenzter Zweig direkt NACH dem BG-Block (vor S4): wenn
+`BgLayerMask==0 && !spriteWon && !isWorldmap && SubScreenHasSprite &&
+!SubScreenEmpty && (MainScreenFlags&0x80) && (SpriteCount&0x02) &&
+ColorMathAddSubscreen` → `Sprites[1]` HD-nachschlagen; gefunden → `subTile`/
+`subTileInfo` setzen, `cmActive=true` → das bestehende Rendering macht
+„nativer Backdrop-Main + HD-Sprite-Operand", identisch zu S7. Kein
+funktionierender Pfad wird angefasst; `subSprHdFired=true` (S9 loggt den Pixel
+dann nicht mehr). Version „S10". Kein Header → inkrementeller Build.
+
+**TEST (User):** Lockjaw, Kongs VOR die Fensteröffnungen schwimmen — Charakter
+jetzt durchgehend HD (kein SD-Umschlagen mehr am Fenster)? Kontrolle im
+`snes_hd_diag.txt`: KEINE `S9-SD reason=mask0`-Zeilen mehr (der Fix setzt
+subSprHdFired). Regression-Check: Mainbrace/Rambi weiterhin HD, normale Level
+unverändert, Perf `ms=` gleich. Bei Erfolg: S8+S9+S10 als Paket committen.
+
+---
+
+**S8-BEFUNDE (spritemiss.txt-Analyse):**
+- **`O1` (Zwei-Slot-Überlagerung) trat NIE auf** (0 von 8473 Einträgen) →
+  der ursprüngliche Hauptverdacht (main/sub capturen verschiedene Tiles) ist
+  WIDERLEGT.
+- **Kein gemisster Hash ist unter anderer Palette gepackt** (0 Paletten-
+  Varianten) → keine Paletten-Ursache.
+- **Kein Hash wird NUR auf Main gemisst** (alle 1435 Main-Miss-Hashes ⊆ der
+  3042 Sub-Miss-Hashes). Da Main- und Sub-Pfad denselben Key `(hash,pal,L4)`
+  nutzen, matchen sie für dieselbe Kachel IDENTISCH — SD kann also nicht durch
+  Main/Sub-Routing einer GEPACKTEN Kachel entstehen, nur durch UNGEPACKTE.
+- **7161 Lockjaw-Misses sind überwiegend Gegner/Fässer/Objekte** (User: bisher
+  nur Diddy/Dixie angefangen zu upscalen) — normale Rollout-Lücke, erwartetes SD.
+- SD-Anteil Sub-Sprites median ~22 % (median 354 Pixel/Frame) — davon ist der
+  Löwenanteil Nicht-Charakter-Sprites.
+
+**VERBLEIBENDE FRAGE (User-Beobachtung, sehr spezifisch):** Diddy/Dixie fallen
+NUR dann auf SD, wenn sie sich im Vordergrund auf gleicher HÖHE mit den
+FENSTERÖFFNUNGEN der Schiffswand überlagern (nicht bei bloßer Charakter-
+Überlagerung, nicht über der Wand). Logisch folgt aus dem Key-Argument: die
+betroffenen Kacheln sind an DER Stelle schlicht (noch) nicht gepackt — die
+Frage ist nur, WARUM sie ausgerechnet über dem Fenster sichtbar SD werden.
+Zwei Möglichkeiten, noch nicht getrennt:
+  (a) **Unvollständige Charakter-Coverage** — die betroffenen Körperteil-Tiles
+      (Beine / obere Kopfhälfte, je nach Höhe) sind einfach noch nicht upgescalt;
+      das Fenster macht sie nur sichtbar. → löst sich beim Fertig-Upscalen.
+  (b) **Echter Routing-Bug** an der Fenster-BG-Konstellation (falls dieselbe
+      Kachel woanders HD ist). Nur DANN Bug.
+
+**USER-WIDERSPRUCH zu (a) (2026-07-20, überzeugend):** Unter Wasser laufen
+DURCHGEHEND dieselben Schwimmanimationen; der Charakter ist VOR und NACH der
+Fensterposition HD sichtbar — nur GENAU vor dem Fenster geht HD verloren.
+Dieselben (gepackten) Tiles können nicht positionsabhängig verschwinden, wenn
+es Coverage wäre. → Damit ist (a) praktisch ausgeschlossen, es bleibt **(b) ein
+echter Routing-Bug**. Das widerlegt zugleich das „gleicher Key ⇒ gleicher
+Match"-Argument: es MUSS einen Pfad geben, in dem ein GEPACKTER Sub-Sprite
+trotzdem nicht als HD gerendert wird.
+
+**S9 GEBAUT (Diagnose, s.u.):** positions-aware Sensor, der genau diesen Fall
+fängt — Sub-Sprite vorhanden UND im Pack, aber NICHT HD gerendert → loggt x/y +
+den Grund (welches Gate den HD-Pfad blockiert). Klärt (b) endgültig.
+
+**HISTORIE / URSPRÜNGLICHE VERMUTUNGEN (überholt):**
 
 **Symptom (User, Lockjaw's Locker, nur unter Wasser/beim Schwimmen):** Wenn
 sich die ZWEI Kongs (teilweise) überlagern, flackern SD-Sprite-Teile auf —
@@ -91,7 +168,69 @@ konsistent. Stage-2 (`hdCaptureSprite`, ~1078) kopiert dasselbe
 mit ins nächste Update nehmen — distinkte NICHT gematchte Sprite-(hash,pal,
 main/sub-Flag, überlagert?) in Datei schreiben, gezielt in Lockjaw-Überlagerung
 sampeln. Klärt Kandidat 1 vs 3 und liefert zugleich die Frame-Liste zum
-Nachrüsten fehlender Animationen (User-Wunsch).
+Nachrüsten fehlender Animationen (User-Wunsch). → GEBAUT als S8 (s.u.).
+
+---
+
+## S8 — SPRITE-MISS-RECORDER (2026-07-20, UNCOMMITTED, nur SnesHdVideoFilter.cpp)
+
+**Zweck:** Diagnose für den KNOWN ISSUE (oben) UND Coverage-Frameliste für noch
+nicht upgescalte Sprite-Animationen.
+
+**Implementierung (Filter-Diagnose-Sektion, nach S6a-bgcap):** Voll-Pixel-Scan
+auf dem Decode-Thread (wie spritecap). Jede DISTINKTE Sprite-`(hash, pal, slot)`,
+deren HD-Lookup den Pack VERFEHLT, wird an `Downloads\snes_hd_spritemiss.txt`
+angehängt:
+`SPRMISS <M|S> P<pal> O<overlap> G<gfx> H<hash16> T<32 Byte hex> C<16 CGRAM 4hex>`
+- `M|S` = Sprite gewann Main-Slot (Sprites[0]) bzw. Sub-Slot (Sprites[1]).
+- `O1` = an diesem Pixel liegt ein Sprite auf BEIDEN Screens, aber Main- und
+  Sub-Capture haben UNTERSCHIEDLICHE Tiles (Zwei-Slot-Limit — Hauptverdacht).
+- `G` = ActiveGfxset (Level-Zuordnung).
+- T/C = wie spritecap: VRAM-Bytes + OBJ-CGRAM zum Decodieren im Viewer.
+Match-Check via `GetMatchingTile(Key)` (exakt die Render-Entscheidung; Sprites
+scope-frei). Live-Re-Hash-Verify (stale OBJ-Stream → später erneut). Dedup per
+Session (in-memory Set), Konsumenten dedupen sessionübergreifend. Version „S8".
+Kein Header → inkrementeller Build.
+
+**TEST-PLAN (User):** S8 bauen, gezielt Lockjaw's Locker spielen und die zwei
+Kongs unter Wasser ÜBERLAGERN lassen (das SD-Flimmern provozieren), dann
+`snes_hd_spritemiss.txt` schicken. Erwartete Analyse:
+- Häufen sich Misses auf `M` (Main) oder `S` (Sub)? → klärt sprHd≈0-Asymmetrie.
+- Tauchen `O1`-Zeilen auf? → bestätigt/verwirft das Zwei-Slot-Limit als Ursache.
+- Sind die gemissten Hashes im spritecap (also galerie-verfügbar zum Upscalen)?
+- Bytes → Viewer decodiert die Tiles → welche Animation/Figur fehlt konkret.
+
+**S8-ERGEBNIS:** s. KNOWN ISSUE oben — Zwei-Slot widerlegt, Misses = Gegner/
+Objekte, Charakter-Fenster-SD auf (b) Bug eingegrenzt → S9 gebaut.
+
+---
+
+## S9 — WINDOW-SD-SENSOR (2026-07-20, UNCOMMITTED, nur SnesHdVideoFilter.cpp)
+
+**Zweck:** Den Lockjaw-Fenster-Bug (KNOWN ISSUE, Fall b) exakt lokalisieren.
+
+**Implementierung (Filter, nach dem S4-Sprite-Block, im Pixel-Loop):** Für jeden
+Pixel, an dem ein SUB-Sprite vorhanden ist (`SpriteCount & 0x02`, Hash≠0) und der
+S7-HD-Operanden-Pfad NICHT gefeuert hat (`!subSprHdFired`) und der auch nicht via
+Main-Sprite HD ist: prüfe, ob die Kachel ÜBERHAUPT im Pack ist
+(`CachedGetMatchingTile(Sprites[1].Key)`). Wenn JA (gepackt, aber nicht HD
+gerendert = der Bug), logge `S9-SD x y reason=... sprWon mask swp subSpr subEmpty
+CM addSub Main Sub hash P`. `reason` nennt das blockierende Gate:
+`MAIN-sprMiss`/`MAIN-noCap` (spriteWon-Pfad), `mask0` (BgLayerMask=0), `noCM`
+(cmActive=0), `noAddSub`, `subEmpty`, `subBGwins` (BG gewann den Sub-Screen statt
+Sprite), `other`. Cap 40/Kontext, s_diagMutex, `subSprHdFired`-Flag im S7-Zweig
+gesetzt. Version „S9". Kein Header → inkrementeller Build.
+
+**TEST-PLAN (User):** S9 bauen, in Lockjaw die Kongs GEZIELT vor den
+Fensteröffnungen schwimmen lassen (SD provozieren), `snes_hd_diag.txt` schicken.
+Die `S9-SD`-Zeilen zeigen dann Grund + Position. Erwartung/Hypothesen:
+- Alle gleicher `reason` an Fenster-y → DAS ist der blockierende Gate.
+- `subBGwins` (swp>0) → das Fenster ist ein BG-Element, das den Sprite auf dem
+  Sub-Screen verdrängt (Vordergrund-Prioritäts-Trick) → Fix: Sprite trotzdem als
+  HD-Operand zulassen wenn er der ECHTE Vordergrund ist.
+- `noCM`/`noAddSub` → über dem Fenster ist Color-Math anders → S7-Pfad läuft nicht.
+- `MAIN-sprMiss` → widerlegt „Sprites[0]==Sprites[1]" (verschiedene Tiles).
+- KEINE `S9-SD`-Zeilen trotz sichtbarem SD → dann doch Coverage/anderer Layer.
 
 ---
 

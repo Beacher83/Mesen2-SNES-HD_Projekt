@@ -16,7 +16,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S7"
+#define SNES_HD_BUILD_VERSION "S10"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -323,6 +323,7 @@ static int diagMatchCount = 0;
 static int diagCmSampleCount = 0;    // generic CM+AddSubscreen pixel samples
 static int diagSubOpSampleCount = 0; // P4.0: sub-screen operand decision samples
 static int diagSprSampleCount = 0;   // P4.1e: sub-screen SPRITE pixel samples
+static int diagS9SampleCount = 0;    // S9: packed sub-sprite that did NOT render HD (window-SD hunt)
 static std::unordered_set<uint64_t> diagLoggedHashes;
 
 // Read-only per-frame state shared by all render threads.
@@ -580,6 +581,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			SnesHdPpuTileInfo* subTileInfo = nullptr;
 			bool cmActive = false;  // hoisted so the rendering section (below) can see it too
 			uint8_t winLayer = 0xFF;  // hoisted so the rendering section (below) can see it too
+			bool subSprHdFired = false;  // S9: the S7 sub-sprite HD-operand path rendered this pixel
 			bool spriteIsSubOperand = false;  // P4.1f: sprite is the final sub winner AND the CM operand → force native
 
 			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
@@ -814,6 +816,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							hdTile = nullptr; hdTileInfo = nullptr;
 							hdTileBot = nullptr; hdTileInfoBot = nullptr;
 							st.SprSubHd++;
+							subSprHdFired = true;
 						} else {
 						// P4.1f (Issue R fix): no HD sprite art — force the native path.
 						// Rendering the main winner's HD tile here would paint semi-
@@ -865,6 +868,34 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			}
 
 			// =============================================================
+			// S10 (fix): sub-screen sprite over a BG HOLE (BgLayerMask == 0).
+			// The S7 sub-sprite HD-operand path lives inside the BG block above,
+			// which is gated on BgLayerMask != 0. Where the background has no
+			// tile — e.g. the porthole window openings in Lockjaw's Locker, where
+			// only the backdrop shows on the main screen and the character is the
+			// color-math operand on the sub screen — that gate skipped S7 and the
+			// character fell to native SD, exactly in front of the windows (S9-SD
+			// reason=mask0, 135/135). Handle it here: native backdrop main + HD
+			// sprite operand, identical to S7. Confined to this case, so no path
+			// that already works is touched.
+			// =============================================================
+			if(pixelInfo.BgLayerMask == 0 && !spriteWon && !isWorldmap
+				&& pixelInfo.SubScreenHasSprite && !pixelInfo.SubScreenEmpty
+				&& (pixelInfo.MainScreenFlags & 0x80) && (pixelInfo.SpriteCount & 0x02)) {
+				SnesHdScanlineInfo& slHole = hdScreen->ScanlineInfo[y];
+				if(slHole.ColorMathAddSubscreen) {
+					SnesHdPackTileInfo* holeSprTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.Sprites[1].Key);
+					if(holeSprTile && !holeSprTile->HdTileData.empty()) {
+						subTile = holeSprTile;
+						subTileInfo = &pixelInfo.Sprites[1];
+						cmActive = true;  // the rendering section gates color math on this
+						subSprHdFired = true;
+						st.SprSubHd++;
+					}
+				}
+			}
+
+			// =============================================================
 			// S4: HD sprites — a sprite won the MAIN screen. Look up its
 			// hash-keyed HD tile (LayerIndex 4; exempt from gfxset scoping
 			// and the worldmap gate — hash matches are exact, characters
@@ -881,6 +912,47 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					hdTileInfo = &pixelInfo.Sprites[0];
 					st.SprHd++;
 					if(cmActive) st.HdCm++;
+				}
+			}
+
+			// =============================================================
+			// S9: window-SD hunt. A SUB sprite is present AND its tile IS in
+			// the pack, yet it did NOT render as an HD sub-operand (S7) and is
+			// not covered by an HD main-sprite either → it will show SD. Log
+			// x/y + WHY the HD path was not taken. This isolates the Lockjaw
+			// "character loses HD in front of the porthole windows" case: the
+			// same (packed) swim tile is HD elsewhere, so the cause must be a
+			// per-pixel routing gate, not missing art.
+			// =============================================================
+			if(diagS9SampleCount < 40 && (pixelInfo.SpriteCount & 0x02)
+				&& !subSprHdFired && pixelInfo.Sprites[1].Key.ContentHash != 0) {
+				bool mainHdSprite = spriteWon && (pixelInfo.SpriteCount & 0x01) && hdTile;
+				if(!mainHdSprite && CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.Sprites[1].Key)) {
+					SnesHdScanlineInfo& slS9 = hdScreen->ScanlineInfo[y];
+					const char* reason =
+						spriteWon ? (pixelInfo.SpriteCount & 0x01 ? "MAIN-sprMiss" : "MAIN-noCap") :
+						pixelInfo.BgLayerMask == 0 ? "mask0" :
+						!(pixelInfo.MainScreenFlags & 0x80) ? "noCM" :
+						!slS9.ColorMathAddSubscreen ? "noAddSub" :
+						pixelInfo.SubScreenEmpty ? "subEmpty" :
+						!pixelInfo.SubScreenHasSprite ? "subBGwins" : "other";
+					std::lock_guard<std::mutex> diagLock(s_diagMutex);
+					if(diagS9SampleCount < 40) {
+						char buf[320];
+						snprintf(buf, sizeof(buf),
+							"[SNES HD diag] S9-SD x=%d y=%d reason=%s sprWon=%d mask=0x%02X "
+							"swp=%d subSpr=%d subEmpty=%d CM=%d addSub=%d Main=$%02X Sub=$%02X "
+							"hash=%016llX P%d",
+							x, y, reason, spriteWon ? 1 : 0, pixelInfo.BgLayerMask,
+							pixelInfo.SubScreenWinnerPlus1, pixelInfo.SubScreenHasSprite ? 1 : 0,
+							pixelInfo.SubScreenEmpty ? 1 : 0, (pixelInfo.MainScreenFlags & 0x80) ? 1 : 0,
+							slS9.ColorMathAddSubscreen ? 1 : 0,
+							slS9.MainScreenLayers, slS9.SubScreenLayers,
+							(unsigned long long)pixelInfo.Sprites[1].Key.ContentHash,
+							pixelInfo.Sprites[1].Key.PaletteIndex);
+						DiagLog(buf);
+						diagS9SampleCount++;
+					}
 				}
 			}
 
@@ -1290,6 +1362,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagCmSampleCount = 0;
 		diagSubOpSampleCount = 0;
 		diagSprSampleCount = 0;
+		diagS9SampleCount = 0;
 		diagPalLogCount = 0;
 		diagSprCapLogCount = 0;
 		diagLoggedHashes.clear();
@@ -1676,6 +1749,85 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 		}
 		if(s_bgCapFile) fflush(s_bgCapFile);
+	}
+
+	// =====================================================================
+	// S8: sprite MISS recording — diagnostic + coverage source for sprites.
+	// Every DISTINCT sprite (hash, palette, main/sub slot) whose HD lookup
+	// MISSES the pack is appended to snes_hd_spritemiss.txt with its 32 VRAM
+	// bytes and the OBJ palette's 16 CGRAM colors (same body as spritecap),
+	// prefixed with an M/S slot flag, an overlap marker and the active gfxset.
+	// Two uses:
+	//   (1) Coverage: the exact list of character frames still to upscale
+	//       (viewer decodes the bytes, same path as bgcap animation tiles).
+	//   (2) KNOWN ISSUE (underwater overlap flicker): the M/S split shows
+	//       whether misses cluster on the MAIN (sprHd) or SUB (sprHdSub) path,
+	//       and O1 marks pixels where a sprite is on BOTH screens but main and
+	//       sub captured DIFFERENT tiles — the two-slot capture limit, prime
+	//       suspect for the partial-SD flicker when the two Kongs overlap.
+	// Match check uses GetMatchingTile (exact render-path decision; sprites are
+	// scope-exempt). Live re-hash verify; dedup per session, consumers across.
+	// =====================================================================
+	if(hdScreen->Vram) {
+		static std::unordered_set<uint64_t> s_sprMissSeen;
+		static FILE* s_sprMissFile = nullptr;
+		static bool s_sprMissAttempted = false;
+		constexpr uint32_t sprMissPixels = (uint32_t)SnesHdScreenInfo::ScreenPixelCount;
+		for(uint32_t i = 0; i < sprMissPixels; i++) {
+			const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[i];
+			if(!pi.SpriteCount) continue;
+			// Overlap: a sprite is present on BOTH screens but the captured main
+			// and sub tiles differ (two distinct sprites met at this pixel).
+			bool overlap = (pi.SpriteCount & 0x03) == 0x03
+				&& pi.Sprites[0].Key.ContentHash != pi.Sprites[1].Key.ContentHash;
+			for(int s = 0; s < 2; s++) {
+				if(!(pi.SpriteCount & (1 << s))) continue;
+				const SnesHdPpuTileInfo& t = pi.Sprites[s];
+				if(t.Key.ContentHash == 0) continue;
+				uint64_t missKey = t.Key.ContentHash
+					^ ((uint64_t)t.Key.PaletteIndex * 0x9E3779B97F4A7C15ULL)
+					^ ((uint64_t)s * 0xC2B2AE3D27D4EB4FULL);
+				if(s_sprMissSeen.find(missKey) != s_sprMissSeen.end()) continue;
+				s_sprMissSeen.insert(missKey);
+				if(_hdData->GetMatchingTile(t.Key)) continue;  // covered → not a miss
+				if(ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, 16) != t.Key.ContentHash) {
+					s_sprMissSeen.erase(missKey);  // stale (OBJ stream) → retry later
+					continue;
+				}
+
+				if(!s_sprMissAttempted) {
+					s_sprMissAttempted = true;
+					const char* home = getenv("USERPROFILE");
+					if(!home) home = getenv("HOME");
+					if(home) {
+						char path[512];
+#ifdef _WIN32
+						snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_spritemiss.txt", home);
+#else
+						snprintf(path, sizeof(path), "%s/Downloads/snes_hd_spritemiss.txt", home);
+#endif
+						s_sprMissFile = fopen(path, "a");  // append across sessions
+					}
+				}
+				if(!s_sprMissFile) break;
+
+				char line[320];
+				int off = snprintf(line, sizeof(line), "SPRMISS %c P%d O%d G%d H%016llX T",
+					s == 0 ? 'M' : 'S', t.Key.PaletteIndex, overlap ? 1 : 0,
+					(int)_hdData->ActiveGfxset, (unsigned long long)t.Key.ContentHash);
+				const uint8_t* tileBytes = reinterpret_cast<const uint8_t*>(hdScreen->Vram + t.VramWordAddr);
+				for(int b = 0; b < 32; b++) {
+					off += snprintf(line + off, sizeof(line) - off, "%02X", tileBytes[b]);
+				}
+				off += snprintf(line + off, sizeof(line) - off, " C");
+				for(int c = 0; c < 16; c++) {
+					off += snprintf(line + off, sizeof(line) - off, "%04X",
+						hdScreen->Cgram[128 + t.Key.PaletteIndex * 16 + c] & 0x7FFF);
+				}
+				fprintf(s_sprMissFile, "%s\n", line);
+			}
+		}
+		if(s_sprMissFile) fflush(s_sprMissFile);
 	}
 
 	// =====================================================================
