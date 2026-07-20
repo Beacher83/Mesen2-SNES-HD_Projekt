@@ -16,7 +16,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S6a"
+#define SNES_HD_BUILD_VERSION "S7"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -368,6 +368,7 @@ struct HdFilterFrameStats
 	uint32_t SprSub = 0;        // P4.1e: sprite is the final sub-screen winner
 	uint32_t SprSubMainHd = 0;  // P4.1e: of those, pixels with a main-winner HD match
 	uint32_t SprHd = 0;         // S4: sprite-won pixels rendered via an HD sprite tile
+	uint32_t SprSubHd = 0;      // S7: sub-screen sprite rendered via an HD sprite tile (fog/water levels)
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -388,6 +389,7 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SprSub += src.SprSub;
 	dst.SprSubMainHd += src.SprSubMainHd;
 	dst.SprHd += src.SprHd;
+	dst.SprSubHd += src.SprSubHd;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -787,18 +789,40 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							}
 						}
 					} else {
-						// P4.1f (Issue R fix): a sprite is the final sub-screen winner —
-						// the CHARACTER ITSELF is the color-math operand. Rendering the
-						// main winner's HD tile here paints semi-transparent HD art
-						// (Lockjaw water overlay) over the pixel before the sprite is
-						// added; native water texels are dark so the PPU's ADD leaves
-						// the character dominant, while brighter HD art washes it out
-						// ("half-transparent characters", confirmed via SPR-SAMPLE).
-						// Force the native path — exact PPU output (water + sprite ADD)
-						// at these few pixels; the surrounding water stays HD.
-						spriteIsSubOperand = true;
+						// A sprite is the final sub-screen winner — the CHARACTER
+						// ITSELF is the color-math operand (Mainbrace/Rambi fog,
+						// Lockjaw water). These are overlay levels: the sprite NEVER
+						// wins the main screen, so the S4 main-sprite path can't upgrade
+						// it and the character stays SD.
 						st.SprSub++;
-						if(hdTile) st.SprSubMainHd++; // pixels the forced-native rule affects
+						if(hdTile) st.SprSubMainHd++;
+
+						// S7: if the sub sprite has HD art, render THAT as the color-math
+						// operand (native main base + HD character). Drop any main/bottom
+						// HD tile so ONLY the sprite is upgraded — the native main base
+						// (fog/water) is preserved. This keeps the P4.1f protection intact:
+						// the wash-out came from painting the MAIN winner's HD overlay tile
+						// over the pixel, never from the sprite itself; here that main tile
+						// is suppressed, so the character can't be washed out.
+						SnesHdPackTileInfo* subSprTile = nullptr;
+						if(pixelInfo.SpriteCount & 0x02) {
+							subSprTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache, pixelInfo.Sprites[1].Key);
+						}
+						if(subSprTile && !subSprTile->HdTileData.empty()) {
+							subTile = subSprTile;
+							subTileInfo = &pixelInfo.Sprites[1];
+							hdTile = nullptr; hdTileInfo = nullptr;
+							hdTileBot = nullptr; hdTileInfoBot = nullptr;
+							st.SprSubHd++;
+						} else {
+						// P4.1f (Issue R fix): no HD sprite art — force the native path.
+						// Rendering the main winner's HD tile here would paint semi-
+						// transparent HD art (Lockjaw water overlay) over the pixel before
+						// the sprite is added; native water texels are dark so the PPU's
+						// ADD leaves the character dominant, while brighter HD art washes
+						// it out ("half-transparent characters", confirmed via SPR-SAMPLE).
+						// Exact PPU output (water + sprite ADD); surrounding water stays HD.
+						spriteIsSubOperand = true;
 						if(diagSprSampleCount < 12 && x >= 48 && x <= 208 && y >= 40 && y <= 200) {
 							std::lock_guard<std::mutex> diagLock(s_diagMutex);
 							if(diagSprSampleCount < 12) {
@@ -815,6 +839,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								DiagLog(buf);
 								diagSprSampleCount++;
 							}
+						}
 						}
 					}
 
@@ -921,7 +946,10 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 						&& palRowActive[hdTileInfo->Key.PaletteIndex & 7]) {
 						mainLut = palLut[hdTileInfo->Key.PaletteIndex & 7];
 					}
-					if(subSampler.valid && palRowActive[subTileInfo->Key.PaletteIndex & 7]) {
+					// S7: sub operand may now be a sprite (LayerIndex 4) — same OBJ-palette
+					// exemption as the main sprite path above.
+					if(subSampler.valid && subTileInfo->Key.LayerIndex != 4
+						&& palRowActive[subTileInfo->Key.PaletteIndex & 7]) {
 						subLut = palLut[subTileInfo->Key.PaletteIndex & 7];
 					}
 				}
@@ -1343,6 +1371,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSprSub = total.SprSub;
 	uint32_t frameSprSubMainHd = total.SprSubMainHd;
 	uint32_t frameSprHd = total.SprHd;
+	uint32_t frameSprSubHd = total.SprSubHd;
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
@@ -1420,7 +1449,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
-			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
+			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
@@ -1429,7 +1458,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			diagFrameCount, diagBgFrameCount, ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch,
 			frameHdMiss, frameHdCm, frameMainNatHd, frameSubOpHd, frameSubOpFixed, frameLayerRetry, frameMultiLayer,
-			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameMaskZero, frameHdmaSplit,
+			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameSprSubHd, frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],

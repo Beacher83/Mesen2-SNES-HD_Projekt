@@ -1,6 +1,97 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-19 | Mesen Build: S6a bestätigt+committed (`ab83dfde`) — HD-Sprite-Pipeline S1-S5 KOMPLETT (Diddy läuft in HD), BG-Anim-Recording aktiv | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites, Filter multithreaded (~2 ms avg) | Nächstes: S6b (Viewer: bgcap→Anim-Tiles-Export)
+Stand: 2026-07-20 | Mesen Build: S7 GETESTET+GUT (Sub-Screen-HD-Sprites für Overlay-Level, Mainbrace/Rambi Diddy HD, keine Lockjaw-Regression) — committen offen; S6a committed (`ab83dfde`) | OFFEN als KNOWN ISSUE (s.u.): Sprite-Flimmern bei Kong-Überlagerung unter Wasser (partiell, Bug-Verdacht, zurückgestellt) | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites, Filter multithreaded (~2 ms avg) | Nächstes Update: Sprite-Miss-Recorder + Known-Issue nachschärfen; parallel S6b (Viewer: bgcap→Anim-Tiles-Export)
+
+---
+
+## S7 — SUB-SCREEN-HD-SPRITES (2026-07-20, UNCOMMITTED, nur SnesHdVideoFilter.cpp)
+
+**Bug (User):** Diddy-HD-Sprites fehlen in Overlay-Leveln (Mainbrace Mayhem,
+Rambi Rumble u.ä.) — BG dort HD, Charakter bleibt SD.
+
+**Root Cause (Log-bestätigt, S6a-diag):** In Overlay-Leveln gewinnt das
+Overlay (Nebel = BG3) den MAIN-Screen; BG1/BG2 UND die Sprites liegen auf dem
+SUB-Screen und kommen per Color-Math-ADD dazu (Mainbrace: `Main=$04 Sub=$13
+CM=$24`). Der S4-HD-Sprite-Pfad feuert aber nur, wenn ein Sprite den
+MAIN-Screen gewinnt (`spriteWon`, MainScreenFlags&0x40) — was hier nie
+passiert (`sprWon=0` alle Frames). Diddy läuft komplett über den P4.1f-Zweig
+(`SubScreenHasSprite`), der Sub-Sprites bewusst auf NATIV zwingt
+(Log: `sprSub≈2250 sprSubHd≈2100` pro Frame, alle nativ). Zum Vergleich
+Normal-Level: `sprWon≈1900 sprHd≈600` (Diddy HD).
+
+**Fix S7:** Im `SubScreenHasSprite`-Zweig zusätzlich den HD-Tile für
+`Sprites[1].Key` (Sub-Sprite, LayerIndex 4, wie Main-Sprite gecaptured)
+nachschlagen. Gefunden → HD-Sprite als Color-Math-OPERAND rendern (setzt
+`subTile`/`subTileInfo`, nutzt den bestehenden `hasSubHd`-Operandenpfad),
+Main-HD-Tile wird unterdrückt (`hdTile=nullptr`) → native Overlay-Basis bleibt.
+Nicht gefunden → P4.1f-Fallback (Force-Native) unverändert. subLut für Sprites
+ausgenommen (OBJ-Palette, kein R3-BG-LUT). Neuer Zähler `sprHdSub=` im
+FRAME-Log. Kein Header berührt → inkrementeller Build.
+
+**P4.1f bleibt intakt:** Der Lockjaw-Auswascheffekt kam vom Rendern der
+MAIN-Winner-HD-Kachel (Wasser) über dem Pixel, NIE vom Sprite selbst. S7
+unterdrückt genau diese Main-Kachel und zieht nur den Sprite hoch → Wasser
+bleibt nativ, Charakter wird HD.
+
+**ERWARTETE TESTERGEBNISSE:** (1) Mainbrace/Rambi: Diddy in HD, `sprHdSub>0`,
+`sprSub` fällt entsprechend. (2) Lockjaw unter Wasser: keine Regression
+(Charakter darf NICHT auswaschen — Wasser nativ, Diddy ggf. jetzt HD statt SD).
+(3) Normal-Level (gfx=7): unverändert (`sprHd` wie bisher, `sprHdSub=0`).
+(4) Perf ~gleich (ms=).
+
+**TESTERGEBNIS (User, 2026-07-20): S7 überwiegend bestätigt** — Overlay-Level
+(Mainbrace/Rambi) Diddy jetzt HD, keine Lockjaw-Auswasch-Regression. EIN
+Rest-Phänomen offen → siehe KNOWN ISSUE unten. S7 gilt als gut/committen.
+
+---
+
+## KNOWN ISSUE (zu beobachten, S7-Rest) — SPRITE-FLIMMERN BEI ÜBERLAGERUNG UNTER WASSER
+
+**Status: OFFEN, bewusst zurückgestellt (User-Wunsch: aufschreiben, später
+nachschärfen). NICHT vergessen.**
+
+**Symptom (User, Lockjaw's Locker, nur unter Wasser/beim Schwimmen):** Wenn
+sich die ZWEI Kongs (teilweise) überlagern, flackern SD-Sprite-Teile auf —
+und zwar nur TEILE einer Figur (z.B. nur die Beine, oder nur die obere
+Kopfhälfte), nicht die ganze Figur. Tritt NUR bei Überlagerung im Wasser auf;
+an Land / in anderen Leveln nicht beobachtet.
+
+**WICHTIG — NICHT fehlende HD-Art:** Die betroffene HD-Art IST im Pack (User
+sieht dieselben Figuren sonst in HD). Das partielle, überlagerungs-abhängige,
+flackernde Muster deutet klar auf einen Bug hin, nicht auf Coverage. (Der
+Coverage-Cross-Check Spritecap-vs-Pack lief zwar parallel: 72,9 % aller je
+gesehenen Sprite-Hashes sind ungepackt — das ist die SEPARATE, generelle
+Rollout-Lücke für andere Level/Animationen, NICHT die Ursache dieses Phänomens.)
+
+**Was der Log zeigt (gehört ggf. dazu):** In Lockjaw ist `sprHd`≈0 (Main-Sprite-
+Pfad matcht ~nie), während `sprHdSub`≈1300/1500 (Sub-Pfad matcht ~87 %). Die
+Asymmetrie Main~0 vs Sub~87 % bei denselben Figuren ist der Hauptverdacht.
+
+**AUSGESCHLOSSEN (bereits geprüft, 2026-07-20):** Ein „Hash passt nicht zur
+angezeigten Farbe"-Mismatch im Capture. Farbe, Priorität, Palette UND Hash
+werden pro Pixel ATOMAR zusammen geschrieben (`SnesPpu.cpp` ~809-825, in der
+Sprite-Tile-Evaluation) — der front-most Sprite überschreibt alle vier
+konsistent. Stage-2 (`hdCaptureSprite`, ~1078) kopiert dasselbe
+`_hdSpritePixels[x]` in Sprites[0] UND Sprites[1].
+
+**KANDIDATEN für die spätere Nachschärfung:**
+1. **Zwei-Slot-Limit (Sprites[0]=main, Sprites[1]=sub):** `_hdSpritePixels[x]`
+   hält nur EINEN Sprite pro x (den front-most). Bei überlagernden Sprites, die
+   sich Main/Sub oder Prioritätsgrenzen teilen, könnte der auf Sub tatsächlich
+   sichtbare Sprite ein ANDERER sein als der gecapturte → falscher Key → SD.
+2. **OBJ-Prioritäts-Routing unter Color-Math:** pro Pixel/Frame flippt die
+   Zuordnung „Sprite gewinnt Main" ↔ „Sprite ist Sub-Operand" ↔ „BG gewinnt".
+   An Überlagerungs-/Prioritätskanten könnten einzelne Tiles inkonsistent
+   geroutet werden (erklärt „nur Beine / nur obere Kopfhälfte" = einzelne 8x8).
+3. **Main-Pfad `sprHd`≈0 in Lockjaw** überhaupt — warum matcht der Main-Sprite-
+   Pfad dort ~nie, obwohl der Sub-Pfad dieselben Figuren zu 87 % matcht?
+   Sind die Main-Winner-Sprites unter Wasser der ZWEITE Kong / andere Frames?
+
+**NÄCHSTE-SESSION-DIAGNOSE:** Sprite-MISS-Recorder (analog S6a-BG-Recorder)
+mit ins nächste Update nehmen — distinkte NICHT gematchte Sprite-(hash,pal,
+main/sub-Flag, überlagert?) in Datei schreiben, gezielt in Lockjaw-Überlagerung
+sampeln. Klärt Kandidat 1 vs 3 und liefert zugleich die Frame-Liste zum
+Nachrüsten fehlender Animationen (User-Wunsch).
 
 ---
 
