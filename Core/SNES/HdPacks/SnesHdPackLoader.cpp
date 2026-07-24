@@ -17,7 +17,13 @@
 //   bg/bg4/*.png           — BG4 tiles
 //   sprites/*.png          — Sprite tiles
 //
-// Filename format: "4000_P03.png" = VRAM address 0x4000, palette 3
+// Filename formats (without extension):
+//   "4000_P03"             — VRAM address 0x4000, palette 3 (BG, address-keyed)
+//   "h{16 hex}_P{pal}"     — S6b BG CHR-animation frame, keyed by CONTENT HASH.
+//                            An animation streams several different tiles through
+//                            the same VRAM address, so the address cannot identify
+//                            the art. Lives in the same bg/bgN/gfxset_XX/ folders.
+//   "{16 hex}_P{pal}"      — S3 sprite tile, keyed by content hash (sprites/ only)
 // Each PNG is 32x32 pixels (4x scale of 8x8 SNES tile)
 // ============================================================================
 
@@ -270,6 +276,54 @@ bool SnesHdPackLoader::ParseGfxsetDirName(const string& dirName, uint8_t& gfxset
 	}
 }
 
+// S6b: BG CHR-animation frames are hash-keyed in the filename, like sprites:
+// "h{16 hex FNV}_P{decPalette}.png" (e.g. "h55138607A3B1C916_P02").
+//
+// A CHR animation streams several DIFFERENT tiles through the SAME VRAM address
+// (Hot Head's lava, Gusty's foliage, Mainbrace's flag), so the address-based
+// naming ParseTileFilename() expects cannot identify the art — only the content
+// can. The leading 'h' marks that, and is unambiguous: a plain tile name starts
+// with a hex VRAM address, and 'h' is not a hex digit.
+//
+// File-local on purpose so SnesHdPackLoader.h stays untouched (a header change
+// would force a much wider rebuild for what is a filename-parsing detail).
+static bool ParseAnimTileFilename(const string& filename, uint64_t& contentHash, uint8_t& paletteIndex)
+{
+	if(filename.size() < 18 || (filename[0] != 'h' && filename[0] != 'H')) {
+		return false;
+	}
+	if(filename[17] != '_') {
+		return false;
+	}
+
+	string hashStr = filename.substr(1, 16);
+	for(char c : hashStr) {
+		bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+		if(!isHex) return false;
+	}
+	try {
+		contentHash = std::stoull(hashStr, nullptr, 16);
+	} catch(...) {
+		return false;
+	}
+	if(contentHash == 0) {
+		return false;  // 0 is the "no hash" sentinel in SnesHdTileKey
+	}
+
+	string palStr = filename.substr(18);
+	if(palStr.empty() || (palStr[0] != 'P' && palStr[0] != 'p')) {
+		return false;
+	}
+	try {
+		unsigned long pal = std::stoul(palStr.substr(1), nullptr, 10);
+		if(pal > 7) return false;
+		paletteIndex = (uint8_t)pal;
+	} catch(...) {
+		return false;
+	}
+	return true;
+}
+
 bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t layerIndex, bool isSprite, uint8_t gfxsetIndex)
 {
 	std::unordered_set<string> extensions = { ".png" };
@@ -287,6 +341,7 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 	}
 
 	int loadedCount = 0;
+	int animCount = 0;
 
 	for(const string& filePath : files) {
 		string filename = FolderUtilities::GetFilename(filePath, false);
@@ -294,6 +349,8 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		uint16_t vramAddr = 0;
 		uint8_t paletteIndex = 0;
 		uint64_t spriteHash = 0;
+		uint64_t animHash = 0;
+		bool isAnimTile = false;
 
 		// S3: sprite tiles are hash-keyed directly in the filename
 		// ("{16-hex-FNV}_P{pal}.png") — OBJ tiles are streamed to varying
@@ -303,6 +360,15 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 				MessageManager::Log("[SNES HD Pack] Skipping invalid sprite filename: " + filename);
 				continue;
 			}
+		} else if(ParseAnimTileFilename(filename, animHash, paletteIndex)) {
+			// S6b: CHR-animation frame, keyed by content hash (see ParseAnimTileFilename).
+			// Tried before ParseTileFilename so the 'h' prefix wins; a normal tile name
+			// can never start with 'h', so this cannot shadow one.
+			if(!_useContentHash) {
+				MessageManager::Log("[SNES HD Pack] Anim tile needs content-hash mode (hashes.bin missing?) - skipping: " + filename);
+				continue;
+			}
+			isAnimTile = true;
 		} else if(!ParseTileFilename(filename, vramAddr, paletteIndex)) {
 			MessageManager::Log("[SNES HD Pack] Skipping invalid filename: " + filename);
 			continue;
@@ -335,6 +401,11 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 			// S3: hash from the filename. Requires content-hash mode at runtime
 			// (the sprite key carries ContentHash; packs always ship hashes.bin).
 			tile->Key.ContentHash = spriteHash;
+		} else if(isAnimTile) {
+			// S6b: hash from the filename, no hashes.bin lookup — the animation's
+			// frames are not in hashes.bin at all (that maps vramAddr -> the ONE tile
+			// present in the snapshot). GfxsetIndex below still scopes them.
+			tile->Key.ContentHash = animHash;
 		} else if(_useContentHash && gfxsetIndex != 0xFF) {
 			// Content hash mode: look up hash from hashes.bin
 			uint32_t hashKey = ((uint32_t)gfxsetIndex << 24) | ((uint32_t)layerIndex << 16) | vramAddr;
@@ -378,11 +449,13 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 		_data->Tiles.push_back(std::move(tile));
 		_data->ImageFileData.push_back(std::move(bitmap));
 		loadedCount++;
+		if(isAnimTile) animCount++;
 	}
 
 	if(loadedCount > 0 || !files.empty()) {
 		MessageManager::Log("[SNES HD Pack] gfxset_" + std::to_string(gfxsetIndex) + " layer " + std::to_string(layerIndex)
-			+ ": loaded " + std::to_string(loadedCount) + "/" + std::to_string(files.size()) + " tiles");
+			+ ": loaded " + std::to_string(loadedCount) + "/" + std::to_string(files.size()) + " tiles"
+			+ (animCount > 0 ? " (" + std::to_string(animCount) + " anim frames)" : string()));
 	}
 
 	return loadedCount > 0;

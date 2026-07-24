@@ -4,6 +4,64 @@ Stand: 2026-07-20 | Mesen Build: S7 COMMITTED+GEPUSHT (`8280cd71`) | S8+S9+S10 G
 
 ---
 
+## S11 — LOADER-ZWEIG FÜR HASH-KEYED BG-ANIM-KACHELN (2026-07-22, UNCOMMITTED, Build „S11")
+
+**Zweck:** letzter fehlender Baustein von S6b. Der Viewer exportiert die
+CHR-Animationsframes inzwischen als `h{16 hex}_P{pal}.png` nach
+`bg/bg{N}/gfxset_XX/`, aber `ParseTileFilename` kannte nur das
+Adress-Format `{vramAddr}_P{pal}` — die Dateien wurden beim Laden verworfen.
+
+**Warum Hash und nicht Adresse:** eine CHR-Animation schiebt mehrere
+VERSCHIEDENE Kacheln durch DIESELBE VRAM-Adresse (Hot Heads Lava, Gustys
+Blätter, Mainbraces Flagge). Die Adresse kann die Art also nicht
+identifizieren, nur der Inhalt. Genau dasselbe Prinzip wie bei den
+Sprites (S3), nur bleiben die Dateien in den BG-Ordnern.
+
+**Implementierung (NUR `SnesHdPackLoader.cpp` + Versions-Define):**
+- `ParseAnimTileFilename()` als **datei-lokale** static-Funktion — bewusst
+  NICHT im Header, damit `SnesHdPackLoader.h` unangetastet bleibt und der
+  Build inkrementell bleibt (Filename-Parsing ist kein Interface).
+- In `LoadTilesFromDirectory` VOR `ParseTileFilename` probiert. Eindeutig,
+  weil ein Adress-Dateiname mit einer Hex-Ziffer beginnt und `h` keine ist.
+  Hex-Prüfung explizit (kein `isxdigit`, spart eine `<cctype>`-Abhängigkeit).
+- Identität: `tile->Key.ContentHash = animHash` direkt, **ohne**
+  hashes.bin-Lookup — die Animationsframes stehen dort gar nicht drin
+  (hashes.bin bildet vramAddr → die EINE Kachel aus dem Snapshot ab).
+- Ohne Content-Hash-Modus wird die Datei mit Logmeldung übersprungen
+  (ohne hashes.bin wäre ein ContentHash-Key nie matchbar).
+- Ladeausgabe zeigt jetzt zusätzlich `(N anim frames)`.
+
+**Verifiziert VOR dem Build (keine Regression zu erwarten):**
+- **Kein Parser-Konflikt:** beide Parser gegen alle 1593 PNGs des echten
+  Packs simuliert → 510 Anim, 1083 Adress-Tiles, **0 Kollisionen,
+  0 abgewiesen**. Kein bestehender Dateiname wechselt den Zweig.
+- **Key-Lookup trifft:** `SnesHdTileKey::operator==`/`GetHashCode` schließen
+  `VramAddress` aus, sobald `ContentHash != 0` (SnesHdData.h Z. 67-94). Der
+  Laufzeit-Key (Hash + echte Adresse) matcht also unsere Kachel
+  (Hash + Adresse 0).
+- **Gfxset-Scoping greift:** LayerIndex 0/1 ≠ 4, also `strictScope` aktiv →
+  Kachel muss `GfxsetIndex == ActiveGfxset` haben. Kommt aus dem
+  `gfxset_XX`-Ordner, passt.
+- **Live-Hashing bestätigt:** `SnesPpu.cpp` Z. 1249-1254 hasht BG-Kacheln je
+  Scanline aus dem VRAM (`ComputeTileContentHash`). Der 1-Eintrag-Memo
+  (`hdLastHashAddr`) ist **funktionslokal** (Z. 1154), lebt also nicht über
+  Frames hinweg — genau die Bedingung, die Animationen brauchen, sonst wäre
+  bei konstanter Adresse ein veralteter Hash wiederverwendet worden.
+
+**Viewer-Fix in derselben Runde (sonst stille Lücke):** `parseBgCap`
+behielt pro Hash nur den ZUERST gesehenen Layer. In Hot Head zeigen BG1 und
+BG2 aber auf dasselbe CHR-Fenster — **203 von 1110 Hashes kommen auf beiden
+Layern vor**. Da der Pack-Key den Layer enthält, wären alle Lookups auf dem
+jeweils anderen Layer ins Leere gelaufen. Jetzt wird `e.layers` (alle
+beobachteten Layer) geführt und pro Layer eine PNG geschrieben.
+
+**USER-TEST:** inkrementeller Build (nur 2 .cpp, kein Header) → Pack neu aus
+dem Viewer exportieren (wegen des Layer-Fixes!) → nach HdPacks → Hot Head.
+Erwartet: Log `Build S11`, `gfxset_32 layer 0: loaded N/N tiles (M anim
+frames)` und dasselbe für layer 1; im Spiel animierte Lava in HD.
+
+---
+
 ## S7 — SUB-SCREEN-HD-SPRITES (2026-07-20, UNCOMMITTED, nur SnesHdVideoFilter.cpp)
 
 **Bug (User):** Diddy-HD-Sprites fehlen in Overlay-Leveln (Mainbrace Mayhem,
