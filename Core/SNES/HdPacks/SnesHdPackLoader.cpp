@@ -15,6 +15,7 @@
 //   bg/bg2/*.png           — BG2 tiles
 //   bg/bg3/*.png           — BG3 tiles
 //   bg/bg4/*.png           — BG4 tiles
+//   cmFg/gfxset_XX/*.png   — Color-math foreground overlay, loaded as BG1 (layer 0)
 //   sprites/*.png          — Sprite tiles
 //
 // Filename formats (without extension):
@@ -124,6 +125,34 @@ bool SnesHdPackLoader::LoadPack()
 	// Also check for tiles directly in bg/ (layer-agnostic, assigned to all layers)
 	string bgDir = FolderUtilities::CombinePath(_hdPackFolder, "bg");
 	// We'll skip this for now — per-layer is cleaner
+
+	// S12: color-math foreground overlay — cmFg/gfxset_XX/*.png
+	//
+	// Levels like Rambi Rumble draw a foreground overlay (the honey) from a SECOND
+	// BG1 chrBase and blend it over the scene. The viewer exports those tiles into
+	// their own folder rather than bg/bg1/ so the overlay can be removed for testing
+	// without touching the terrain art — until now nothing ever read it back.
+	//
+	// They are ordinary address-keyed BG1 tiles: same "{addr}_P{pal}.png" naming,
+	// and the exporter already writes their content hashes into hashes.bin under
+	// layer 0, deduplicated against the terrain entries. So loading them as layer 0
+	// needs no new key type and no renderer change — they simply become matchable.
+	{
+		string cmFgDir = FolderUtilities::CombinePath(_hdPackFolder, "cmFg");
+		vector<string> cmFgDirs;
+		try { cmFgDirs = FolderUtilities::GetFolders(cmFgDir); } catch(...) {}
+		for(const string& subdir : cmFgDirs) {
+			size_t sep = subdir.find_last_of("/\\");
+			string dirName = (sep != string::npos) ? subdir.substr(sep + 1) : subdir;
+
+			uint8_t gfxsetIdx = 0;
+			if(ParseGfxsetDirName(dirName, gfxsetIdx)) {
+				if(LoadTilesFromDirectory(subdir, 0, false, gfxsetIdx)) {
+					anyLoaded = true;
+				}
+			}
+		}
+	}
 
 	// Load sprite tiles
 	string spriteDir = FolderUtilities::CombinePath(_hdPackFolder, "sprites");
