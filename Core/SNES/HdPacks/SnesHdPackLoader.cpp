@@ -15,6 +15,10 @@
 //   bg/bg2/*.png           — BG2 tiles
 //   bg/bg3/*.png           — BG3 tiles
 //   bg/bg4/*.png           — BG4 tiles
+//   bg/bgN/gfxset_XX/*.png — per-gfxset tiles (XX is DECIMAL, e.g. gfxset_37 = 0x25)
+//   bg/bgN/global/*.png    — tiles that match in ANY gfxset (the text font); stored
+//                            with GfxsetIndex 0xFF, which GetMatchingTile lets past
+//                            the strict scoping check
 //   cmFg/gfxset_XX/*.png   — Color-math foreground overlay, loaded as BG1 (layer 0)
 //   sprites/*.png          — Sprite tiles
 //
@@ -108,6 +112,16 @@ bool SnesHdPackLoader::LoadPack()
 			uint8_t gfxsetIdx = 0;
 			if(ParseGfxsetDirName(dirName, gfxsetIdx)) {
 				if(LoadTilesFromDirectory(subdir, layer, false, gfxsetIdx)) {
+					anyLoaded = true;
+				}
+				foundGfxsetDirs = true;
+			} else if(dirName == "global") {
+				// Art that belongs to no single gfxset: the text font is the same
+				// ~90 glyphs in every shop, on the world map and in the menus, so
+				// scoping it to one set would leave it native everywhere else.
+				// 0xFF is the "unscoped" marker GetMatchingTile already honours —
+				// the same exemption sprites use.
+				if(LoadTilesFromDirectory(subdir, layer, false, 0xFF)) {
 					anyLoaded = true;
 				}
 				foundGfxsetDirs = true;
