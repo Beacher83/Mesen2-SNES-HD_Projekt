@@ -11,13 +11,29 @@
   2. Load DKC2 ROM (with 102% .srm save for level access)
   3. Open Script > New Script Window, load this script
 
-  USAGE:
+  USAGE (automatic mode — normal levels):
   - Script runs ROM analysis on startup (shows gfxset count in log)
   - Navigate to a level on the world map and enter it
   - HUD shows: current level, detected gfxset, progress
   - Press [F2] to dump VRAM + CGRAM + PPU state for current gfxset
   - Gfxsets already dumped are marked green in HUD
   - Press [F3] to log remaining gfxsets to the script log
+
+  USAGE (manual slot mode — world maps and NPC shops):
+  World maps have no gfxset at all (property type 0x0004/0x0005 carries no
+  style data), so lookupGfxsetFromRom returns nil and [F2] refuses to dump
+  them. NPC shops do have a gfxset (0x08-0x0C via NPC_GFXSETS) but that only
+  helps if WRAM $0539 actually holds it there — unverified. Manual mode sits
+  next to the automatic path and takes the target set from YOU instead of
+  from RAM, so neither question has to be answered:
+  - [Page Up] / [Page Down] select a slot (HUD shows name + target file)
+  - [End] dumps the current screen into that slot
+  - After a dump the selection advances by one — the slot list is in
+    collection order, so walking the maps in order needs no stepping
+  - Dumping over an existing file needs a second [End] to confirm
+
+  There is one slot per map/shop, not one per category: slots 1-9 are the
+  nine individual maps, slots 10-14 the five shops.
 
   OUTPUT (per gfxset, in script data folder):
   - gfxset_XX_vram.bin    — 64KB VRAM binary (compatible with Viewer import)
@@ -35,6 +51,13 @@
 local DUMP_KEY      = "F2"    -- Key to trigger VRAM dump
 local STATUS_KEY    = "F3"    -- Key to log remaining gfxsets
 local FRAMES_WAIT   = 3      -- Frames to wait before dump (VBlank DMA settle)
+
+-- Manual slot mode. Key names must match Core/Shared/KeyDefinitions.h
+-- ("Page Up" and "Page Down" carry a space). Deliberately not F-keys —
+-- those collide with Mesen's own save/load state hotkeys.
+local SLOT_PREV_KEY = "Page Up"
+local SLOT_NEXT_KEY = "Page Down"
+local SLOT_DUMP_KEY = "End"
 
 ------------------------------------------------------------------------
 -- DKC2 Level Names (indexed 0x00 - 0xBF = 192 entries)
@@ -253,6 +276,50 @@ for i = 0x50, 0x57 do NPC_GFXSETS[i] = 0x09 end
 for i = 0x58, 0x5F do NPC_GFXSETS[i] = 0x0C end
 
 ------------------------------------------------------------------------
+-- Manual slots (world maps + NPC shops)
+------------------------------------------------------------------------
+-- The 5 shops reuse their real ROM gfxsets 0x08-0x0C, so they drop straight
+-- into the existing gfxset_XX naming.
+--
+-- The 9 world maps have NO gfxset in the ROM and need synthetic indices.
+-- A full scan of all 192 level IDs found exactly 32 gfxsets in use:
+--   02 03 04 07 08 09 0A 0B 0C 1D 1E 20 21 22 23 24 25 26 27 28 29 2A 2B
+--   2C 2D 2E 2F 30 31 32 33 34
+-- 0x35-0x3D are free and contiguous — one per map, in world order.
+--
+-- CAREFUL: the maps' LEVEL IDs are 0x30-0x38, but 0x30-0x34 are real level
+-- gfxsets that are already dumped. Naming maps after their level ID would
+-- overwrite five existing dumps. The synthetic indices below avoid that.
+local MANUAL_SLOTS = {
+  { gfx = 0x35, level = 0x38, name = "OW: Crocodile Isle (hub)" },
+  { gfx = 0x36, level = 0x30, name = "OW: Gangplank Galleon" },
+  { gfx = 0x37, level = 0x31, name = "OW: Crocodile Cauldron" },
+  { gfx = 0x38, level = 0x32, name = "OW: Krem Quay" },
+  { gfx = 0x39, level = 0x33, name = "OW: Krazy Kremland (screen 1)" },
+  { gfx = 0x3A, level = 0x34, name = "OW: Gloomy Gulch" },
+  { gfx = 0x3B, level = 0x35, name = "OW: K. Rool's Keep" },
+  { gfx = 0x3C, level = 0x36, name = "OW: The Flying Krock" },
+  { gfx = 0x3D, level = 0x37, name = "OW: Lost World" },
+  { gfx = 0x08, level = 0x39, name = "Shop: Cranky's Monkey Museum" },
+  { gfx = 0x09, level = 0x50, name = "Shop: Funky's Flights II" },
+  { gfx = 0x0A, level = 0x40, name = "Shop: Wrinkly's Kong Kollege" },
+  { gfx = 0x0B, level = 0x48, name = "Shop: Swanky's Bonus Bonanza" },
+  { gfx = 0x0C, level = 0x58, name = "Shop: Klubba's Kiosk" },
+  -- Krazy Kremland's map spans two screens with different graphics, so it
+  -- needs a second dump. Appended rather than inserted next to screen 1 so
+  -- the slot numbers of everything already collected stay put.
+  { gfx = 0x3E, level = 0x33, name = "OW: Krazy Kremland (screen 2)" },
+  -- Non-level screens: no level ID and no gfxset at all, so level is 0.
+  -- The boss arenas are deliberately NOT here — they are ordinary levels with
+  -- real gfxsets and are already dumped (K. Rool Duel = 0x2E, Krocodile Kore
+  -- = 0x2A, King Zing = 0x04, Kudgel = 0x26, Stronghold Showdown = 0x2B).
+  { gfx = 0x3F, level = 0x00, name = "Screen: Title" },
+  { gfx = 0x40, level = 0x00, name = "Screen: Menu / file select" },
+  { gfx = 0x41, level = 0x00, name = "Screen: Game Over" },
+  { gfx = 0x42, level = 0x00, name = "Screen: Rating / ending" },
+}
+
+------------------------------------------------------------------------
 -- ROM data access (DKC2 = HiROM, bank $3D holds level/style data)
 ------------------------------------------------------------------------
 local ROM_BANK_3D = 0x3D0000  -- PRG ROM offset for bank $3D
@@ -340,18 +407,25 @@ function dumpMemoryToFile(filepath, memType)
 end
 
 --- Dump PPU state + metadata to text file
-function dumpStateToFile(filepath, levelId, gfxset, ppuConfig, mapId)
+--- label (optional) overrides the LEVEL_NAMES lookup — manual slots name
+--- themselves, since a shop's level ID is only a representative of eight.
+function dumpStateToFile(filepath, levelId, gfxset, ppuConfig, mapId, label)
   local f = io.open(filepath, "w")
   if not f then return false end
+
+  -- lookupGfxsetFromRom returns (nil, "overworld") for map/shop property
+  -- types, so ppuConfig can be a string here — %02X would throw on it.
+  if type(ppuConfig) ~= "number" then ppuConfig = 0 end
+  if type(mapId)     ~= "number" then mapId = 0 end
 
   f:write("DKC2 VRAM Dump — GfxSet State\n")
   f:write("================================\n\n")
   f:write(string.format("Timestamp:  %s\n", os.date("%Y-%m-%d %H:%M:%S")))
   f:write(string.format("Level ID:   0x%02X (%d)\n", levelId, levelId))
-  f:write(string.format("Level Name: %s\n", LEVEL_NAMES[levelId] or "Unknown"))
+  f:write(string.format("Level Name: %s\n", label or LEVEL_NAMES[levelId] or "Unknown"))
   f:write(string.format("GfxSet:     0x%02X (%d)\n", gfxset, gfxset))
-  f:write(string.format("PPU Config: 0x%02X\n", ppuConfig or 0))
-  f:write(string.format("Map ID:     0x%02X\n", mapId or 0))
+  f:write(string.format("PPU Config: 0x%02X\n", ppuConfig))
+  f:write(string.format("Map ID:     0x%02X\n", mapId))
   f:write("\n")
 
   -- Dump VRAM size verification
@@ -400,6 +474,17 @@ local lastMsgTimer = 0      -- frames remaining for message display
 
 local keyWasDown = false    -- edge detection for dump key
 local statusKeyWasDown = false -- edge detection for status key
+
+-- Manual slot mode
+local slotIndex = 1           -- currently selected MANUAL_SLOTS entry
+local manualDumped = {}       -- gfxsetId -> true (dumped via manual mode)
+local manualCount = 0         -- number of manual slots dumped this session
+local overwriteArmed = nil    -- gfxset awaiting a confirming second [End]
+local overwriteTimer = 0      -- frames the confirmation stays armed
+local manualPending = nil     -- slot queued, waiting out FRAMES_WAIT
+local slotPrevWasDown = false
+local slotNextWasDown = false
+local slotDumpWasDown = false
 
 ------------------------------------------------------------------------
 -- I/O access check
@@ -451,6 +536,13 @@ emu.log(string.format(
 emu.log(string.format(">>> Output folder: %s", outputFolder))
 emu.log(">>> Press [" .. DUMP_KEY .. "] in-game to dump current gfxset.")
 emu.log(">>> Press [" .. STATUS_KEY .. "] to show remaining gfxsets in log.")
+emu.log("")
+emu.log(string.format(">>> Manual slots (%d): world maps + NPC shops.", #MANUAL_SLOTS))
+emu.log(string.format(">>> [%s]/[%s] select, [%s] dump the selected slot.",
+  SLOT_PREV_KEY, SLOT_NEXT_KEY, SLOT_DUMP_KEY))
+for i, s in ipairs(MANUAL_SLOTS) do
+  emu.log(string.format("      %2d. gfxset_%02X  %s", i, s.gfx, s.name))
+end
 emu.log("================================================================\n")
 
 emu.displayMessage("DKC2", string.format(
@@ -500,14 +592,25 @@ end
 ------------------------------------------------------------------------
 -- Perform the actual dump for a gfxset
 ------------------------------------------------------------------------
-function performDump(gfxset)
+--- slot (optional) = a MANUAL_SLOTS entry. When given, the target set and
+--- its metadata come from the slot instead of from the ROM scan — world map
+--- slots have no ROM gfxset to look up at all.
+function performDump(gfxset, slot)
   local prefix = string.format("%s\\gfxset_%02X", outputFolder, gfxset)
 
-  -- Get ppuConfig/mapId via representative level from ROM scan
-  local info = allGfxsets[gfxset]
-  local repLevelId = info and info.representative or 0
-  local _, ppuConfig, mapId = lookupGfxsetFromRom(repLevelId)
-  local repName = LEVEL_NAMES[repLevelId] or "?"
+  local repLevelId, ppuConfig, mapId, repName
+  if slot then
+    repLevelId = slot.level
+    ppuConfig, mapId = 0, 0
+    repName = slot.name
+  else
+    -- Get ppuConfig/mapId via representative level from ROM scan
+    local info = allGfxsets[gfxset]
+    repLevelId = info and info.representative or 0
+    local romGfx
+    romGfx, ppuConfig, mapId = lookupGfxsetFromRom(repLevelId)
+    repName = LEVEL_NAMES[repLevelId] or "?"
+  end
 
   emu.log(string.format("--- Dumping GfxSet 0x%02X (rep: %s) ---",
     gfxset, repName))
@@ -529,7 +632,8 @@ function performDump(gfxset)
   end
 
   -- Dump PPU state
-  local stateOk = dumpStateToFile(prefix .. "_state.txt", repLevelId, gfxset, ppuConfig, mapId)
+  local stateOk = dumpStateToFile(prefix .. "_state.txt", repLevelId, gfxset,
+    ppuConfig, mapId, slot and slot.name or nil)
   if stateOk then
     emu.log("  State: written -> gfxset_" .. string.format("%02X", gfxset) .. "_state.txt")
   end
@@ -539,9 +643,26 @@ function performDump(gfxset)
 
   if vramOk and cgramOk then
     dumpedGfxsets[gfxset] = true
-    dumpCount = dumpCount + 1
-    local msg = string.format("OK: gfxset 0x%02X dumped (%d/%d)",
-      gfxset, dumpCount, totalGfxsetCount)
+    local msg
+    if slot then
+      manualDumped[gfxset] = true
+      manualCount = manualCount + 1
+      -- The 5 shop slots ARE part of the ROM scan (gfxset 0x08-0x0C via
+      -- NPC_GFXSETS), so they count towards dumpCount as well. The 9 world
+      -- map slots are synthetic and would push the HUD past totalGfxsetCount.
+      if allGfxsets[gfxset] then dumpCount = dumpCount + 1 end
+      msg = string.format("OK: %s -> gfxset_%02X (%d/%d slots)",
+        slot.name, gfxset, manualCount, #MANUAL_SLOTS)
+      -- Advance to the next slot. The slot list is in collection order, so
+      -- the common case (walk to the next map, press [End]) needs no manual
+      -- stepping at all — forgetting it is otherwise silent until the
+      -- overwrite guard catches it one screen too late.
+      if slotIndex < #MANUAL_SLOTS then slotIndex = slotIndex + 1 end
+    else
+      dumpCount = dumpCount + 1
+      msg = string.format("OK: gfxset 0x%02X dumped (%d/%d)",
+        gfxset, dumpCount, totalGfxsetCount)
+    end
     emu.log("  " .. msg)
     emu.displayMessage("DKC2 Dump", msg)
     lastMsg = msg
@@ -607,6 +728,53 @@ emu.addEventCallback(function()
   end
   statusKeyWasDown = statusDown
 
+  -- === Manual slot mode: select with Page Up/Down, dump with End ===
+  local prevDown = emu.isKeyPressed(SLOT_PREV_KEY)
+  if prevDown and not slotPrevWasDown then
+    slotIndex = slotIndex - 1
+    if slotIndex < 1 then slotIndex = #MANUAL_SLOTS end
+    overwriteArmed = nil
+  end
+  slotPrevWasDown = prevDown
+
+  local nextDown = emu.isKeyPressed(SLOT_NEXT_KEY)
+  if nextDown and not slotNextWasDown then
+    slotIndex = slotIndex + 1
+    if slotIndex > #MANUAL_SLOTS then slotIndex = 1 end
+    overwriteArmed = nil
+  end
+  slotNextWasDown = nextDown
+
+  if overwriteTimer > 0 then
+    overwriteTimer = overwriteTimer - 1
+    if overwriteTimer == 0 then overwriteArmed = nil end
+  end
+
+  local slotDown = emu.isKeyPressed(SLOT_DUMP_KEY)
+  if slotDown and not slotDumpWasDown then
+    local slot = MANUAL_SLOTS[slotIndex]
+    local target = string.format("%s\\gfxset_%02X_vram.bin", outputFolder, slot.gfx)
+    local existing = io.open(target, "rb")
+    if existing then existing:close() end
+
+    if existing and overwriteArmed ~= slot.gfx then
+      -- A mis-selected slot could overwrite a level dump collected weeks ago,
+      -- so an existing file always costs a second, deliberate press.
+      overwriteArmed = slot.gfx
+      overwriteTimer = 300
+      lastMsg = string.format("gfxset_%02X exists — [%s] again to overwrite",
+        slot.gfx, SLOT_DUMP_KEY)
+      lastMsgTimer = 300
+      emu.displayMessage("DKC2 Dump", lastMsg)
+    else
+      overwriteArmed = nil
+      emu.log(string.format("[manual] slot '%s' -> gfxset_%02X", slot.name, slot.gfx))
+      manualPending = slot   -- same VBlank-DMA settle delay as the [F2] path
+      waitCounter = 0
+    end
+  end
+  slotDumpWasDown = slotDown
+
   -- Dump delay countdown
   if dumpPending then
     waitCounter = waitCounter + 1
@@ -617,6 +785,14 @@ emu.addEventCallback(function()
       if gfxset and not dumpedGfxsets[gfxset] then
         performDump(gfxset)
       end
+    end
+  elseif manualPending then
+    waitCounter = waitCounter + 1
+    if waitCounter >= FRAMES_WAIT then
+      local slot = manualPending
+      manualPending = nil
+      -- No re-read here: the slot is the user's explicit choice, not RAM state.
+      performDump(slot.gfx, slot)
     end
   end
 
@@ -651,13 +827,26 @@ emu.addEventCallback(function()
   emu.drawString(x, y, progStr, green, bgColor, 0, 1)
   y = y + 11
 
+  -- Manual slot selection (world maps + shops)
+  local slot = MANUAL_SLOTS[slotIndex]
+  local slotColor = manualDumped[slot.gfx] and green or yellow
+  local slotMark  = manualDumped[slot.gfx] and " [DONE]" or ""
+  emu.drawString(x, y, string.format("Slot %d/%d: %s", slotIndex, #MANUAL_SLOTS, slot.name),
+    slotColor, bgColor, 0, 1)
+  y = y + 11
+  emu.drawString(x, y, string.format("  -> gfxset_%02X%s  (manual %d/%d)",
+    slot.gfx, slotMark, manualCount, #MANUAL_SLOTS), slotColor, bgColor, 0, 1)
+  y = y + 11
+
   -- Dump in progress indicator
-  if dumpPending then
+  if dumpPending or manualPending then
     local remaining = FRAMES_WAIT - waitCounter
     emu.drawString(x, y, "DUMPING in " .. remaining .. "...", red, bgColor, 0, 1)
     y = y + 11
   else
     emu.drawString(x, y, "[" .. DUMP_KEY .. "]=Dump [" .. STATUS_KEY .. "]=Status", gray, bgColor, 0, 1)
+    y = y + 11
+    emu.drawString(x, y, "[PgUp/PgDn]=Slot [" .. SLOT_DUMP_KEY .. "]=Dump slot", gray, bgColor, 0, 1)
     y = y + 11
   end
 

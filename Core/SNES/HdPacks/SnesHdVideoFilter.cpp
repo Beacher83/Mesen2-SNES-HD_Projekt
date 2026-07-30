@@ -16,7 +16,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S12"
+#define SNES_HD_BUILD_VERSION "S13"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -341,6 +341,13 @@ struct HdFilterFrameCtx
 	uint32_t ppuWidth = 256;
 	bool isHiRes = false;
 	bool isWorldmap = false;
+	// M5.7's worldmap lockout, narrowed. Blocking BG HD on the worldmap was only
+	// ever a stand-in for scoping: back then any level tile could match a map tile
+	// by hash alone. P4.2's strict gfxset scoping does that job properly, and the
+	// maps now ship their own gfxsets and fingerprints, so the lockout would just
+	// keep their own art from rendering. It still applies when a pack has no
+	// fingerprints at all, where strict scoping cannot help.
+	bool blockBgHd = false;
 	uint64_t vramSig = 0;
 	bool anyPalTransform = false;
 	const bool* palRowActive = nullptr;        // [8]
@@ -525,6 +532,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 	const uint32_t ppuWidth = ctx.ppuWidth;
 	const bool isHiRes = ctx.isHiRes;
 	const bool isWorldmap = ctx.isWorldmap;
+	const bool blockBgHd = ctx.blockBgHd;
 	const uint64_t vramSig = ctx.vramSig;
 	const bool anyPalTransform = ctx.anyPalTransform;
 	const bool* palRowActive = ctx.palRowActive;
@@ -584,7 +592,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			bool subSprHdFired = false;  // S9: the S7 sub-sprite HD-operand path rendered this pixel
 			bool spriteIsSubOperand = false;  // P4.1f: sprite is the final sub winner AND the CM operand → force native
 
-			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !isWorldmap) {
+			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !blockBgHd) {
 				st.BgPixels++;
 
 				winLayer = pixelInfo.BgWinnerLayer;
@@ -1406,6 +1414,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	renderCtx.ppuWidth = ppuWidth;
 	renderCtx.isHiRes = isHiRes;
 	renderCtx.isWorldmap = isWorldmap;
+	renderCtx.blockBgHd = isWorldmap && !_hdData->HasFingerprints();
 	renderCtx.vramSig = vramSig;
 	renderCtx.anyPalTransform = anyPalTransform;
 	renderCtx.palRowActive = palRowActive;

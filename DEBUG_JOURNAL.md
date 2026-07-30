@@ -1,6 +1,55 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-20 | Mesen Build: S7 COMMITTED+GEPUSHT (`8280cd71`) | S8+S9+S10 GEBAUT (UNCOMMITTED, Build „S10"): S8 Sprite-MISS-Recorder, S9 Window-SD-Sensor (hat den Bug gefunden), **S10 FIX** für den KNOWN ISSUE | KNOWN ISSUE GELÖST (Test ausstehend): Lockjaw Charakter-SD vor Fensteröffnungen = `BgLayerMask==0`-Loch → S7-Pfad (im BG-Block gated) übersprungen; S9 bewies `reason=mask0` 135/135; S10 behandelt Sub-Sprite über BG-Loch separat | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites, Filter multithreaded (~2 ms avg) | Nächstes: S10-Test (Lockjaw-Fenster: Charakter HD? keine `S9-SD`-Zeilen mehr?), dann S8+S9+S10 committen
+Stand: 2026-07-30 | Mesen Build: **S13 GEBAUT (UNCOMMITTED)** auf `c8e01223` (S12) | **MEILENSTEIN: die Weltkarten laufen in HD** — Krem Quay und Crocodile Cauldron user-bestätigt. Die komplette Shop/Worldmap-Kette (Render aus VRAM-Dump → SD-Export → Upscale → Import → Container → Pack-Export → Loader → Laufzeit-Match) ist damit end-to-end bewiesen. | S13 grenzt die M5.7-Worldmap-Sperre auf Packs ohne Fingerprints ein — sie traf ohnehin nur Gangplank, die einzige verbliebene SD-Karte. **Test ausstehend.** | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites/Anim-Kacheln, Filter multithreaded (~2 ms avg) | Nächstes: S13-Test (Gangplank HD? keine Regression?), dann Mehr-Ebenen-Schirme (Hub, Funky, Lost World) und die globale Schrift
+
+---
+
+## S13 — WORLDMAP-SPERRE AUF PACKS OHNE FINGERPRINTS EINGEGRENZT (2026-07-30, UNCOMMITTED, Build „S13")
+
+**Zweck:** Die Weltkarten haben jetzt eigene Gfxsets (`0x35`–`0x3E`, im Pack dezimal
+`53`–`62`) samt HD-Kunst, Content-Hashes und Fingerprints. Zwölf davon rendern bereits in
+HD — **user-bestätigt für Krem Quay und Crocodile Cauldron**. Genau eine Karte blieb SD:
+**Gangplank Galleon**, weil ihre VRAM-Signatur seit M5.7 hart gesperrt ist.
+
+**Root Cause:** `isWorldmap = (vramSig == 0xDBF342F9932FD251ULL)` (Z. 1243) trifft
+ausschließlich Gangplank — die Sperre war nie generisch, sondern immer eine
+Ein-Karten-Sperre. Belegt im Diagnose-Log des Users:
+
+```
+CONTEXT CHANGE #1: sig DBF342F9932FD251 (WORLDMAP) … gfx=-1/6
+FRAME 0/0 [WORLDMAP]: total=57344 bg=0 match=0 miss=0
+```
+
+`bg=0` = der komplette BG-Block wurde übersprungen; kein Pixel kam je bis zum Lookup.
+
+**Warum die Sperre 2026 obsolet ist:** M5.7 brauchte sie, weil damals jede Level-Kachel
+eine Karten-Kachel per Hash treffen konnte. Diese Aufgabe erledigt seit P4.2 das strikte
+Gfxset-Scoping (`SnesHdData.h:458`: `ActiveGfxset < 0` blockt komplett). Da die Karten
+inzwischen eigene Fingerprints mitbringen, würde die Sperre nur noch **ihre eigene Kunst**
+aussperren.
+
+**Fix (nur `SnesHdVideoFilter.cpp`, kein Header):** neues Kontextfeld `blockBgHd`:
+
+```cpp
+renderCtx.blockBgHd = isWorldmap && !_hdData->HasFingerprints();
+```
+
+Der BG-Block (Z. 595) gated jetzt darauf statt auf `isWorldmap`. Packs **ohne**
+Fingerprints verhalten sich unverändert — dort kann Scoping nicht helfen, also bleibt die
+alte Sperre aktiv.
+
+**Bewusst NICHT angefasst:** der S10-Zweig für Sub-Sprites über BG-Löchern (Z. 890) prüft
+weiter `isWorldmap`. Sprites sind vom Strict-Scoping ausgenommen (`SnesHdData.h:457`,
+`LayerIndex != 4`), dort ist die Sperre also **nicht** redundant. Ebenso unverändert:
+alle Diagnose-Labels.
+
+**Nebenbefund (nicht gefixt):** Der S4-**Main**-Sprite-Pfad (ab Z. 907) hat gar kein
+`isWorldmap`-Gate — HD-Sprites können auf der Karte über den Main-Pfad also schon lange
+rendern, über den Sub-/Loch-Pfad nicht. Inkonsistent, bisher folgenlos.
+
+**USER-TEST:** Gangplank-Karte in HD? Andere Karten und normale Level ohne Regression?
+Im Log muss `build=S13` stehen; erwartet wird auf Gangplank `gfx=54` statt `gfx=-1` und
+`bg>0` statt `bg=0`.
 
 ---
 
