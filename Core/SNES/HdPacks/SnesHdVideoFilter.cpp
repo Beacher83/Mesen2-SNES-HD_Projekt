@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -16,7 +17,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S13"
+#define SNES_HD_BUILD_VERSION "S15"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -1710,7 +1711,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						^ ((uint64_t)layer * 0xC2B2AE3D27D4EB4FULL);
 					if(s_bgCapSeen.find(seenKey) != s_bgCapSeen.end()) continue;
 					s_bgCapSeen.insert(seenKey);
-					if(_hdData->TileByKey.find(t.Key) != _hdData->TileByKey.end()) continue;  // covered
+					// S14: ask the RENDER PATH whether this tile is covered, not the
+					// raw map. SnesHdTileKey carries no gfxset — that lives on the
+					// tile and is applied by GetMatchingTile's strict scoping — so a
+					// bare TileByKey lookup counts a tile as covered even when the
+					// current context blocks it and the screen shows plain SD. Those
+					// tiles were invisible here: present in the pack, never matched,
+					// never recorded. The sprite recorder below already does this.
+					if(_hdData->GetMatchingTile(t.Key, hdScreen->Vram)) continue;  // covered
 
 					// Verify live VRAM still matches the captured hash (2bpp
 					// layers hash 8 words, 4bpp 16 words — same as the PPU)
@@ -1758,6 +1766,94 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 		}
 		if(s_bgCapFile) fflush(s_bgCapFile);
+	}
+
+	// =====================================================================
+	// S14: PALETTE-animation recording — the blind spot the bgcap recorder
+	// has by construction. Its dedup key is (ContentHash, palette index,
+	// layer), so a tile whose CHR bytes never change and whose palette
+	// INDEX never changes gets recorded exactly once, however often the
+	// game rewrites the COLORS in that palette row. Blinking lights are
+	// precisely that case — Krazy Kremland's sign on the hub, Swanky's
+	// light strip — which is why they show up in no capture at all.
+	//
+	// This decides whether there is any work to do: HD tiles already track
+	// live palettes through the R3 CGRAM-diff transform, so a palette-
+	// animated element animates BY ITSELF once its tile has HD art and
+	// needs no animation pipeline. A CHR-animated one needs the full S6b
+	// chain. The two are indistinguishable by eye and, until now, in the
+	// logs as well.
+	//
+	// Frames that rewrite MANY colors at once are fades and screen loads,
+	// not animation; they are summarised on one CGF line without indices
+	// so they cannot drown the few-color writes that matter.
+	// =====================================================================
+	// Deliberately NOT gated on ActiveGfxset, unlike the bgcap recorder above.
+	// A screen with no HD art yet has no fingerprint, so ActiveGfxset is -1 and
+	// a gfxset-gated recorder stays silent exactly where the question "does this
+	// blink via palette or via CHR?" is still open — Swanky's shop is that case,
+	// and Lost World was before it got art. Chicken and egg. The screen is keyed
+	// by its VRAM signature instead, which exists regardless of coverage; the
+	// gfxset is still logged when known.
+	{
+		static uint16_t s_cgPrev[256] = {};
+		static bool s_cgHave = false;
+		static uint64_t s_cgSig = 0;
+		static uint32_t s_cgLines = 0;
+		static FILE* s_cgFile = nullptr;
+		static bool s_cgAttempted = false;
+		const int gfx = _hdData->ActiveGfxset;
+		if(vramSig != s_cgSig) { s_cgSig = vramSig; s_cgHave = false; }   // new screen: re-baseline
+
+		if(!s_cgHave) {
+			memcpy(s_cgPrev, hdScreen->Cgram, sizeof(s_cgPrev));
+			s_cgHave = true;
+		} else if(s_cgLines < 20000) {   // ~4 MB ceiling; a blink cycle needs a handful of lines
+			int changed[12];
+			int nListed = 0, nTotal = 0;
+			for(int i = 0; i < 256; i++) {
+				if((hdScreen->Cgram[i] & 0x7FFF) == (s_cgPrev[i] & 0x7FFF)) continue;
+				nTotal++;
+				if(nListed < 12) changed[nListed++] = i;
+			}
+			if(nTotal > 0) {
+				if(!s_cgAttempted) {
+					s_cgAttempted = true;
+					const char* home = getenv("USERPROFILE");
+					if(!home) home = getenv("HOME");
+					if(home) {
+						char path[512];
+#ifdef _WIN32
+						snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_cgramcap.txt", home);
+#else
+						snprintf(path, sizeof(path), "%s/Downloads/snes_hd_cgramcap.txt", home);
+#endif
+						s_cgFile = fopen(path, "a");  // append across sessions
+					}
+				}
+				if(s_cgFile) {
+					if(nTotal <= 12) {
+						// Index is the raw CGRAM slot: BG palettes 0x00-0x7F
+						// (row = index/16 for 4bpp), sprite palettes 0x80-0xFF.
+						char line[512];
+						int off = snprintf(line, sizeof(line), "CGA G%d S%016llX F%u N%d",
+							gfx, (unsigned long long)vramSig, hdScreen->FrameNumber, nTotal);
+						for(int k = 0; k < nListed; k++) {
+							off += snprintf(line + off, sizeof(line) - off, " I%02X:%04X>%04X",
+								changed[k], s_cgPrev[changed[k]] & 0x7FFF,
+								hdScreen->Cgram[changed[k]] & 0x7FFF);
+						}
+						fprintf(s_cgFile, "%s\n", line);
+					} else {
+						fprintf(s_cgFile, "CGF G%d S%016llX F%u N%d\n",
+							gfx, (unsigned long long)vramSig, hdScreen->FrameNumber, nTotal);
+					}
+					s_cgLines++;
+					fflush(s_cgFile);
+				}
+			}
+			memcpy(s_cgPrev, hdScreen->Cgram, sizeof(s_cgPrev));
+		}
 	}
 
 	// =====================================================================
@@ -1837,6 +1933,76 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 		}
 		if(s_sprMissFile) fflush(s_sprMissFile);
+	}
+
+	// =====================================================================
+	// S15: sprite POSITION recording — where each sprite tile sits on screen.
+	// The world maps draw their level names straight into OAM (the p4plus2
+	// disassembly's sprites.txt has no entry for them, and no VRAM still dump
+	// contains them), so the letters exist only as runtime captures. spritemiss
+	// already carries their pixels, but not where they were — and without that
+	// the glyphs cannot be reassembled into words, which is what an upscaler
+	// needs to produce decent art. One 8x8 fragment on its own upscales badly.
+	//
+	// Deliberately a SEPARATE file rather than extra columns on SPRMISS: that
+	// format is consumed by the viewer's importer, and its dedup keeps only the
+	// first sighting of each tile — exactly the wrong thing here, where the same
+	// letter legitimately appears at several positions.
+	//
+	// Sampled on the 8-pixel grid like the bgcap recorder, so each tile position
+	// yields about one line and coordinates land on a tile-sized raster — plenty
+	// to group letters into words. Deduped per (hash, x, y): a name sitting still
+	// costs a handful of lines, while a different name at the same spot has
+	// different hashes and is recorded in full.
+	// =====================================================================
+	if(hdScreen->Vram) {
+		static std::unordered_set<uint64_t> s_sprPosSeen;
+		static FILE* s_sprPosFile = nullptr;
+		static bool s_sprPosAttempted = false;
+		static uint32_t s_sprPosLines = 0;
+		if(s_sprPosLines < 60000) {
+			for(uint32_t sy = overscan.Top; sy < (uint32_t)(239 - overscan.Bottom); sy += 8) {
+				for(uint32_t sx = 0; sx < 256; sx += 8) {
+					const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[sy * SnesHdScreenInfo::ScreenWidth + sx];
+					if(!pi.SpriteCount) continue;
+					for(int s = 0; s < 2; s++) {
+						if(!(pi.SpriteCount & (1 << s))) continue;
+						const SnesHdPpuTileInfo& t = pi.Sprites[s];
+						if(t.Key.ContentHash == 0) continue;
+						uint64_t posKey = t.Key.ContentHash
+							^ ((uint64_t)sx * 0x9E3779B97F4A7C15ULL)
+							^ ((uint64_t)sy * 0xC2B2AE3D27D4EB4FULL);
+						if(s_sprPosSeen.find(posKey) != s_sprPosSeen.end()) continue;
+						// Only record tiles whose live VRAM still matches, same as
+						// the miss recorder — the OBJ stream is rewritten mid-frame.
+						if(ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, 16) != t.Key.ContentHash) continue;
+						s_sprPosSeen.insert(posKey);
+
+						if(!s_sprPosAttempted) {
+							s_sprPosAttempted = true;
+							const char* home = getenv("USERPROFILE");
+							if(!home) home = getenv("HOME");
+							if(home) {
+								char path[512];
+#ifdef _WIN32
+								snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_sprpos.txt", home);
+#else
+								snprintf(path, sizeof(path), "%s/Downloads/snes_hd_sprpos.txt", home);
+#endif
+								s_sprPosFile = fopen(path, "a");
+							}
+						}
+						if(!s_sprPosFile) break;
+						fprintf(s_sprPosFile, "SPRPOS G%d S%016llX F%u X%03u Y%03u P%d %c H%016llX\n",
+							(int)_hdData->ActiveGfxset, (unsigned long long)vramSig,
+							hdScreen->FrameNumber, sx, sy, t.Key.PaletteIndex,
+							s == 0 ? 'M' : 'S', (unsigned long long)t.Key.ContentHash);
+						s_sprPosLines++;
+					}
+				}
+			}
+			if(s_sprPosFile) fflush(s_sprPosFile);
+		}
 	}
 
 	// =====================================================================

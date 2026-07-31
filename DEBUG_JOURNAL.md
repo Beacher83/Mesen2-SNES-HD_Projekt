@@ -1,6 +1,174 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-30 | Mesen Build: **S13 GEBAUT (UNCOMMITTED)** auf `c8e01223` (S12) | **MEILENSTEIN: die Weltkarten laufen in HD** — Krem Quay und Crocodile Cauldron user-bestätigt. Die komplette Shop/Worldmap-Kette (Render aus VRAM-Dump → SD-Export → Upscale → Import → Container → Pack-Export → Loader → Laufzeit-Match) ist damit end-to-end bewiesen. | S13 grenzt die M5.7-Worldmap-Sperre auf Packs ohne Fingerprints ein — sie traf ohnehin nur Gangplank, die einzige verbliebene SD-Karte. **Test ausstehend.** | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites/Anim-Kacheln, Filter multithreaded (~2 ms avg) | Nächstes: S13-Test (Gangplank HD? keine Regression?), dann Mehr-Ebenen-Schirme (Hub, Funky, Lost World) und die globale Schrift
+Stand: 2026-07-31 | Mesen Build: **S15 GEBAUT (UNCOMMITTED, ungetestet)** — S15 ergänzt den Sprite-POSITIONS-Recorder (`snes_hd_sprpos.txt`) für die Levelnamen-Schrift, siehe unten. | S14 (uncommitted)
+
+---
+
+## S15 — SPRITE-POSITIONEN AUFZEICHNEN (2026-07-31, UNCOMMITTED, Build „S15")
+
+**Warum:** Die Levelnamen der Weltkarten werden direkt in OAM gezeichnet — `sprites.txt`
+der p4plus2-Disassembly kennt sie nicht (wohl aber `0x158, "Skull Cart"`), und in keinem
+VRAM-Standbild stehen sie. Sie existieren also ausschließlich als Laufzeit-Capture.
+`snes_hd_spritemiss.txt` hat ihre Pixel, aber **nicht ihre Position** — und ohne die lassen
+sich die Glyphen nicht zu Wörtern zusammensetzen. Einzelne 8×8-Schnipsel upscalen liefert
+schlechte Kunst (die Lektion aus S6b).
+
+**Bewusst eine EIGENE Datei statt zusätzlicher Spalten in `SPRMISS`:** dessen Format liest
+der Viewer-Importer, und sein Dedup behält nur die ERSTE Sichtung je Kachel — genau falsch
+hier, wo derselbe Buchstabe an mehreren Stellen steht.
+
+- Sampling auf dem 8-Pixel-Raster wie beim bgcap-Recorder → ~eine Zeile je Kachelposition,
+  Koordinaten auf Kachelraster (für Wortgruppierung mehr als genug).
+- Dedup über **(hash, x, y)**: ein stehender Name kostet eine Handvoll Zeilen, ein anderer
+  Name an derselben Stelle hat andere Hashes und wird vollständig erfasst.
+- Live-Rehash-Prüfung wie beim Miss-Recorder (der OBJ-Stream wird mitten im Frame neu
+  beschrieben). Deckel 60 000 Zeilen.
+- Format: `SPRPOS G<gfx> S<sig16> F<frame> X<x> Y<y> P<pal> <M|S> H<hash16>`
+
+Nur `SnesHdVideoFilter.cpp`, kein Header → **inkrementeller Build.**
+
+---
+
+Vorheriger Stand: 2026-07-31 | Mesen Build: **S14 GEBAUT (UNCOMMITTED, ungetestet)** auf `62c3a2b5` — zwei Blindstellen der Aufzeichnung geschlossen, siehe S14 unten. S13 ist user-bestätigt und gepusht.
+
+---
+
+## S14 — ZWEI BLINDSTELLEN DER AUFZEICHNUNG (2026-07-31, UNCOMMITTED, Build „S14")
+
+**Auslöser:** Der User meldet vier animierte Elemente auf Karten und in Shops — Lost Worlds
+Rauchsäule, das blinkende Kremland-Schild auf dem Hub, kleine Fackeln auf dem Hub, eine
+Lichterleiste in Swankys Laden. In den Aufzeichnungen steht **nur die Rauchsäule** (128
+Frames, G61). Für den Hub gibt es keine einzige `bgcap`-Zeile, obwohl er erkannt wird
+(`gfx=53`, drei Kontextwechsel im Log). Vermutung des Users: es fehlt eine Log-Fähigkeit.
+Das trifft zu — und zwar an zwei unabhängigen Stellen.
+
+### (a) Der Coverage-Check kannte das Strict-Scoping nicht
+
+Der bgcap-Recorder entschied „schon abgedeckt" mit
+`_hdData->TileByKey.find(t.Key) != end()`. **`SnesHdTileKey` trägt aber kein Gfxset**
+(`SnesHdData.h:60`) — das sitzt am *Tile* (`GfxsetIndex`, `:271`) und wird erst von
+`GetMatchingTile` angewandt (`:465`). Eine Kachel, die im Pack unter einem **fremden**
+Gfxset liegt, galt dem Recorder damit als abgedeckt, obwohl das strikte Scoping sie zur
+Laufzeit blockt und der Schirm sie in SD zeigt. Solche Kacheln waren doppelt unsichtbar:
+kein HD im Bild, kein Eintrag im Log.
+
+**Fix:** Der Recorder fragt jetzt `GetMatchingTile` — dieselbe Entscheidung, die der
+Renderpfad trifft. Der Sprite-Recorder (`S8`) macht das seit jeher so; die beiden waren
+schlicht nicht gleichgezogen.
+
+### (b) Palette-Animationen sind prinzipiell unsichtbar → neuer CGRAM-Recorder
+
+Der Dedup-Key des Recorders ist `(ContentHash, PaletteIndex, Layer)`. Ändert das Spiel
+nur die **Farben** einer Palettenzeile, bleiben alle drei Bestandteile gleich: die Kachel
+wird im allerersten Frame einmal betrachtet und danach nie wieder. Blinkende Lichter sind
+exakt dieser Fall. Kein Gate, kein Limit — die Aufzeichnung kann diese Klasse von
+Animation konstruktionsbedingt nicht sehen.
+
+**Warum das mehr als Diagnose ist:** HD-Kacheln folgen über den R3-CGRAM-Diff-Transform
+bereits den Live-Paletten. Ein palettenanimiertes Element **animiert also von selbst**,
+sobald seine Kachel HD-Kunst hat, und braucht überhaupt keine Anim-Pipeline. Ein
+CHR-animiertes braucht die volle S6b-Kette. Die beiden sind mit bloßem Auge nicht zu
+unterscheiden — und waren es in den Logs bisher auch nicht.
+
+**Neu: `snes_hd_cgramcap.txt`.** Pro Frame werden die 256 CGRAM-Einträge gegen den
+Vorframe verglichen; jede Änderung wird mit Gfxset, Frame-Nummer, Slot und
+Alt-→-Neu-Farbe protokolliert. Frames, die viele Farben auf einmal umschreiben, sind
+Fades und Schirmwechsel, keine Animation — sie werden auf eine `CGF`-Zusammenfassung ohne
+Indizes reduziert, damit sie die wenigen interessanten Schreibvorgänge nicht zudecken.
+Basislinie wird bei jedem Gfxset-Wechsel neu gesetzt. Deckel bei 20 000 Zeilen.
+
+```
+CGA G53 F12345 N2 I6D:1F00>7FFF I6E:0C00>3DEF     ← zwei Farben = Animationsverdacht
+CGF G53 F12400 N214                               ← Fade/Schirmwechsel, ignorieren
+```
+
+**Auswertung:** wiederkehrende `CGA`-Zeilen auf denselben Slots = Palette-Animation
+(nichts zu tun außer HD-Kunst für die Kachel). Keine `CGA`-Zeilen, dafür neue
+`bgcap`-Einträge auf derselben Stelle = CHR-Animation (S6b-Kette). Beides nichts = das
+Element ist ein Sprite.
+
+**Umfang:** nur `SnesHdVideoFilter.cpp` (+ `<cstring>`), kein Header, kein Renderpfad —
+**inkrementeller Build genügt.** Build-Version auf `S14` gezogen.
+
+### ERGEBNIS DES ERSTEN S14-LAUFS (2026-07-31) — beide Fixes haben geliefert
+
+**Gegenprobe sauber:** Lost World meldet **eine einzige** CGRAM-Änderung (Backdrop), der
+Hub **3850** — und der Hub hat weiterhin **null** bgcap-Zeilen. Die beiden Klassen sind
+damit erstmals messbar getrennt.
+
+**Hub = ausschließlich Palette-Animation, in zwei Sorten:**
+
+| Slots | Muster | R3-Transform |
+|---|---|---|
+| `$31`–`$37` (Zeile 3) | 469×, alle 7 Farben **gleichsinnig** ±5 Stufen | **korrekt** — Ratio schwankt nur in Rot, 79–100 % |
+| `$4C` (Zeile 4) | 442×, binär `0000`↔`0380` (an/aus) | **falsch** |
+| `$4D`–`$4F` (Zeile 4) | 3850×, jeden Frame, 64 Farben synchron | **falsch** |
+
+**Warum falsch:** das Ratio wird aus der **Summe aller 15 Farben** einer Zeile gebildet
+(Z. 1288–1302). Ändern sich alle Farben gleichsinnig (Zeile 3), trifft das die Sache genau.
+Blinkt eine **einzelne** Farbe, moduliert das Ratio dagegen die ganze Kachelfläche:
+gemessener Ausschlag auf Zeile 4 **74–106 % im Grünkanal, 46 Zustände**.
+
+### KORREKTUR: die praktische Auswirkung ist gering — nachgemessen
+
+Der erste Schluss („die Fläche flackert grünlich") war eine Rechnung ohne Blick aufs Bild,
+und der User widerspricht zu Recht: der Hub wird sauber dargestellt. Die Pixelmessung
+erklärt, warum:
+
+| Ebene | Zellen auf Zeile 4 | Pixel auf den ANIMIERTEN Indizes 12–15 |
+|---|---|---|
+| BG2 (x19–22, y35–37) | 18 | **234 von 234 = 100 %** |
+| BG1 (x9–27, y33–53) | 80 | 40 von 5107 = **0,8 %** |
+
+Die BG2-Kacheln sind **reine Lampenkacheln** — sie bestehen ausschließlich aus den
+Farben, die blinken. Für sie zieht das Zeilen-Ratio in genau die richtige Richtung: die
+Lampen werden gedimmt statt hart geschaltet, aber sie blinken. **Das Kremland-Schild
+funktioniert in HD bereits.** Die 80 BG1-Kacheln werden zwar fälschlich mitmoduliert,
+liegen aber in ~80 % der Frames bei 98–101 % und nur gelegentlich bei 74 % Grün.
+
+**Fazit: Issue U ist eine Notiz, keine Baustelle.** Eine indexgenaue Farbsubstitution wäre
+theoretisch korrekter, aber sie wäre eine Änderung im heißen Renderpfad für einen Effekt,
+den man nicht sieht. Nicht anfassen, solange kein sichtbares Problem gemeldet wird.
+
+### (c) NACHTRAG: cgramcap darf nicht auf das Gfxset gegated sein
+
+Swankys Laden **wurde** besucht (eigene Signatur `0D3FD661746FF022`, CTX #9–12), lieferte
+aber keine einzige Zeile — weil er mangels HD-Art keinen Fingerprint hat und damit auf
+`gfx=-1` steht, während der Recorder `ActiveGfxset >= 0` verlangte. Henne und Ei: genau
+dort, wo „Palette oder CHR?" offen ist, schwieg die Aufzeichnung. (Dieselbe Falle traf
+Lost World, bevor es Kunst bekam.)
+
+**Der CGRAM-Recorder ist jetzt ungegated** und schlüsselt den Schirm über seine
+**VRAM-Signatur**, die es unabhängig von der Abdeckung gibt; das Gfxset wird weiterhin
+mitgeschrieben, wenn bekannt. Neues Feld `S<sig16>` in `CGA`/`CGF`.
+**Der bgcap-Recorder bleibt bewusst gegated** — ohne Gfxset wären seine Kacheln für den
+Export nicht zuordenbar, und Swanky bekommt seinen Fingerprint ohnehin mit dem statischen
+Shop-Export, danach zeichnet er von selbst auf.
+
+**Wichtig für die Planung: Palette-Animation ist mit der S6b-Kette prinzipiell nicht
+lösbar.** Der Tile-Key enthält den Palette-INDEX, nicht die Farben — alle Blinkphasen haben
+denselben ContentHash, Mesen kann sie gar nicht unterscheiden. Es ist ein Renderpfad-Thema
+(indexgenaue Farbsubstitution statt Zeilen-Ratio), kein Kunst-Thema. **Für den Hub gibt es
+folglich nichts zu exportieren und nichts hochzuskalieren.** Zurückgestellt als Issue U.
+
+### ★ NEBENFUND, DEN NUR FIX (a) SICHTBAR MACHEN KONNTE: FUNKYS BG2 LÄUFT IN SD ★
+
+Neu im Log: **239 Adressen ab `$6000` auf L1, lückenlos in 16er-Schritten, alle Palette 7**
+— Funkys Flights (G9), dessen zweite Szenenebene. Nachgerechnet gegen die Dumps:
+**alle 239 Kacheln existieren byte-identisch in gfxset_25** (87 an derselben Adresse, 152 an
+anderer, **0 fehlen**). Die HD-Kunst liegt also längst im Pack — unter `gfxset_37` — und das
+strikte Scoping blockt sie bei `ActiveGfxset == 9` korrekterweise. Ergebnis: Funkys BG2
+rendert nativ, obwohl die Kunst vorhanden ist.
+
+Der alte `TileByKey.find`-Check hielt genau diese Kacheln für abgedeckt — sie waren die
+Blindstelle in Reinform. Behebung braucht **keinen** neuen Renderpfad: Funky einmal als
+eigenes Set exportieren, damit dieselbe Kunst auch unter `gfxset_09` im Pack liegt. Der
+Viewer kennt den Extra-Layer bereits (`OVERWORLD_SETS[0x09].extraLayers`).
+Dazu 4 echte Lücken auf Funkys BG1 (`$3880`, `$40F0`–`$4110`).
+
+---
+
+Vorheriger Stand: 2026-07-30 | Mesen Build: **S13** auf `c8e01223` (S12) | **MEILENSTEIN: die Weltkarten laufen in HD** — Krem Quay und Crocodile Cauldron user-bestätigt. Die komplette Shop/Worldmap-Kette (Render aus VRAM-Dump → SD-Export → Upscale → Import → Container → Pack-Export → Loader → Laufzeit-Match) ist damit end-to-end bewiesen. | S13 grenzt die M5.7-Worldmap-Sperre auf Packs ohne Fingerprints ein — sie traf ohnehin nur Gangplank, die einzige verbliebene SD-Karte. **Test ausstehend.** | Architektur: P4.0-Composite-Engine + P4.2 Gfxset-Scoping + hash-keyed Sprites/Anim-Kacheln, Filter multithreaded (~2 ms avg) | Nächstes: S13-Test (Gangplank HD? keine Regression?), dann Mehr-Ebenen-Schirme (Hub, Funky, Lost World) und die globale Schrift
 
 ---
 
