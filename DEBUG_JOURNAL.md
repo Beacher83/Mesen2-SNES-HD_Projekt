@@ -1,6 +1,136 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-07-31 | Mesen Build: **S15 GEBAUT (UNCOMMITTED, ungetestet)** — S15 ergänzt den Sprite-POSITIONS-Recorder (`snes_hd_sprpos.txt`) für die Levelnamen-Schrift, siehe unten. | S14 (uncommitted)
+Stand: 2026-08-05 | Mesen Build: **S17 (user-bestätigt, committet)** — OAM-Recorder, ersetzt das Erraten von Sprite-Objekten. Am 2026-08-05 end-to-end bewiesen: die Hub-Objekte (Fackeln, Flagge, Luftschiff) laufen in Mesen in HD, den ganzen Weg über den Viewer statt per Skript. | S16 mit committet
+
+---
+
+## S17 — OAM STATT BILDSCHIRMABTASTUNG (2026-08-03, UNCOMMITTED, Build „S17")
+
+**Warum:** S15/S16 tasten den Bildschirm ab und schreiben eine Zeile je Kachel. Das hält
+fest, WAS gezeichnet wurde, aber nie, WAS ZUSAMMENGEHÖRT. Der Viewer musste Objekte aus
+Nachbarschaft und einem Frame-Fenster erschließen — und **jeder** Fehlschlag dieses
+Workstreams geht darauf zurück:
+
+- Die Piratenflagge auf dem Hub war bei Fenster 1 da und bei Fenster 600 weg. Ob die
+  Kacheln eines Objekts im selben Fenster landeten wie ihre Nachbarn, war Zufall: `sprpos`
+  dedupliziert über `(hash, origin)`, jede Kachel steht also **genau einmal** in der Datei.
+- Der Steinweg kam unvollständig heraus, Fackeln verschmolzen mit Dixies Kopf.
+- Animationsphasen mussten über Überlappung geraten werden.
+
+**Die Information fehlte nur in unseren Dateien, nicht im Emulator.** `SpriteInfo`
+(`SnesPpuTypes.h:21`) trägt `Index` — die OAM-Nummer —, dazu `X`, `Y`, `Width`, `Height`,
+`Palette` und beide Spiegel-Flags. **Ein OAM-Eintrag IST ein Objekt** (8×8 bis 64×64),
+vom Spiel so definiert, und der Index ist über Frames hinweg eine stabile Identität.
+
+**Neu: `snes_hd_oam.txt`.** Je Frame ein Kopf plus eine Zeile je sichtbarem Eintrag:
+
+```
+OAMF G<gfx> S<sig16> F<frame> M<oamMode> N<anzahl>
+OAM I<idx> X<+xxx> Y<yyy> W<ww> H<hh> T<tile9hex> P<pal> R<prio> <H|-><V|-> <hash…>
+```
+
+Die Hashes sind alle Unterkacheln des Objekts, in Lesereihenfolge — der Viewer hat kein
+VRAM und findet die Pixel darüber in `spritemiss`. Der Kachellauf spiegelt
+`FetchSpriteAttributes`: ein W×H-Sprite belegt (W/8)×(H/8) Kacheln in der 16×16-Nametable
+**mit Umbruch innerhalb der Zeile**.
+
+**Was sich strukturell ändert:**
+
+| S15/S16 | S17 |
+|---|---|
+| Kachel einmal je Sitzung → kein Frame vollständig | **Jeder Frame vollständig** → Frame-Fenster entfällt |
+| Objekt = geratene Nachbarschaft | Objekt = OAM-Eintrag |
+| Phasen über Überlappung erschlossen | gleicher Index, andere Kachelnummer = **die Phase** |
+
+**Volumen:** geschrieben wird nur, wenn sich die **sichtbare** OAM-Belegung ändert
+(FNV-Signatur über Index/Kachel/Position/Palette). Ein stehender Kartenschirm kostet einen
+Frame, eine Fackel einen je Phase. Deckel 20 000 Frames.
+
+**Zwei Stellen, an denen ich mich fast vertan hätte** — beide gegen Mesens eigene
+Auswertung geprüft statt aus dem Kopf geschrieben:
+1. **Sprites sind RECHTECKIG.** `FetchSpritePosition` (`SnesPpu.cpp:689`) hat getrennte
+   `oamWidth[16]`/`oamHeight[16]`-Tabellen, indiziert mit `OamMode | (largeFlag << 3)`.
+   Eine einzelne „Größe" je Modus wäre für 16×32 und 32×64 falsch gewesen.
+2. **Y wickelt um.** Ein Sprite ist erst unsichtbar, wenn es ganz in `[240,256)` liegt
+   *und* nicht über den Umbruch reicht. Ein naives „unterhalb des Schirms" hätte die
+   Sprites am unteren Bildrand verworfen.
+
+**Header berührt** (`SnesHdData.h`: `Oam`, `OamBaseAddress`, `OamAddressOffset`, `OamMode`
+in `SnesHdScreenInfo`) → inkrementeller Build zieht die Abhängigkeiten nach, dauert etwas
+länger als sonst. Build-Version auf **S17**.
+
+**`sprpos` wird damit überflüssig**, bleibt aber vorerst drin, bis der OAM-Weg bestätigt ist.
+`spritemiss` bleibt dauerhaft — es liefert die Pixel.
+
+### ★ S17 GETESTET UND BESTÄTIGT (2026-08-04, Hub-Aufzeichnung) ★
+
+`snes_hd_oam.txt`: **4264 Frames** (nur bei geänderter OAM-Belegung), 18,7 MB.
+Verteilung G53 3589, G-1 550, G9 125. **0 Zeilen mit falscher Hash-Anzahl** — der
+Kachellauf inklusive Zeilenumbruch in der 16×16-Nametable stimmt exakt.
+
+**Hub: 240 038 Einträge → 300 distinkte Objekte.** Zum Vergleich: der geratene Weg
+lieferte für denselben Schirm 2229 „Objekte", von denen die meisten Klumpen oder
+Bruchstücke waren.
+
+**Gruppierungsregel gefunden — und sie ist keine Heuristik:** Zusammensetzen über
+räumliche Überlappung scheitert auf dem Hub (Flagge, Kongs und Levelname berühren sich
+und verschmelzen zu einem Block). **Ein Spiel legt die Sprites eines Objekts aber in einem
+zusammenhängenden OAM-INDEXBLOCK ab.** Gruppiert man nach Indexlauf (plus einer
+Näheprüfung gegen zufällig benachbarte Indizes), fallen die Objekte einzeln heraus:
+
+- **Piratenflagge** — Totenkopf, Knochen und Mast als eine Einheit, in mehreren Wehphasen
+- **Fackeln** — als Paar, komplett mit Stiel UND Flamme (der Fall, an dem die
+  Palettentrennung des alten Wegs auseinanderfiel)
+- **Torhaus mit beiden Fackeln** — vollständig
+- **Rauchwolken des Luftschiffs** — sauber getrennt
+
+**Damit ist der alte Weg abgelöst.** Der Viewer wird auf OAM umgebaut; `sprpos` kann
+danach entfallen.
+
+---
+
+## S16 — POSITIONS-RECORDER VERLOR SYSTEMATISCH KACHELN (2026-08-03, UNCOMMITTED, Build „S16")
+
+**Symptom (User-Test des Viewer-Laufzeit-Reiters):** Wörter erschienen mit halben
+Buchstaben — bei `ANTICS` fehlte die obere Hälfte von `C` und `S`, bei `FUNKY` die untere
+Hälfte des `Y`. Beim DK-Münz-Symbol (vier Kacheln) fehlte reihenweise eine **Ecke**.
+Die Steine aus Lost World und die Kong-Köpfe waren ebenfalls unvollständig.
+
+**Kein Zufall, sondern eine Bauartgrenze.** `SnesPpu::RenderSprites` (`SnesPpu.cpp:809`)
+füllt `HdSpritePixel` ausschließlich dort, wo `color != 0`:
+
+```cpp
+if(color != 0) {
+    ...
+    sp.OffsetX = (uint8_t)x;
+    sp.OffsetY = _currentSprite.TileRowOffset;
+}
+```
+
+Eine Sprite-Kachel existiert in `ScreenTiles` also **nur an ihren deckenden Pixeln**.
+S15 tastete ein 8-Pixel-Raster ab — pro Kachel genau ein Punkt. Lag dieser eine Punkt auf
+einem transparenten Pixel, wurde die Kachel **nie aufgezeichnet**. Deshalb traf es
+verlässlich die dünnen Stellen: Buchstabenhälften ohne Tinte in der abgetasteten Zeile
+und die Ecken runder Symbole, wo die Kunst konstruktionsbedingt leer ist.
+
+**Fix:** jeden Pixel abtasten statt eines Rasters, und **den Kachelursprung melden statt
+des Abtastpunkts**. `OffsetX`/`OffsetY` sind der Pixelversatz *innerhalb* der 8×8-Kachel,
+der Ursprung ist damit `(px - OffsetX, py - OffsetY)`. Dedup läuft jetzt über
+`(hash, originX, originY)` — dadurch ist es **gleichgültig, welcher Pixel getroffen wurde**,
+und das Ausgabevolumen bleibt wie bisher bei etwa einer Zeile je Kachelinstanz.
+Sprites, die links/oben aus dem Bild ragen, werden geklemmt statt verworfen.
+
+**⚠ ALTE `snes_hd_sprpos.txt` VORHER LÖSCHEN.** Mesen hängt an die Datei an. Alte Zeilen
+tragen Abtastpunkte (x Vielfache von 8, y alle mit demselben Rest), neue echte Ursprünge —
+gemischt bekäme dieselbe Kachel zwei leicht verschiedene Positionen. Der Viewer erkennt
+das alte Format an genau dieser Signatur und sagt es beim Laden.
+
+**Nachtrag aus dem ersten S16-Lauf:** die Datei traf mit 60 006 Zeilen exakt den Deckel,
+die Aufzeichnung brach also mitten im Kartenlauf ab. **Deckel auf 200 000 angehoben**
+(~70 Byte je Zeile ⇒ ~14 MB; der Viewer parst das in unter einer Sekunde).
+
+**Nur `SnesHdVideoFilter.cpp`, kein Header → inkrementeller Build reicht.**
+Build-Version auf **S16**.
 
 ---
 

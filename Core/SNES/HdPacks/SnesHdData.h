@@ -237,6 +237,17 @@ struct SnesHdScreenInfo
 	uint32_t FrameNumber = 0;
 	uint16_t Scanline = 0;
 
+	// S17: OAM, so a sprite OBJECT can be recorded as the game defined it.
+	// The screen capture in ScreenTiles knows which tile produced a pixel but
+	// not what belongs together — that has to be guessed from adjacency, and the
+	// guess is what made whole objects come and go depending on grouping
+	// settings. OAM carries the answer: one entry IS one object (up to 64x64),
+	// with its own position, size, palette and mirror flags.
+	uint8_t* Oam = nullptr;     // 544 bytes: 128 x 4-byte entries + 32-byte high table
+	uint16_t OamBaseAddress = 0;    // OBSEL name base (word address)
+	uint16_t OamAddressOffset = 0;  // OBSEL name select — offset of the second tile table
+	uint8_t OamMode = 0;            // OBSEL size mode 0-7 (which two sprite sizes are active)
+
 	SnesHdScreenInfo(const SnesHdScreenInfo&) = delete;
 	SnesHdScreenInfo& operator=(const SnesHdScreenInfo&) = delete;
 

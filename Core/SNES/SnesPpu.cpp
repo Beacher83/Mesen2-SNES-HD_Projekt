@@ -41,6 +41,8 @@ SnesPpu::SnesPpu(Emulator* emu, SnesConsole* console)
 	_hdScreenInfo[1] = new SnesHdScreenInfo();
 	_hdScreenInfo[0]->Vram = _vram;
 	_hdScreenInfo[1]->Vram = _vram;
+	_hdScreenInfo[0]->Oam = _oamRam;   // S17: sprite OBJECT identity for the recorder
+	_hdScreenInfo[1]->Oam = _oamRam;
 	_hdActiveScreen = _hdScreenInfo[0];
 }
 
@@ -1758,6 +1760,11 @@ void SnesPpu::SendFrame()
 		// P4.0: CGRAM snapshot — basis for detecting palette shifts vs. the
 		// pack's reference palettes (underwater darkening, sunset HDMA, cycling).
 		memcpy(_hdActiveScreen->Cgram, _cgram, sizeof(_hdActiveScreen->Cgram));
+		// S17: the OBSEL fields decide how an OAM entry maps to VRAM tiles, so
+		// they have to travel with the frame — OAM alone cannot be decoded.
+		_hdActiveScreen->OamBaseAddress = _state.OamBaseAddress;
+		_hdActiveScreen->OamAddressOffset = _state.OamAddressOffset;
+		_hdActiveScreen->OamMode = _state.OamMode;
 		frame.Data = _hdActiveScreen;
 		// Swap to other buffer for next frame
 		_hdActiveScreen = (_hdActiveScreen == _hdScreenInfo[0]) ? _hdScreenInfo[1] : _hdScreenInfo[0];

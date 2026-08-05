@@ -17,7 +17,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S15"
+#define SNES_HD_BUILD_VERSION "S17"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -1936,7 +1936,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	}
 
 	// =====================================================================
-	// S15: sprite POSITION recording — where each sprite tile sits on screen.
+	// S15/S16: sprite POSITION recording — where each sprite tile sits on screen.
 	// The world maps draw their level names straight into OAM (the p4plus2
 	// disassembly's sprites.txt has no entry for them, and no VRAM still dump
 	// contains them), so the letters exist only as runtime captures. spritemiss
@@ -1945,30 +1945,57 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// needs to produce decent art. One 8x8 fragment on its own upscales badly.
 	//
 	// Deliberately a SEPARATE file rather than extra columns on SPRMISS: that
-	// format is consumed by the viewer's importer, and its dedup keeps only the
-	// first sighting of each tile — exactly the wrong thing here, where the same
-	// letter legitimately appears at several positions.
+	// recorder's dedup keeps only the first sighting of each tile — exactly the
+	// wrong thing here, where the same letter legitimately appears at several
+	// positions. The viewer reads BOTH files (button "Laufzeit"): spritemiss for
+	// the pixels, sprpos for the layout, joined into whole words.
 	//
-	// Sampled on the 8-pixel grid like the bgcap recorder, so each tile position
-	// yields about one line and coordinates land on a tile-sized raster — plenty
-	// to group letters into words. Deduped per (hash, x, y): a name sitting still
-	// costs a handful of lines, while a different name at the same spot has
-	// different hashes and is recorded in full.
+	// S16: scans EVERY pixel and reports the tile's ORIGIN, not the sample point.
+	//
+	// S15 sampled an 8-pixel grid and logged the sample coordinates. That lost
+	// tiles, and the loss was systematic rather than random: SnesPpu::RenderSprites
+	// (SnesPpu.cpp:809) only fills HdSpritePixel where `color != 0`, so a sprite
+	// tile exists in ScreenTiles ONLY at its OPAQUE pixels. If the one grid point
+	// inside a tile happened to land on a transparent pixel, that tile was never
+	// recorded at all — which is why words came back missing letter halves and the
+	// DK coin (a round symbol on four tiles) kept losing its corners, where the
+	// artwork is empty by construction.
+	//
+	// Any opaque pixel will do once the origin is derived: OffsetX/OffsetY are the
+	// pixel's screen-space position WITHIN its 8x8 tile, so the tile starts at
+	// (sx - OffsetX, sy - OffsetY). Deduping on (hash, originX, originY) instead of
+	// the sample point keeps the output volume the same as before — still about one
+	// line per tile instance — while no longer depending on WHICH pixel was hit.
+	// A name sitting still costs a handful of lines; a different name at the same
+	// spot has different hashes and is recorded in full.
 	// =====================================================================
 	if(hdScreen->Vram) {
 		static std::unordered_set<uint64_t> s_sprPosSeen;
 		static FILE* s_sprPosFile = nullptr;
 		static bool s_sprPosAttempted = false;
 		static uint32_t s_sprPosLines = 0;
-		if(s_sprPosLines < 60000) {
-			for(uint32_t sy = overscan.Top; sy < (uint32_t)(239 - overscan.Bottom); sy += 8) {
-				for(uint32_t sx = 0; sx < 256; sx += 8) {
-					const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[sy * SnesHdScreenInfo::ScreenWidth + sx];
+		// Raised from 60 000: the first S16 session hit that ceiling while still
+		// walking the world maps, so the later ones were recorded only in part.
+		// At ~70 bytes a line this caps the file around 14 MB, which the viewer
+		// parses in well under a second.
+		if(s_sprPosLines < 200000) {
+			for(uint32_t py = overscan.Top; py < (uint32_t)(239 - overscan.Bottom); py++) {
+				for(uint32_t px = 0; px < 256; px++) {
+					const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[py * SnesHdScreenInfo::ScreenWidth + px];
 					if(!pi.SpriteCount) continue;
 					for(int s = 0; s < 2; s++) {
 						if(!(pi.SpriteCount & (1 << s))) continue;
 						const SnesHdPpuTileInfo& t = pi.Sprites[s];
 						if(t.Key.ContentHash == 0) continue;
+						// Tile origin from the pixel's offset inside it. Clamped rather
+						// than skipped: a sprite may hang off the left/top edge, and its
+						// visible part is still worth having.
+						int32_t ox = (int32_t)px - (int32_t)t.OffsetX;
+						int32_t oy = (int32_t)py - (int32_t)t.OffsetY;
+						if(ox < 0) ox = 0;
+						if(oy < 0) oy = 0;
+						uint32_t sx = (uint32_t)ox;
+						uint32_t sy = (uint32_t)oy;
 						uint64_t posKey = t.Key.ContentHash
 							^ ((uint64_t)sx * 0x9E3779B97F4A7C15ULL)
 							^ ((uint64_t)sy * 0xC2B2AE3D27D4EB4FULL);
@@ -2002,6 +2029,124 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 			}
 			if(s_sprPosFile) fflush(s_sprPosFile);
+		}
+	}
+
+	// =====================================================================
+	// S17: OAM recording — sprite OBJECTS as the game defines them.
+	//
+	// S15/S16 sampled the screen and wrote one line per tile. That records WHAT
+	// was drawn but never WHAT BELONGS TOGETHER, so the viewer had to infer
+	// objects from adjacency and from a window of frames. Every failure of this
+	// workstream traces back to that inference: a sprite appeared or vanished
+	// depending on the grouping window, objects fused with whatever stood next to
+	// them, and animation phases had to be guessed from overlap.
+	//
+	// OAM answers all of it directly. One entry is one object (8x8 up to 64x64)
+	// with its own position, size, palette and mirror flags, and the OAM index is
+	// a stable identity across frames — so an animation is simply "same index,
+	// different tile number", not something to be reconstructed.
+	//
+	// Written per FRAME, not per tile, so every record is complete on its own and
+	// the window hack disappears. Volume is kept down by writing only frames whose
+	// visible OAM set actually CHANGED: a still map screen costs one frame, a
+	// torch one frame per phase. Tile CONTENT still comes from spritemiss, which
+	// is why only the tile number is written here.
+	// =====================================================================
+	if(hdScreen->Oam && hdScreen->Vram) {
+		static FILE* s_oamFile = nullptr;
+		static bool s_oamAttempted = false;
+		static uint32_t s_oamFrames = 0;
+		static uint64_t s_oamPrevSig = 0;
+		if(s_oamFrames < 20000) {
+			// Exactly SnesPpu::FetchSpritePosition's tables — sprites can be
+			// RECTANGULAR (16x32, 32x64), so width and height must be read
+			// separately. Index = OamMode | (largeFlag << 3).
+			static constexpr uint8_t kOamWidth[16]  = { 8,8,8,16,16,32,16,16, 16,32,64,32,64,64,32,32 };
+			static constexpr uint8_t kOamHeight[16] = { 8,8,8,16,16,32,32,32, 16,32,64,32,64,64,64,32 };
+			const uint8_t* oam = hdScreen->Oam;
+
+			struct Entry { int idx, x, y, w, h; uint16_t tile; uint8_t pal, prio; bool hm, vm; };
+			Entry list[128];
+			int visible = 0;
+			uint64_t sig = 0;
+			for(int i = 0; i < 128; i++) {
+				const uint8_t* e = oam + (i << 2);
+				const uint8_t hiTable = oam[0x200 | (i >> 2)] >> ((i << 1) & 0x06);
+				const int x = (int)(int16_t)((hiTable & 0x01) ? (0xFF00 | e[0]) : e[0]);
+				const int y = e[1];
+				const uint8_t mode = (uint8_t)((hdScreen->OamMode & 0x07) | ((hiTable & 0x02) << 2));
+				const int w = kOamWidth[mode], h = kOamHeight[mode];
+				// Off-screen entries are how the game HIDES a sprite; counting them
+				// as a change would make a still screen write on every frame.
+				// Y is 8-bit and WRAPS, so a sprite is only truly invisible when it
+				// sits entirely inside [240,256) without reaching past the wrap —
+				// testing "below the screen" alone would drop sprites that are
+				// legitimately hanging off the bottom edge.
+				if(x <= -w || x >= 256) continue;
+				if(y >= 240 && y + h <= 256) continue;
+				const uint8_t flags = e[3];
+				Entry& en = list[visible++];
+				en.idx = i; en.x = x; en.y = y; en.w = w; en.h = h;
+				en.tile = (uint16_t)e[2] | (((uint16_t)flags & 0x01) << 8);
+				en.pal = (flags >> 1) & 0x07;
+				en.prio = (flags >> 4) & 0x03;
+				en.hm = (flags & 0x40) != 0;
+				en.vm = (flags & 0x80) != 0;
+				sig = (sig * 0x100000001B3ULL)
+					^ ((uint64_t)i << 40) ^ ((uint64_t)en.tile << 24)
+					^ ((uint64_t)(x & 0x1FF) << 12) ^ ((uint64_t)y << 3) ^ (uint64_t)en.pal;
+			}
+
+			if(visible > 0 && sig != s_oamPrevSig) {
+				s_oamPrevSig = sig;
+				if(!s_oamAttempted) {
+					s_oamAttempted = true;
+					const char* home = getenv("USERPROFILE");
+					if(!home) home = getenv("HOME");
+					if(home) {
+						char path[512];
+#ifdef _WIN32
+						snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_oam.txt", home);
+#else
+						snprintf(path, sizeof(path), "%s/Downloads/snes_hd_oam.txt", home);
+#endif
+						s_oamFile = fopen(path, "a");
+					}
+				}
+				if(s_oamFile) {
+					fprintf(s_oamFile, "OAMF G%d S%016llX F%u M%d N%d\n",
+						(int)_hdData->ActiveGfxset, (unsigned long long)vramSig,
+						hdScreen->FrameNumber, hdScreen->OamMode, visible);
+					for(int n = 0; n < visible; n++) {
+						const Entry& en = list[n];
+						// A W x H sprite occupies (W/8) x (H/8) tiles laid out in the
+						// 16x16 name table, wrapping within the row — the same walk
+						// FetchSpriteAttributes does. The hashes are written out so the
+						// viewer can find the pixels in spritemiss; it has no VRAM.
+						fprintf(s_oamFile, "OAM I%03d X%+04d Y%03d W%02d H%02d T%03X P%d R%d %c%c",
+							en.idx, en.x, en.y, en.w, en.h, en.tile, en.pal, en.prio,
+							en.hm ? 'H' : '-', en.vm ? 'V' : '-');
+						const int baseRow = (en.tile & 0xFF) >> 4;
+						const int baseCol = en.tile & 0x0F;
+						const bool second = (en.tile & 0x100) != 0;
+						for(int dy = 0; dy < en.h / 8; dy++) {
+							for(int dx = 0; dx < en.w / 8; dx++) {
+								const uint8_t idx = (uint8_t)((((baseRow + dy) & 0x0F) << 4)
+									| ((baseCol + dx) & 0x0F));
+								const uint16_t vaddr = (uint16_t)((hdScreen->OamBaseAddress
+									+ ((uint16_t)idx << 4)
+									+ (second ? hdScreen->OamAddressOffset : 0)) & 0x7FFF);
+								fprintf(s_oamFile, " %016llX",
+									(unsigned long long)ComputeTileContentHash(hdScreen->Vram, vaddr, 16));
+							}
+						}
+						fputc('\n', s_oamFile);
+					}
+					s_oamFrames++;
+					fflush(s_oamFile);
+				}
+			}
 		}
 	}
 
