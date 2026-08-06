@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -17,7 +18,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S17"
+#define SNES_HD_BUILD_VERSION "S18"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -25,6 +26,47 @@
 // (or $HOME/Downloads/ on non-Windows). Flushed after every write so crash
 // won't lose data.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// OpenRecorder — one place where every recorder file is opened.
+//
+// All of them append across sessions, which is right (a capture spans several
+// sittings) and was also a trap: with no marker in the file there is no way to
+// tell this session's lines from last month's. Analysing snes_hd_bgcap.txt cost
+// an afternoon twice for exactly that reason — 21 886 lines from many runs, and
+// "the last block" was a guess.
+//
+// Every open now stamps a session line, so the newest run is a search rather
+// than an estimate:
+//     === SESSION 2026-08-05 22:41:07 build=S18 ===
+// ---------------------------------------------------------------------------
+static FILE* OpenRecorder(const char* fileName)
+{
+	const char* home = getenv("USERPROFILE");
+	if(!home) home = getenv("HOME");
+	if(!home) return nullptr;
+
+	char path[512];
+#ifdef _WIN32
+	snprintf(path, sizeof(path), "%s\\Downloads\\%s", home, fileName);
+#else
+	snprintf(path, sizeof(path), "%s/Downloads/%s", home, fileName);
+#endif
+	FILE* f = fopen(path, "a");
+	if(f) {
+		time_t now = time(nullptr);
+		struct tm lt {};
+#ifdef _WIN32
+		localtime_s(&lt, &now);
+#else
+		localtime_r(&now, &lt);
+#endif
+		fprintf(f, "=== SESSION %04d-%02d-%02d %02d:%02d:%02d build=" SNES_HD_BUILD_VERSION " ===\n",
+			lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
+		fflush(f);
+	}
+	return f;
+}
+
 static void DiagLog(const char* msg)
 {
 	MessageManager::Log(msg);
@@ -1646,19 +1688,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				if(liveHash != t.Key.ContentHash) continue;
 
 				if(!s_spriteCapAttempted) {
-					s_spriteCapAttempted = true;
-					const char* home = getenv("USERPROFILE");
-					if(!home) home = getenv("HOME");
-					if(home) {
-						char path[512];
-#ifdef _WIN32
-						snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_spritecap.txt", home);
-#else
-						snprintf(path, sizeof(path), "%s/Downloads/snes_hd_spritecap.txt", home);
-#endif
-						s_spriteCapFile = fopen(path, "a");  // append across sessions
+						s_spriteCapAttempted = true;
+						s_spriteCapFile = OpenRecorder("snes_hd_spritecap.txt");
 					}
-				}
 				if(!s_spriteCapFile) break;
 				s_spriteCapSeen.insert(setKey);
 
@@ -1698,6 +1730,20 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		static std::unordered_set<uint64_t> s_bgCapSeen;
 		static FILE* s_bgCapFile = nullptr;
 		static bool s_bgCapAttempted = false;
+		// A reloaded pack changes the answers: a tile that missed before may match
+		// now. The dedup would keep it out of the log anyway, so "no misses left"
+		// after an export would be indistinguishable from "already reported once".
+		// That ambiguity cost a real verification — Lockjaw's zero could not be
+		// called genuine without knowing whether the emulator had been restarted.
+		{
+			static const void* s_bgCapPack = nullptr;
+			static size_t s_bgCapPackTiles = 0;
+			if(s_bgCapPack != (const void*)_hdData || s_bgCapPackTiles != _hdData->Tiles.size()) {
+				s_bgCapPack = (const void*)_hdData;
+				s_bgCapPackTiles = _hdData->Tiles.size();
+				s_bgCapSeen.clear();
+			}
+		}
 		for(uint32_t sy = overscan.Top; sy < (uint32_t)(239 - overscan.Bottom); sy += 8) {
 			for(uint32_t sx = 0; sx < 256; sx += 8) {
 				const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[sy * SnesHdScreenInfo::ScreenWidth + sx];
@@ -1730,17 +1776,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 					if(!s_bgCapAttempted) {
 						s_bgCapAttempted = true;
-						const char* home = getenv("USERPROFILE");
-						if(!home) home = getenv("HOME");
-						if(home) {
-							char path[512];
-#ifdef _WIN32
-							snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_bgcap.txt", home);
-#else
-							snprintf(path, sizeof(path), "%s/Downloads/snes_hd_bgcap.txt", home);
-#endif
-							s_bgCapFile = fopen(path, "a");  // append across sessions
-						}
+						s_bgCapFile = OpenRecorder("snes_hd_bgcap.txt");
 					}
 					if(!s_bgCapFile) break;
 
@@ -1795,7 +1831,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// and Lost World was before it got art. Chicken and egg. The screen is keyed
 	// by its VRAM signature instead, which exists regardless of coverage; the
 	// gfxset is still logged when known.
-	{
+	//
+	// GATED SINCE S18. It answered its question (Issue U: the world map blinks by
+	// palette, and R3 already follows it) and nothing reads the file since — it
+	// just wrote 3 MB per capture. Kept because it is the only way to see palette
+	// animation at all, but off unless asked for: set the environment variable
+	//     SNES_HD_CGRAMCAP=1
+	// before starting Mesen. Read once, so toggling needs a restart.
+	static const bool s_cgEnabled = getenv("SNES_HD_CGRAMCAP") != nullptr;
+	if(s_cgEnabled) {
 		static uint16_t s_cgPrev[256] = {};
 		static bool s_cgHave = false;
 		static uint64_t s_cgSig = 0;
@@ -1818,19 +1862,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 			if(nTotal > 0) {
 				if(!s_cgAttempted) {
-					s_cgAttempted = true;
-					const char* home = getenv("USERPROFILE");
-					if(!home) home = getenv("HOME");
-					if(home) {
-						char path[512];
-#ifdef _WIN32
-						snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_cgramcap.txt", home);
-#else
-						snprintf(path, sizeof(path), "%s/Downloads/snes_hd_cgramcap.txt", home);
-#endif
-						s_cgFile = fopen(path, "a");  // append across sessions
+						s_cgAttempted = true;
+						s_cgFile = OpenRecorder("snes_hd_cgramcap.txt");
 					}
-				}
 				if(s_cgFile) {
 					if(nTotal <= 12) {
 						// Index is the raw CGRAM slot: BG palettes 0x00-0x7F
@@ -1901,19 +1935,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				}
 
 				if(!s_sprMissAttempted) {
-					s_sprMissAttempted = true;
-					const char* home = getenv("USERPROFILE");
-					if(!home) home = getenv("HOME");
-					if(home) {
-						char path[512];
-#ifdef _WIN32
-						snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_spritemiss.txt", home);
-#else
-						snprintf(path, sizeof(path), "%s/Downloads/snes_hd_spritemiss.txt", home);
-#endif
-						s_sprMissFile = fopen(path, "a");  // append across sessions
+						s_sprMissAttempted = true;
+						s_sprMissFile = OpenRecorder("snes_hd_spritemiss.txt");
 					}
-				}
 				if(!s_sprMissFile) break;
 
 				char line[320];
@@ -1933,103 +1957,6 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 		}
 		if(s_sprMissFile) fflush(s_sprMissFile);
-	}
-
-	// =====================================================================
-	// S15/S16: sprite POSITION recording — where each sprite tile sits on screen.
-	// The world maps draw their level names straight into OAM (the p4plus2
-	// disassembly's sprites.txt has no entry for them, and no VRAM still dump
-	// contains them), so the letters exist only as runtime captures. spritemiss
-	// already carries their pixels, but not where they were — and without that
-	// the glyphs cannot be reassembled into words, which is what an upscaler
-	// needs to produce decent art. One 8x8 fragment on its own upscales badly.
-	//
-	// Deliberately a SEPARATE file rather than extra columns on SPRMISS: that
-	// recorder's dedup keeps only the first sighting of each tile — exactly the
-	// wrong thing here, where the same letter legitimately appears at several
-	// positions. The viewer reads BOTH files (button "Laufzeit"): spritemiss for
-	// the pixels, sprpos for the layout, joined into whole words.
-	//
-	// S16: scans EVERY pixel and reports the tile's ORIGIN, not the sample point.
-	//
-	// S15 sampled an 8-pixel grid and logged the sample coordinates. That lost
-	// tiles, and the loss was systematic rather than random: SnesPpu::RenderSprites
-	// (SnesPpu.cpp:809) only fills HdSpritePixel where `color != 0`, so a sprite
-	// tile exists in ScreenTiles ONLY at its OPAQUE pixels. If the one grid point
-	// inside a tile happened to land on a transparent pixel, that tile was never
-	// recorded at all — which is why words came back missing letter halves and the
-	// DK coin (a round symbol on four tiles) kept losing its corners, where the
-	// artwork is empty by construction.
-	//
-	// Any opaque pixel will do once the origin is derived: OffsetX/OffsetY are the
-	// pixel's screen-space position WITHIN its 8x8 tile, so the tile starts at
-	// (sx - OffsetX, sy - OffsetY). Deduping on (hash, originX, originY) instead of
-	// the sample point keeps the output volume the same as before — still about one
-	// line per tile instance — while no longer depending on WHICH pixel was hit.
-	// A name sitting still costs a handful of lines; a different name at the same
-	// spot has different hashes and is recorded in full.
-	// =====================================================================
-	if(hdScreen->Vram) {
-		static std::unordered_set<uint64_t> s_sprPosSeen;
-		static FILE* s_sprPosFile = nullptr;
-		static bool s_sprPosAttempted = false;
-		static uint32_t s_sprPosLines = 0;
-		// Raised from 60 000: the first S16 session hit that ceiling while still
-		// walking the world maps, so the later ones were recorded only in part.
-		// At ~70 bytes a line this caps the file around 14 MB, which the viewer
-		// parses in well under a second.
-		if(s_sprPosLines < 200000) {
-			for(uint32_t py = overscan.Top; py < (uint32_t)(239 - overscan.Bottom); py++) {
-				for(uint32_t px = 0; px < 256; px++) {
-					const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[py * SnesHdScreenInfo::ScreenWidth + px];
-					if(!pi.SpriteCount) continue;
-					for(int s = 0; s < 2; s++) {
-						if(!(pi.SpriteCount & (1 << s))) continue;
-						const SnesHdPpuTileInfo& t = pi.Sprites[s];
-						if(t.Key.ContentHash == 0) continue;
-						// Tile origin from the pixel's offset inside it. Clamped rather
-						// than skipped: a sprite may hang off the left/top edge, and its
-						// visible part is still worth having.
-						int32_t ox = (int32_t)px - (int32_t)t.OffsetX;
-						int32_t oy = (int32_t)py - (int32_t)t.OffsetY;
-						if(ox < 0) ox = 0;
-						if(oy < 0) oy = 0;
-						uint32_t sx = (uint32_t)ox;
-						uint32_t sy = (uint32_t)oy;
-						uint64_t posKey = t.Key.ContentHash
-							^ ((uint64_t)sx * 0x9E3779B97F4A7C15ULL)
-							^ ((uint64_t)sy * 0xC2B2AE3D27D4EB4FULL);
-						if(s_sprPosSeen.find(posKey) != s_sprPosSeen.end()) continue;
-						// Only record tiles whose live VRAM still matches, same as
-						// the miss recorder — the OBJ stream is rewritten mid-frame.
-						if(ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, 16) != t.Key.ContentHash) continue;
-						s_sprPosSeen.insert(posKey);
-
-						if(!s_sprPosAttempted) {
-							s_sprPosAttempted = true;
-							const char* home = getenv("USERPROFILE");
-							if(!home) home = getenv("HOME");
-							if(home) {
-								char path[512];
-#ifdef _WIN32
-								snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_sprpos.txt", home);
-#else
-								snprintf(path, sizeof(path), "%s/Downloads/snes_hd_sprpos.txt", home);
-#endif
-								s_sprPosFile = fopen(path, "a");
-							}
-						}
-						if(!s_sprPosFile) break;
-						fprintf(s_sprPosFile, "SPRPOS G%d S%016llX F%u X%03u Y%03u P%d %c H%016llX\n",
-							(int)_hdData->ActiveGfxset, (unsigned long long)vramSig,
-							hdScreen->FrameNumber, sx, sy, t.Key.PaletteIndex,
-							s == 0 ? 'M' : 'S', (unsigned long long)t.Key.ContentHash);
-						s_sprPosLines++;
-					}
-				}
-			}
-			if(s_sprPosFile) fflush(s_sprPosFile);
-		}
 	}
 
 	// =====================================================================
@@ -2101,19 +2028,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			if(visible > 0 && sig != s_oamPrevSig) {
 				s_oamPrevSig = sig;
 				if(!s_oamAttempted) {
-					s_oamAttempted = true;
-					const char* home = getenv("USERPROFILE");
-					if(!home) home = getenv("HOME");
-					if(home) {
-						char path[512];
-#ifdef _WIN32
-						snprintf(path, sizeof(path), "%s\\Downloads\\snes_hd_oam.txt", home);
-#else
-						snprintf(path, sizeof(path), "%s/Downloads/snes_hd_oam.txt", home);
-#endif
-						s_oamFile = fopen(path, "a");
+						s_oamAttempted = true;
+						s_oamFile = OpenRecorder("snes_hd_oam.txt");
 					}
-				}
 				if(s_oamFile) {
 					fprintf(s_oamFile, "OAMF G%d S%016llX F%u M%d N%d\n",
 						(int)_hdData->ActiveGfxset, (unsigned long long)vramSig,

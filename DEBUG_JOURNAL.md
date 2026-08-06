@@ -1,6 +1,53 @@
 # Debug Journal — SNES HD Pack (Mesen2 / DKC2)
 
-Stand: 2026-08-05 | Mesen Build: **S17 (user-bestätigt, committet)** — OAM-Recorder, ersetzt das Erraten von Sprite-Objekten. Am 2026-08-05 end-to-end bewiesen: die Hub-Objekte (Fackeln, Flagge, Luftschiff) laufen in Mesen in HD, den ganzen Weg über den Viewer statt per Skript. | S16 mit committet
+Stand: 2026-08-05 | Mesen Build: **S18 GEBAUT (ungetestet)** — Aufräumen der Recorder: `sprpos` raus, `cgramcap` gegatet, Sitzungs-Kopfzeilen, Dedup-Reset beim Pack-Wechsel. | S17 user-bestätigt und committet (`d4677027`)
+
+---
+
+## S18 — DIE RECORDER AUFGERÄUMT (2026-08-05, UNGETESTET, Build „S18")
+
+Reine Aufräumarbeit, kein neues Verhalten am Bild. Vier Punkte, alle in
+`SnesHdVideoFilter.cpp` — **kein Header berührt, inkrementeller Build reicht.**
+
+### 1. `sprpos` entfernt (−97 Zeilen, −87 MB je Aufzeichnung)
+S17 hat den Positions-Recorder inhaltlich abgelöst: ein OAM-Eintrag IST ein Objekt, das
+Erraten aus Nachbarschaft und Frame-Fenster entfällt. Übrig blieb ein Leser — die
+Schrift-Seite des Viewers, die `rebuildRuntimeObjects()` auf den Positionen laufen ließ
+(3836 ms bei **jedem** Laden). Die läuft seit dem 2026-08-05 auf OAM, damit war der
+Recorder ohne Abnehmer. `snes_hd_spritemiss.txt` bleibt: es liefert die Pixel.
+
+### 2. `cgramcap` gegatet
+Hat seine Frage beantwortet (Issue U: die Weltkarte blinkt über die Palette, und R3 folgt
+dem bereits), seither liest die Datei niemand — sie schrieb nur 3 MB je Aufzeichnung.
+Behalten, weil es der einzige Weg ist, Palette-Animation überhaupt zu sehen, aber aus
+per Vorgabe. Einschalten über die Umgebungsvariable **`SNES_HD_CGRAMCAP=1`** vor dem
+Start; einmal gelesen, ein Umschalten braucht also einen Neustart.
+
+### 3. Sitzungs-Kopfzeile in allen Recordern
+Alle hängen an (`fopen(..., "a")`), was richtig ist — eine Aufzeichnung zieht sich über
+mehrere Sitzungen. Ohne Marke ließ sich aber nicht sagen, welche Zeilen von heute sind.
+Das hat zweimal einen Nachmittag gekostet: 21 886 Zeilen aus vielen Läufen, und „der
+letzte Block" war geraten. Neu schreibt **jedes** Öffnen eine Zeile:
+
+```
+=== SESSION 2026-08-05 22:41:07 build=S18 ===
+```
+
+Alle fünf Recorder gehen jetzt durch **einen** Öffner (`OpenRecorder`), statt den
+Pfadaufbau je Stelle zu wiederholen. **Die Viewer-Parser überspringen `===`-Zeilen**,
+sonst zählten sie sie als verworfen.
+
+### 4. Dedup-Reset beim Pack-Wechsel
+`s_bgCapSeen` unterdrückt Wiederholungen — prozessweit. Nach einem Pack-Neuexport ohne
+Emulator-Neustart war „keine Misses mehr" deshalb **nicht** von „schon einmal gemeldet"
+zu unterscheiden. Genau daran ließ sich Lockjaws Null nicht als echt bestätigen. Der
+Recorder merkt sich jetzt Zeiger und Kachelzahl von `_hdData` und leert die Menge, sobald
+sich eines ändert.
+
+**TEST:** Log-Zeilen müssen `build=S18` zeigen. `snes_hd_sprpos.txt` darf nicht mehr
+wachsen, `snes_hd_cgramcap.txt` ohne die Umgebungsvariable ebenfalls nicht. Jede
+Recorder-Datei bekommt beim ersten Schreiben eine `=== SESSION`-Zeile. Und: nach einem
+Pack-Neuexport ohne Neustart müssen Misses wieder auftauchen, falls es welche gibt.
 
 ---
 
