@@ -130,6 +130,20 @@ private:
 		uint8_t Palette = 0;        // OBJ palette 0-7 (CGRAM row = 8 + palette)
 		bool HMirror = false;
 		bool VMirror = false;
+
+		// S21: the HD art of a sprite reaches past the native silhouette — the SNES
+		// rasterises coverage on the 1x grid (colour index 0 = nothing), while the 4x
+		// art carries a soft fringe of its own. To draw that fringe the tile identity
+		// has to be recorded at natively TRANSPARENT pixels too, which these two
+		// fields keep apart from the normal case:
+		//   NativeOpaque - the sprite really covers this pixel; such an entry must
+		//                  never be overwritten by a transparent pixel of a sprite
+		//                  drawn later, or the overlap would lose its HD art.
+		//   Priority     - the sprite's raw priority (0-3). At a transparent pixel the
+		//                  PPU never decided sprite-vs-BG, so the filter has to, and
+		//                  it needs the value the decision would have used.
+		bool NativeOpaque = false;
+		uint8_t Priority = 0;
 	};
 	HdSpritePixel _hdSpritePixels[256] = {};
 	HdSpritePixel _hdSpritePixelsCopy[256] = {};

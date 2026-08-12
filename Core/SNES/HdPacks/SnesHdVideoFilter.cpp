@@ -18,7 +18,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S20"
+#define SNES_HD_BUILD_VERSION "S21"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -613,6 +613,13 @@ struct HdFilterFrameCtx
 };
 
 // Per-thread frame counters, summed after all threads joined.
+// S21 A/B switch: set SNES_HD_NO_SPRITE_EDGES=1 before starting Mesen to render
+// sprite edges exactly as S20 did — native silhouette, partial alpha blended
+// against the sprite's own SD colour. Read once, so toggling needs a restart.
+// Both halves of the edge work hang off this one flag, so a single comparison
+// run answers whether it helps.
+static const bool s_noSpriteEdges = getenv("SNES_HD_NO_SPRITE_EDGES") != nullptr;
+
 struct HdFilterFrameStats
 {
 	uint32_t TotalPixels = 0;
@@ -637,6 +644,8 @@ struct HdFilterFrameStats
 	uint32_t SprSubMainHd = 0;  // P4.1e: of those, pixels with a main-winner HD match
 	uint32_t SprHd = 0;         // S4: sprite-won pixels rendered via an HD sprite tile
 	uint32_t SprSubHd = 0;      // S7: sub-screen sprite rendered via an HD sprite tile (fog/water levels)
+	uint32_t SprEdge = 0;       // S21: pixels outside the native silhouette that carry sprite fringe art
+	uint32_t SprEdgeBlend = 0;  // S21: of those, sub-pixels where the fringe was actually drawn
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -660,6 +669,8 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SprSubMainHd += src.SprSubMainHd;
 	dst.SprHd += src.SprHd;
 	dst.SprSubHd += src.SprSubHd;
+	dst.SprEdge += src.SprEdge;
+	dst.SprEdgeBlend += src.SprEdgeBlend;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -1182,6 +1193,29 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					hdTileInfo = &pixelInfo.Sprites[0];
 					st.SprHd++;
 					if(cmActive) st.HdCm++;
+
+					// S21 (second half): give the sprite a bottom layer, the same way a
+					// BG winner gets one. Without it a partly transparent sprite texel
+					// blends against nm* — and at a sprite pixel that is the sprite's own
+					// SD colour, so the softest edge in the art comes out as opaque as
+					// the hard one. Blending against the BG art beneath is what makes an
+					// anti-aliased silhouette visible at all. Where the background has no
+					// HD art the old behaviour stands: the native colour is all there is.
+					SnesHdScanlineInfo& slSpr = hdScreen->ScanlineInfo[y];
+					if(!s_noSpriteEdges && hdTile->HasTransparentPixels && !hdTileBot
+						&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[0].Key.ContentHash) != nullptr) {
+						for(int layer = 0; layer < 4 && !hdTileBot; layer++) {
+							if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
+							if(!((slSpr.MainScreenLayers | slSpr.SubScreenLayers) & (1 << layer))) continue;
+							SnesHdPackTileInfo* below = CachedGetMatchingTile(hdData, hdScreen->Vram,
+								tileLookupCache, pixelInfo.BgTiles[layer].Key);
+							if(below) {
+								hdTileBot = below;
+								hdTileInfoBot = &pixelInfo.BgTiles[layer];
+								st.MultiLayer++;
+							}
+						}
+					}
 				}
 			}
 
@@ -1242,9 +1276,49 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			bool hasMainHd = hdTile && hdTileInfo && !hdTile->HdTileData.empty();
 			bool hasSubHd = subTile && subTileInfo && !subTile->HdTileData.empty();
 
+			// =============================================================
+			// S21: sprite edge fringe.
+			//
+			// The SNES decides sprite coverage on the 1x grid — colour index 0 is
+			// nothing at all — so the native silhouette is a staircase. The 4x art
+			// carries its own soft fringe just outside that staircase, and until now
+			// it could not be drawn: no HD identity was recorded where the native
+			// pixel was transparent. The PPU now records it in slot 2 (see
+			// SnesPpu::FetchSpriteTile), and this is where it gets drawn.
+			//
+			// The priority comparison happens HERE and not in the PPU on purpose: at
+			// the time sprites render, the tilemaps have not composited yet, so the
+			// question "would this sprite be in front?" cannot be answered there.
+			// MainScreenFlags now holds the actual winner, so its priority is exactly
+			// what the sprite would have had to beat.
+			SnesHdPackTileInfo* edgeTile = nullptr;
+			const SnesHdPpuTileInfo* edgeTileInfo = nullptr;
+			// Only art whose baked palette we know takes part. That is not a colour
+			// argument but an origin one: runtime-captured tiles (world map objects —
+			// wasps, flag, torches) are grabbed off the live screen, so background
+			// colour is baked into their border texels, and the export drops their
+			// reference for exactly that reason. Extending such a tile outwards smears
+			// that background into the picture — user-visible as a washed-out fringe on
+			// the hub objects, while gallery art like Kruncha looked right. Having a
+			// reference is precisely what separates the two.
+			if(!s_noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && !spriteWon
+				&& pixelInfo.Sprites[2].Key.ContentHash != 0
+				&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[2].Key.ContentHash) != nullptr
+				&& pixelInfo.Sprites[2].Priority > (pixelInfo.MainScreenFlags & 0x0F)) {
+				edgeTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache,
+					pixelInfo.Sprites[2].Key);
+				if(edgeTile && !edgeTile->HdTileData.empty()) {
+					edgeTileInfo = &pixelInfo.Sprites[2];
+					st.SprEdge++;
+				} else {
+					edgeTile = nullptr;
+				}
+			}
+			bool hasEdgeHd = edgeTile != nullptr;
+
 			// P4.1f: when the character is the color-math operand, render the
 			// exact PPU output instead of compositing HD art over it (Issue R).
-			if((hasMainHd || hasSubHd) && !spriteIsSubOperand) {
+			if((hasMainHd || hasSubHd || hasEdgeHd) && !spriteIsSubOperand) {
 				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
 				uint8_t brightness = sl.ScreenBrightness;
 
@@ -1268,10 +1342,11 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				// P4.1c perf: everything that is constant across the hdScale×hdScale
 				// sub-pixel block is decided once per native pixel. Semantics are an
 				// exact match of the previous per-sub-pixel ApplyColorMathToPixel port.
-				HdTileSampler botSampler, mainSampler, subSampler;
+				HdTileSampler botSampler, mainSampler, subSampler, edgeSampler;
 				botSampler.Init(hdTileBot, hdTileInfoBot, hdScale);
 				if(hasMainHd) mainSampler.Init(hdTile, hdTileInfo, hdScale);
 				if(hasSubHd) subSampler.Init(subTile, subTileInfo, hdScale);
+				if(hasEdgeHd) edgeSampler.Init(edgeTile, edgeTileInfo, hdScale);
 
 				// R3: per-tile palette-row transform (live CGRAM vs reference).
 				// Resolved once per native pixel; nullptr = identity.
@@ -1323,6 +1398,14 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				if(!s_noRecolor && subSampler.valid && subTileInfo->Key.LayerIndex == 4) {
 					subRecolor.Init(hdData->GetSpriteRefPalette(subTileInfo->Key.ContentHash),
 						hdScreen->Cgram + 128 + (subTileInfo->Key.PaletteIndex & 7) * 16);
+				}
+				// S21: the fringe is the same sprite's art and follows the same live
+				// OBJ palette — without this it would be the one part of a character
+				// that ignores the level's tint.
+				HdSpriteRecolor edgeRecolor;
+				if(!s_noRecolor && edgeSampler.valid) {
+					edgeRecolor.Init(hdData->GetSpriteRefPalette(edgeTileInfo->Key.ContentHash),
+						hdScreen->Cgram + 128 + (edgeTileInfo->Key.PaletteIndex & 7) * 16);
 				}
 
 				// 1. Clip main color to black (runs even without AllowColorMath;
@@ -1461,6 +1544,29 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								r = std::min(255, r + oR) >> halfShift;
 								g = std::min(255, g + oG) >> halfShift;
 								b = std::min(255, b + oB) >> halfShift;
+							}
+						}
+
+						// --- S21: sprite fringe over the finished background ---
+						// Deliberately AFTER color math: this pixel's math flags belong
+						// to the BG that won it, and DKC2 never applies color math to
+						// OBJ (every recorded context has CMEnabled with OBJ=0), so
+						// running the sprite's own texel through the BG's math would
+						// tint it with an effect the sprite never gets. Brightness
+						// still applies below — that one is global.
+						if(edgeSampler.valid) {
+							uint32_t ec = edgeSampler.Sample(dx, dy);
+							if(edgeRecolor.valid) {
+								ec = edgeRecolor.Apply(ec);
+							}
+							uint32_t ea = ec >> 24;
+							if(ea) {
+								// HdTileData is premultiplied, same as every other blend here
+								int er = (ec >> 16) & 0xFF, eg = (ec >> 8) & 0xFF, eb = ec & 0xFF;
+								r = er + (r * (255 - (int)ea)) / 255;
+								g = eg + (g * (255 - (int)ea)) / 255;
+								b = eb + (b * (255 - (int)ea)) / 255;
+								st.SprEdgeBlend++;
 							}
 						}
 
@@ -1753,6 +1859,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSprSubHd = total.SprSubHd;
 	uint32_t frameSprRecolor = total.SprRecolor;
 	uint32_t frameSprRecolorNoRef = total.SprRecolorNoRef;
+	uint32_t frameSprEdge = total.SprEdge;
+	uint32_t frameSprEdgeBlend = total.SprEdgeBlend;
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
@@ -1830,7 +1938,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
-			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
+			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
+			" sprEdge=%u/%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
@@ -1840,7 +1949,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameTotalPixels, frameBgPixels, frameHdMatch,
 			frameHdMiss, frameHdCm, frameMainNatHd, frameSubOpHd, frameSubOpFixed, frameLayerRetry, frameMultiLayer,
 			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameSprSubHd,
-			frameSprRecolor, frameSprRecolorNoRef, frameMaskZero, frameHdmaSplit,
+			frameSprRecolor, frameSprRecolorNoRef,
+			frameSprEdge, frameSprEdgeBlend, frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],

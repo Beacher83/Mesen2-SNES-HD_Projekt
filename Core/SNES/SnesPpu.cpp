@@ -648,6 +648,14 @@ void SnesPpu::FetchSpriteData()
 	if(_fetchSpriteStart == 0) {
 		memset(_spritePriorityCopy, 0xFF, sizeof(_spritePriorityCopy));
 
+		// S21: the OBJ identity buffer needs clearing now that it is also read at
+		// pixels WITHOUT a native sprite. Until now every read was guarded by
+		// _spritePriority[x] < 4, so a stale entry could never be reached; the
+		// fringe path has no such guard and would smear last scanline's art.
+		if(_hdData && _hdActiveScreen) {
+			memset(_hdSpritePixelsCopy, 0, sizeof(_hdSpritePixelsCopy));
+		}
+
 		_spriteTileCount = 0;
 		_currentSprite.Index = 0xFF;
 
@@ -812,11 +820,24 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 				_spriteColorsCopy[xPos + x] = color;
 				_spritePriorityCopy[xPos + x] = _currentSprite.Priority;
 				_spritePaletteCopy[xPos + x] = _currentSprite.Palette;
-				if(hdCapture) {
+			}
+
+			// S21: record the OBJ tile identity for the HD path. Note this is NOT
+			// gated on `color != 0` any more: the 4x art has a soft fringe that lives
+			// where the native pixel is transparent, and without an entry there the
+			// filter can never draw it. The native buffers above stay gated, so the
+			// emulated picture is bit-identical either way.
+			//
+			// An opaque entry always wins: sprites are fetched in OAM order, and a
+			// later sprite's transparent pixel must not erase the identity of an
+			// earlier one that actually covers this pixel.
+			if(hdCapture) {
+				HdSpritePixel& sp = _hdSpritePixelsCopy[xPos + x];
+				const bool opaque = color != 0;
+				if(opaque || sp.ContentHash == 0) {
 					// SCREEN-SPACE offsets (x = column within the displayed slice,
 					// TileRowOffset = displayed row) — HdTileSampler applies the
 					// mirror flags itself, exactly like the BG tile convention.
-					HdSpritePixel& sp = _hdSpritePixelsCopy[xPos + x];
 					sp.ContentHash = hdHash;
 					sp.TileVramAddr = _currentSprite.TileVramAddr;
 					sp.OffsetX = (uint8_t)x;
@@ -824,6 +845,8 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 					sp.Palette = _currentSprite.Palette;
 					sp.HMirror = _currentSprite.HorizontalMirror;
 					sp.VMirror = _currentSprite.VerticalMirror;
+					sp.NativeOpaque = opaque;
+					sp.Priority = _currentSprite.Priority;
 				}
 			}
 		}
@@ -1119,6 +1142,20 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 					_hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x].SubScreenHasSprite = true;
 					hdCaptureSprite(x, 1, spritePrio);
 				}
+			}
+		} else if(hdValid && drawMain && x < SnesHdScreenInfo::ScreenWidth
+			&& _hdSpritePixels[x].ContentHash != 0 && !_hdSpritePixels[x].NativeOpaque) {
+			// S21: no native sprite pixel here, but a sprite's 8x8 tile does cover it —
+			// its HD art may still have a soft fringe reaching into this pixel. Record
+			// the identity in slot 2 so the filter can draw that fringe over whatever
+			// ends up behind it.
+			//
+			// The window mask is applied here, exactly as above; the PRIORITY decision
+			// is deliberately left to the filter, because at this point the tilemaps
+			// have not rendered yet and _mainScreenFlags still holds the backdrop.
+			// Slot 2 carries the sprite's own priority for that comparison.
+			if(!ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
+				hdCaptureSprite(x, 2, priority[_hdSpritePixels[x].Priority & 0x03]);
 			}
 		}
 	}
