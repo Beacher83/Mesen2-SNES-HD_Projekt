@@ -88,6 +88,9 @@ bool SnesHdPackLoader::LoadPack()
 	// R3: load reference BG palettes for the CGRAM-diff transform (optional)
 	LoadPalettes();
 
+	// Reference OBJ palettes so HD sprites can follow the level's colors (optional)
+	LoadSpritePalettes();
+
 	bool anyLoaded = false;
 
 	// Load BG tiles for each layer (bg1 through bg4).
@@ -698,6 +701,84 @@ bool SnesHdPackLoader::LoadPalettes()
 			+ std::to_string(_data->GfxsetPalettes.size()) + " gfxsets");
 	}
 	return !_data->GfxsetPalettes.empty();
+}
+
+bool SnesHdPackLoader::LoadSpritePalettes()
+{
+	// sprite_palettes.bin format (all little-endian):
+	//   uint8_t  version                     (1)
+	//   uint16_t paletteCount
+	//   paletteCount x 16 x uint16_t bgr555  (index 0 = transparent)
+	//   uint32_t entryCount
+	//   entryCount x { uint64_t contentHash, uint16_t paletteIndex }
+	//
+	// Palettes are deduplicated by content — a few dozen palettes typically serve
+	// tens of thousands of tiles, so the table is tiny and the entry list is what
+	// costs. See SnesHdData.h for why sprites need this at all.
+	string palPath = FolderUtilities::CombinePath(_hdPackFolder, "sprite_palettes.bin");
+
+	ifstream file(palPath, std::ios::binary);
+	if(!file) {
+		return false;  // No file — no sprite recoloring (HD sprite colors stay baked in)
+	}
+
+	uint8_t version = 0;
+	file.read((char*)&version, 1);
+	if(file.fail() || version != 1) {
+		MessageManager::Log("[SNES HD Pack] sprite_palettes.bin: unsupported version "
+			+ std::to_string(version) + " — sprite recoloring disabled");
+		return false;
+	}
+
+	uint16_t paletteCount = 0;
+	file.read((char*)&paletteCount, 2);
+	if(file.fail() || paletteCount == 0) {
+		return false;
+	}
+
+	vector<uint16_t> palData((size_t)paletteCount * 16);
+	file.read((char*)palData.data(), (std::streamsize)palData.size() * sizeof(uint16_t));
+	if(file.fail()) {
+		MessageManager::Log("[SNES HD Pack] sprite_palettes.bin: truncated palette table — ignored");
+		return false;
+	}
+
+	uint32_t entryCount = 0;
+	file.read((char*)&entryCount, 4);
+	if(file.fail() || entryCount == 0) {
+		return false;
+	}
+
+	unordered_map<uint64_t, uint32_t> byHash;
+	byHash.reserve(entryCount);
+	for(uint32_t i = 0; i < entryCount; i++) {
+		uint64_t hash = 0;
+		uint16_t palIdx = 0;
+		file.read((char*)&hash, 8);
+		file.read((char*)&palIdx, 2);
+		if(file.fail()) {
+			MessageManager::Log("[SNES HD Pack] sprite_palettes.bin: truncated at entry "
+				+ std::to_string(i) + " of " + std::to_string(entryCount) + " — using what was read");
+			break;
+		}
+		// A corrupt index would read past the palette table on every sprite pixel.
+		if(palIdx >= paletteCount) {
+			continue;
+		}
+		byHash[hash] = palIdx;
+	}
+
+	if(byHash.empty()) {
+		return false;
+	}
+
+	_data->SpritePaletteData = std::move(palData);
+	_data->SpritePaletteByHash = std::move(byHash);
+
+	MessageManager::Log("[SNES HD Pack] Loaded reference sprite palettes: "
+		+ std::to_string(_data->SpritePaletteByHash.size()) + " tiles, "
+		+ std::to_string(paletteCount) + " palettes");
+	return true;
 }
 
 // Implement SnesHdBitmapInfo::Init (declared in SnesHdData.h)

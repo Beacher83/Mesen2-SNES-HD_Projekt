@@ -393,6 +393,34 @@ public:
 	// Empty = no transform (HD tiles keep their baked-in colors).
 	unordered_map<uint8_t, vector<uint16_t>> GfxsetPalettes;
 
+	// Reference OBJ palettes per sprite tile (sprite_palettes.bin) — the 16 colors
+	// the HD art was baked under, keyed by the tile's content hash.
+	//
+	// The BG mechanism above cannot serve sprites. DKC2 allocates OBJ palettes
+	// dynamically: a sprite's init script names a palette (command $8D, table
+	// DATA_FD5FEE) and the allocator (bank BB, CODE_BB8A6F) hands it one of 8
+	// refcounted CGRAM slots — whichever happens to be free. That slot number is
+	// what reaches us in the OAM attribute bits, and it carries no color identity:
+	// the same crate sits in different slots in different levels, and the LEVEL
+	// decides which palette it gets. So the reference cannot be derived from
+	// anything we see at runtime and has to ship with the art.
+	//
+	// With it the filter recolors reference -> live CGRAM, which is how one piece
+	// of art per sprite ends up correctly tinted everywhere. Empty = no recoloring
+	// (HD sprites keep their baked-in colors).
+	vector<uint16_t> SpritePaletteData;                       // paletteCount x 16, BGR555
+	unordered_map<uint64_t, uint32_t> SpritePaletteByHash;    // contentHash -> palette index
+
+	// nullptr when the tile has no reference (runtime-captured tiles, older packs).
+	const uint16_t* GetSpriteRefPalette(uint64_t contentHash) const
+	{
+		auto it = SpritePaletteByHash.find(contentHash);
+		if(it == SpritePaletteByHash.end()) {
+			return nullptr;
+		}
+		return SpritePaletteData.data() + (size_t)it->second * 16;
+	}
+
 	// Currently detected active gfxset.
 	// -1 = no gfxset detected (no fingerprints loaded, or no match found)
 	int16_t ActiveGfxset = -1;

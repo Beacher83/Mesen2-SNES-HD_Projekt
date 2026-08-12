@@ -18,7 +18,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S18"
+#define SNES_HD_BUILD_VERSION "S19"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -39,18 +39,154 @@
 // than an estimate:
 //     === SESSION 2026-08-05 22:41:07 build=S18 ===
 // ---------------------------------------------------------------------------
-static FILE* OpenRecorder(const char* fileName)
+static bool RecorderPath(const char* fileName, char* out, size_t outSize)
 {
 	const char* home = getenv("USERPROFILE");
 	if(!home) home = getenv("HOME");
-	if(!home) return nullptr;
-
-	char path[512];
+	if(!home) return false;
 #ifdef _WIN32
-	snprintf(path, sizeof(path), "%s\\Downloads\\%s", home, fileName);
+	snprintf(out, outSize, "%s\\Downloads\\%s", home, fileName);
 #else
-	snprintf(path, sizeof(path), "%s/Downloads/%s", home, fileName);
+	snprintf(out, outSize, "%s/Downloads/%s", home, fileName);
 #endif
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// SeedRecorderSet — carry a recorder's dedup across sessions.
+//
+// OpenRecorder appends, which is right: a capture spans several sittings. But
+// the dedup sets were per-process statics, so every Mesen start re-recorded
+// what earlier runs had already written and appended it a second, third, ...
+// time. Measured on 2026-08-10: 11 sessions had grown snes_hd_spritecap.txt to
+// 75 MB and snes_hd_spritemiss.txt to 38 MB for a few tens of thousands of
+// distinct tiles. The comment "consumers dedup across sessions" was true and
+// still left the files to grow without bound.
+//
+// Reading the keys back when the file is opened makes the append design mean
+// what it says: a restart adds only what is genuinely new. Costs one sequential
+// pass over the file at open, once per session, on the thread that was about to
+// write to it anyway.
+// ---------------------------------------------------------------------------
+static void SeedRecorderSet(const char* fileName, std::unordered_set<uint64_t>& seen,
+	bool (*parseKey)(const char*, uint64_t&))
+{
+	char path[512];
+	if(!RecorderPath(fileName, path, sizeof(path))) {
+		return;
+	}
+	FILE* f = fopen(path, "r");
+	if(!f) {
+		return;   // first run — nothing recorded yet
+	}
+	char line[4096];
+	size_t before = seen.size();
+	while(fgets(line, sizeof(line), f)) {
+		uint64_t key;
+		if(parseKey(line, key)) {
+			seen.insert(key);
+		}
+	}
+	fclose(f);
+	char msg[256];
+	snprintf(msg, sizeof(msg), "[SNES HD diag] %s: %zu keys from earlier sessions — only new lines get appended",
+		fileName, seen.size() - before);
+	MessageManager::Log(msg);
+}
+
+// Key parsers — each must reproduce EXACTLY the key its writer builds, or the
+// recorder starts duplicating again without any visible symptom.
+// Writer: "SPR %016llX P%d T..."
+static bool ParseSpriteCapKey(const char* line, uint64_t& key)
+{
+	unsigned long long h; int pal;
+	if(sscanf(line, "SPR %16llX P%d", &h, &pal) != 2) return false;
+	key = (uint64_t)h ^ ((uint64_t)pal * 0x9E3779B97F4A7C15ULL);
+	return true;
+}
+
+// Writer: "BGA G%d L%d P%d A%04X H%016llX T..."
+static bool ParseBgCapKey(const char* line, uint64_t& key)
+{
+	int g, layer, pal; unsigned addr; unsigned long long h;
+	if(sscanf(line, "BGA G%d L%d P%d A%4X H%16llX", &g, &layer, &pal, &addr, &h) != 5) return false;
+	key = (uint64_t)h ^ ((uint64_t)pal * 0x9E3779B97F4A7C15ULL)
+		^ ((uint64_t)layer * 0xC2B2AE3D27D4EB4FULL);
+	return true;
+}
+
+// Writer: "SPRMISS %c P%d O%d G%d H%016llX T..."  ('M' = main slot 0, 'S' = sub slot 1)
+static bool ParseSprMissKey(const char* line, uint64_t& key)
+{
+	char c; int pal, ov, g; unsigned long long h;
+	if(sscanf(line, "SPRMISS %c P%d O%d G%d H%16llX", &c, &pal, &ov, &g, &h) != 5) return false;
+	key = (uint64_t)h ^ ((uint64_t)pal * 0x9E3779B97F4A7C15ULL)
+		^ ((c == 'M' ? 0ULL : 1ULL) * 0xC2B2AE3D27D4EB4FULL);
+	return true;
+}
+
+// OAM is deduplicated on an object's COMPOSITION, not on the frame it appeared
+// in — see the recorder below. Both writer and seeder hash the same substring of
+// the same rendered line, starting at " W", so they cannot drift apart: position
+// and OAM index sit before that point and are excluded, everything that defines
+// what the object IS sits after it.
+static uint64_t OamCompositionSig(const char* line)
+{
+	const char* tail = strstr(line, " W");
+	if(!tail) return 0;
+	uint64_t h = 0xCBF29CE484222325ULL;
+	for(const char* p = tail; *p && *p != '\n' && *p != '\r'; p++) {
+		h = (h ^ (uint8_t)*p) * 0x100000001B3ULL;
+	}
+	return h;
+}
+
+// Dedup happens per FRAME, folding the composition of every entry in it. Two
+// alternatives were worse: keeping the frame gate on position (what the file
+// grew to 399 MB with, since something on screen moves every frame), and
+// dropping individual known entries from a frame (which would leave partial
+// blocks behind and change what an OAMF block means to the viewer). Folding the
+// whole frame keeps every written block complete and self-consistent, and a
+// frame whose object set merely MOVED is recognised as one we already have.
+static void SeedOamFrameSigs(std::unordered_set<uint64_t>& seen)
+{
+	char path[512];
+	if(!RecorderPath("snes_hd_oam.txt", path, sizeof(path))) {
+		return;
+	}
+	FILE* f = fopen(path, "r");
+	if(!f) {
+		return;
+	}
+	char line[4096];
+	uint64_t cur = 0;
+	bool inFrame = false;
+	size_t before = seen.size();
+	while(fgets(line, sizeof(line), f)) {
+		if(strncmp(line, "OAMF ", 5) == 0) {
+			if(inFrame && cur) {
+				seen.insert(cur);
+			}
+			cur = 0xCBF29CE484222325ULL;
+			inFrame = true;
+		} else if(inFrame && strncmp(line, "OAM I", 5) == 0) {
+			cur = (cur ^ OamCompositionSig(line)) * 0x100000001B3ULL;
+		}
+	}
+	if(inFrame && cur) {
+		seen.insert(cur);
+	}
+	fclose(f);
+	char msg[256];
+	snprintf(msg, sizeof(msg), "[SNES HD diag] snes_hd_oam.txt: %zu distinct object sets from earlier sessions",
+		seen.size() - before);
+	MessageManager::Log(msg);
+}
+
+static FILE* OpenRecorder(const char* fileName)
+{
+	char path[512];
+	if(!RecorderPath(fileName, path, sizeof(path))) return nullptr;
 	FILE* f = fopen(path, "a");
 	if(f) {
 		time_t now = time(nullptr);
@@ -179,6 +315,85 @@ struct HdTileSampler
 	inline uint32_t Sample(uint32_t dx, uint32_t dy) const
 	{
 		return base[(int)dy * rowStep + (int)dx * colStep];
+	}
+};
+
+// Sprite recoloring: map an HD sprite's baked-in reference palette onto the live
+// OBJ palette the game loaded for this level. See SnesHdData.h for why sprites
+// need this and BG tiles do not -- OBJ palette slots are dynamically allocated,
+// so the slot we see says nothing about the colors, and the level decides them.
+//
+// Per texel: find the nearest reference color and carry the texel's offset from
+// it over to the live color. Anti-aliased texels sit between two palette entries,
+// and keeping the offset preserves that gradient instead of snapping it to one
+// side. When live == reference every delta is zero and Apply() is the exact
+// identity -- a level whose sprites already look right cannot change.
+struct HdSpriteRecolor
+{
+	bool valid = false;
+	uint8_t refR[16] = {}, refG[16] = {}, refB[16] = {};
+	int16_t dR[16] = {}, dG[16] = {}, dB[16] = {};
+
+	void Init(const uint16_t* refPal, const uint16_t* liveRow)
+	{
+		valid = false;
+		if(!refPal || !liveRow) {
+			return;
+		}
+		bool anyDelta = false;
+		for(int i = 0; i < 16; i++) {
+			uint16_t rc = refPal[i] & 0x7FFF;
+			uint16_t lc = liveRow[i] & 0x7FFF;
+			refR[i] = ColorUtilities::Convert5BitTo8Bit(rc & 0x1F);
+			refG[i] = ColorUtilities::Convert5BitTo8Bit((rc >> 5) & 0x1F);
+			refB[i] = ColorUtilities::Convert5BitTo8Bit((rc >> 10) & 0x1F);
+			dR[i] = (int16_t)((int)ColorUtilities::Convert5BitTo8Bit(lc & 0x1F) - (int)refR[i]);
+			dG[i] = (int16_t)((int)ColorUtilities::Convert5BitTo8Bit((lc >> 5) & 0x1F) - (int)refG[i]);
+			dB[i] = (int16_t)((int)ColorUtilities::Convert5BitTo8Bit((lc >> 10) & 0x1F) - (int)refB[i]);
+			// Index 0 is transparent and never drawn, so a difference there is not
+			// a reason to run the whole recolor.
+			if(i > 0 && (dR[i] || dG[i] || dB[i])) {
+				anyDelta = true;
+			}
+		}
+		valid = anyDelta;
+	}
+
+	inline uint32_t Apply(uint32_t c) const
+	{
+		uint32_t a = c >> 24;
+		if(a == 0) {
+			return c;
+		}
+		int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+		// HdTileData is premultiplied; the nearest-color search only makes sense
+		// against the straight color, so undo and redo the premultiply on edges.
+		if(a < 255) {
+			r = std::min(255, r * 255 / (int)a);
+			g = std::min(255, g * 255 / (int)a);
+			b = std::min(255, b * 255 / (int)a);
+		}
+		int best = 1, bestD = 0x7FFFFFFF;
+		for(int i = 1; i < 16; i++) {
+			int er = r - (int)refR[i], eg = g - (int)refG[i], eb = b - (int)refB[i];
+			int d = er * er + eg * eg + eb * eb;
+			if(d < bestD) {
+				bestD = d;
+				best = i;
+				if(d == 0) {
+					break;
+				}
+			}
+		}
+		r = std::min(255, std::max(0, r + (int)dR[best]));
+		g = std::min(255, std::max(0, g + (int)dG[best]));
+		b = std::min(255, std::max(0, b + (int)dB[best]));
+		if(a < 255) {
+			r = r * (int)a / 255;
+			g = g * (int)a / 255;
+			b = b * (int)a / 255;
+		}
+		return (a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 	}
 };
 
@@ -416,6 +631,8 @@ struct HdFilterFrameStats
 	uint32_t SubOpHd = 0;       // P4.0: CM operand sampled from a sub-screen HD tile
 	uint32_t SubOpFixed = 0;    // P4.0: empty sub-screen -> FixedColor operand
 	uint32_t MainNatHd = 0;     // P4.0: native main color + HD sub operand (overlay case)
+	uint32_t SprRecolor = 0;    // sprite pixels whose HD art was recolored to the live OBJ palette
+	uint32_t SprRecolorNoRef = 0; // sprite pixels with HD art but no reference palette in the pack
 	uint32_t SprSub = 0;        // P4.1e: sprite is the final sub-screen winner
 	uint32_t SprSubMainHd = 0;  // P4.1e: of those, pixels with a main-winner HD match
 	uint32_t SprHd = 0;         // S4: sprite-won pixels rendered via an HD sprite tile
@@ -437,6 +654,8 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SubOpHd += src.SubOpHd;
 	dst.SubOpFixed += src.SubOpFixed;
 	dst.MainNatHd += src.MainNatHd;
+	dst.SprRecolor += src.SprRecolor;
+	dst.SprRecolorNoRef += src.SprRecolorNoRef;
 	dst.SprSub += src.SprSub;
 	dst.SprSubMainHd += src.SprSubMainHd;
 	dst.SprHd += src.SprHd;
@@ -1077,6 +1296,35 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					}
 				}
 
+				// Sprites are exempt from the R3 LUT above (it only covers BG rows)
+				// and get the recolor instead: live OBJ colors come from CGRAM at the
+				// slot the game allocated, the reference ships with the art.
+				// A/B switch. The recolor is the only thing S19 changed about how a
+				// sprite LOOKS, so being able to turn it off in a running build is
+				// the difference between measuring and guessing:
+				//     set SNES_HD_NO_SPRITE_RECOLOR=1
+				// before starting Mesen to render sprites exactly as S18 did (baked
+				// colors, no correction). Read once, so toggling needs a restart.
+				static const bool s_noRecolor = getenv("SNES_HD_NO_SPRITE_RECOLOR") != nullptr;
+
+				HdSpriteRecolor mainRecolor, subRecolor;
+				if(!s_noRecolor && mainSampler.valid && hdTileInfo->Key.LayerIndex == 4) {
+					const uint16_t* spriteRef = hdData->GetSpriteRefPalette(hdTileInfo->Key.ContentHash);
+					mainRecolor.Init(spriteRef, hdScreen->Cgram + 128 + (hdTileInfo->Key.PaletteIndex & 7) * 16);
+					// Separated on purpose: "no reference shipped" is a pack gap worth
+					// reporting, while "reference == live" is the normal, correct case
+					// and must not look like one.
+					if(!spriteRef) {
+						st.SprRecolorNoRef++;
+					} else if(mainRecolor.valid) {
+						st.SprRecolor++;
+					}
+				}
+				if(!s_noRecolor && subSampler.valid && subTileInfo->Key.LayerIndex == 4) {
+					subRecolor.Init(hdData->GetSpriteRefPalette(subTileInfo->Key.ContentHash),
+						hdScreen->Cgram + 128 + (subTileInfo->Key.PaletteIndex & 7) * 16);
+				}
+
 				// 1. Clip main color to black (runs even without AllowColorMath;
 				//    Always mode does NOT reset halfShift — matches PPU)
 				int halfShift = sl.ColorMathHalveResult ? 1 : 0;
@@ -1128,6 +1376,9 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							uint32_t mha = 0;
 							if(mainSampler.valid) {
 								mc = mainSampler.Sample(dx, dy);
+								if(mainRecolor.valid) {
+									mc = mainRecolor.Apply(mc);
+								}
 								mha = mc >> 24;
 							}
 							if(mha == 255) {
@@ -1179,6 +1430,9 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								oR = nsR; oG = nsG; oB = nsB;
 								if(subSampler.valid) {
 									uint32_t c = subSampler.Sample(dx, dy);
+									if(subRecolor.valid) {
+										c = subRecolor.Apply(c);
+									}
 									uint32_t ha = c >> 24;
 									if(ha == 255) {
 										// R6.1: opaque fast path (blend reduces to o=h)
@@ -1497,6 +1751,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSprSubMainHd = total.SprSubMainHd;
 	uint32_t frameSprHd = total.SprHd;
 	uint32_t frameSprSubHd = total.SprSubHd;
+	uint32_t frameSprRecolor = total.SprRecolor;
+	uint32_t frameSprRecolorNoRef = total.SprRecolorNoRef;
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
@@ -1574,7 +1830,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
-			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
+			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
@@ -1583,7 +1839,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			diagFrameCount, diagBgFrameCount, ctxLabel,
 			frameTotalPixels, frameBgPixels, frameHdMatch,
 			frameHdMiss, frameHdCm, frameMainNatHd, frameSubOpHd, frameSubOpFixed, frameLayerRetry, frameMultiLayer,
-			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameSprSubHd, frameMaskZero, frameHdmaSplit,
+			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameSprSubHd,
+			frameSprRecolor, frameSprRecolorNoRef, frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
@@ -1689,6 +1946,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 				if(!s_spriteCapAttempted) {
 						s_spriteCapAttempted = true;
+						SeedRecorderSet("snes_hd_spritecap.txt", s_spriteCapSeen, ParseSpriteCapKey);
+						if(s_spriteCapSeen.find(setKey) != s_spriteCapSeen.end()) continue;   // earlier session had it
 						s_spriteCapFile = OpenRecorder("snes_hd_spritecap.txt");
 					}
 				if(!s_spriteCapFile) break;
@@ -1776,6 +2035,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 					if(!s_bgCapAttempted) {
 						s_bgCapAttempted = true;
+						SeedRecorderSet("snes_hd_bgcap.txt", s_bgCapSeen, ParseBgCapKey);
+						if(s_bgCapSeen.find(seenKey) != s_bgCapSeen.end()) continue;   // earlier session had it
 						s_bgCapFile = OpenRecorder("snes_hd_bgcap.txt");
 					}
 					if(!s_bgCapFile) break;
@@ -1936,6 +2197,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 				if(!s_sprMissAttempted) {
 						s_sprMissAttempted = true;
+						SeedRecorderSet("snes_hd_spritemiss.txt", s_sprMissSeen, ParseSprMissKey);
+						if(s_sprMissSeen.find(missKey) != s_sprMissSeen.end()) continue;   // earlier session had it
 						s_sprMissFile = OpenRecorder("snes_hd_spritemiss.txt");
 					}
 				if(!s_sprMissFile) break;
@@ -1985,6 +2248,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		static bool s_oamAttempted = false;
 		static uint32_t s_oamFrames = 0;
 		static uint64_t s_oamPrevSig = 0;
+		// Distinct object sets already on file — seeded from earlier sessions, so
+		// the 20000 budget below is now a budget for NEW material rather than one
+		// that refills on every restart.
+		static std::unordered_set<uint64_t> s_oamSeenComp;
 		if(s_oamFrames < 20000) {
 			// Exactly SnesPpu::FetchSpritePosition's tables — sprites can be
 			// RECTANGULAR (16x32, 32x64), so width and height must be read
@@ -2027,38 +2294,54 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 			if(visible > 0 && sig != s_oamPrevSig) {
 				s_oamPrevSig = sig;
-				if(!s_oamAttempted) {
-						s_oamAttempted = true;
-						s_oamFile = OpenRecorder("snes_hd_oam.txt");
+
+				// Render the frame's entries first, then decide whether it is worth
+				// keeping. The position-based gate above only says "something moved";
+				// the composition fold below says whether we have this OBJECT SET
+				// already, which is what the viewer actually consumes.
+				static std::vector<std::string> s_oamLines;
+				s_oamLines.clear();
+				uint64_t compSig = 0xCBF29CE484222325ULL;
+				char lineBuf[4096];
+				for(int n = 0; n < visible; n++) {
+					const Entry& en = list[n];
+					// A W x H sprite occupies (W/8) x (H/8) tiles laid out in the
+					// 16x16 name table, wrapping within the row — the same walk
+					// FetchSpriteAttributes does. The hashes are written out so the
+					// viewer can find the pixels in spritemiss; it has no VRAM.
+					int off = snprintf(lineBuf, sizeof(lineBuf),
+						"OAM I%03d X%+04d Y%03d W%02d H%02d T%03X P%d R%d %c%c",
+						en.idx, en.x, en.y, en.w, en.h, en.tile, en.pal, en.prio,
+						en.hm ? 'H' : '-', en.vm ? 'V' : '-');
+					const int baseRow = (en.tile & 0xFF) >> 4;
+					const int baseCol = en.tile & 0x0F;
+					const bool second = (en.tile & 0x100) != 0;
+					for(int dy = 0; dy < en.h / 8 && off < (int)sizeof(lineBuf) - 20; dy++) {
+						for(int dx = 0; dx < en.w / 8 && off < (int)sizeof(lineBuf) - 20; dx++) {
+							const uint8_t idx = (uint8_t)((((baseRow + dy) & 0x0F) << 4)
+								| ((baseCol + dx) & 0x0F));
+							const uint16_t vaddr = (uint16_t)((hdScreen->OamBaseAddress
+								+ ((uint16_t)idx << 4)
+								+ (second ? hdScreen->OamAddressOffset : 0)) & 0x7FFF);
+							off += snprintf(lineBuf + off, sizeof(lineBuf) - off, " %016llX",
+								(unsigned long long)ComputeTileContentHash(hdScreen->Vram, vaddr, 16));
+						}
 					}
-				if(s_oamFile) {
+					compSig = (compSig ^ OamCompositionSig(lineBuf)) * 0x100000001B3ULL;
+					s_oamLines.push_back(lineBuf);
+				}
+
+				if(!s_oamAttempted) {
+					s_oamAttempted = true;
+					SeedOamFrameSigs(s_oamSeenComp);
+					s_oamFile = OpenRecorder("snes_hd_oam.txt");
+				}
+				if(s_oamFile && s_oamSeenComp.insert(compSig).second) {
 					fprintf(s_oamFile, "OAMF G%d S%016llX F%u M%d N%d\n",
 						(int)_hdData->ActiveGfxset, (unsigned long long)vramSig,
 						hdScreen->FrameNumber, hdScreen->OamMode, visible);
-					for(int n = 0; n < visible; n++) {
-						const Entry& en = list[n];
-						// A W x H sprite occupies (W/8) x (H/8) tiles laid out in the
-						// 16x16 name table, wrapping within the row — the same walk
-						// FetchSpriteAttributes does. The hashes are written out so the
-						// viewer can find the pixels in spritemiss; it has no VRAM.
-						fprintf(s_oamFile, "OAM I%03d X%+04d Y%03d W%02d H%02d T%03X P%d R%d %c%c",
-							en.idx, en.x, en.y, en.w, en.h, en.tile, en.pal, en.prio,
-							en.hm ? 'H' : '-', en.vm ? 'V' : '-');
-						const int baseRow = (en.tile & 0xFF) >> 4;
-						const int baseCol = en.tile & 0x0F;
-						const bool second = (en.tile & 0x100) != 0;
-						for(int dy = 0; dy < en.h / 8; dy++) {
-							for(int dx = 0; dx < en.w / 8; dx++) {
-								const uint8_t idx = (uint8_t)((((baseRow + dy) & 0x0F) << 4)
-									| ((baseCol + dx) & 0x0F));
-								const uint16_t vaddr = (uint16_t)((hdScreen->OamBaseAddress
-									+ ((uint16_t)idx << 4)
-									+ (second ? hdScreen->OamAddressOffset : 0)) & 0x7FFF);
-								fprintf(s_oamFile, " %016llX",
-									(unsigned long long)ComputeTileContentHash(hdScreen->Vram, vaddr, 16));
-							}
-						}
-						fputc('\n', s_oamFile);
+					for(const std::string& l : s_oamLines) {
+						fprintf(s_oamFile, "%s\n", l.c_str());
 					}
 					s_oamFrames++;
 					fflush(s_oamFile);
