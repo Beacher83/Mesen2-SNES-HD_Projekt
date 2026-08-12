@@ -388,6 +388,10 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 
 	int loadedCount = 0;
 	int animCount = 0;
+	// S20: sprite hashes already loaded slot-free — every further slot variant of
+	// the same art is redundant and is skipped before it is even decoded.
+	std::unordered_set<uint64_t> slotFreeSpriteHashes;
+	int skippedSlotDupes = 0;
 
 	for(const string& filePath : files) {
 		string filename = FolderUtilities::GetFilename(filePath, false);
@@ -405,6 +409,17 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 			if(!ParseSpriteFilename(filename, spriteHash, paletteIndex)) {
 				MessageManager::Log("[SNES HD Pack] Skipping invalid sprite filename: " + filename);
 				continue;
+			}
+			// S20: art with a reference palette follows the live OBJ row on its own,
+			// so it is stored once for all slots. The slot in the filename is then
+			// only a leftover of how the tile was recorded — the first file wins and
+			// the rest are dropped without decoding them.
+			if(_data->SpritePaletteByHash.count(spriteHash) > 0) {
+				paletteIndex = SnesHdSpriteAnyPalette;
+				if(!slotFreeSpriteHashes.insert(spriteHash).second) {
+					skippedSlotDupes++;
+					continue;
+				}
 			}
 		} else if(ParseAnimTileFilename(filename, animHash, paletteIndex)) {
 			// S6b: CHR-animation frame, keyed by content hash (see ParseAnimTileFilename).
@@ -501,7 +516,8 @@ bool SnesHdPackLoader::LoadTilesFromDirectory(const string& dirPath, uint8_t lay
 	if(loadedCount > 0 || !files.empty()) {
 		MessageManager::Log("[SNES HD Pack] gfxset_" + std::to_string(gfxsetIndex) + " layer " + std::to_string(layerIndex)
 			+ ": loaded " + std::to_string(loadedCount) + "/" + std::to_string(files.size()) + " tiles"
-			+ (animCount > 0 ? " (" + std::to_string(animCount) + " anim frames)" : string()));
+			+ (animCount > 0 ? " (" + std::to_string(animCount) + " anim frames)" : string())
+			+ (skippedSlotDupes > 0 ? " (" + std::to_string(skippedSlotDupes) + " redundant slot copies skipped)" : string()));
 	}
 
 	return loadedCount > 0;

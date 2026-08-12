@@ -57,11 +57,27 @@ inline uint64_t ComputeTileContentHash(const uint16_t* vram, uint16_t wordAddres
 //   Key = VRAM word address + palette + layer
 //   Original approach; breaks when multiple gfxsets share VRAM addresses.
 
+// S20: PaletteIndex value that means "this sprite tile fits any OBJ palette row".
+//
+// For sprites the PaletteIndex is the OAM palette SLOT, and a slot carries no
+// identity: DKC2's allocator (CODE_BB8A6F) hands out whichever of the eight
+// slots is free, so the same character lands in different rows from one level
+// to the next — and the pack had to ship the same art once per slot it had ever
+// been recorded in. A tile that carries a reference palette does not need that:
+// it is recoloured from its reference to whatever row is live, so one copy is
+// correct everywhere. Those tiles are stored under this wildcard, and
+// GetMatchingTile falls back to it when the exact slot has no art.
+//
+// Tiles WITHOUT a reference keep their recorded slot: they render with their
+// baked-in colours, so letting them match a foreign row would be a new way to
+// paint wrong colours.
+static constexpr uint8_t SnesHdSpriteAnyPalette = 0xFF;
+
 struct SnesHdTileKey
 {
 	uint64_t ContentHash = 0;   // FNV-1a 64-bit hash of tile VRAM bytes (0 = legacy VramAddress mode)
 	uint16_t VramAddress = 0;   // VRAM word address (legacy fallback, used when ContentHash == 0)
-	uint8_t PaletteIndex = 0;   // Palette group (0-7)
+	uint8_t PaletteIndex = 0;   // Palette group (0-7), or SnesHdSpriteAnyPalette for slot-free sprite art
 	uint8_t LayerIndex = 0;     // 0-3 = BG1-BG4, 4 = Sprites
 
 	size_t GetHashCode() const
@@ -503,6 +519,21 @@ public:
 					if(tile->IsFullyTransparent) continue;
 					if(strictScope && tile->GfxsetIndex != 0xFF && (int16_t)tile->GfxsetIndex != ActiveGfxset) continue;
 					return tile;
+				}
+			}
+
+			// S20: sprite art that carries a reference palette is stored slot-free
+			// (see SnesHdSpriteAnyPalette). The exact slot is tried first so a pack
+			// that still ships per-slot art keeps behaving exactly as before.
+			if(key.LayerIndex == 4 && key.PaletteIndex != SnesHdSpriteAnyPalette) {
+				SnesHdTileKey anyKey = key;
+				anyKey.PaletteIndex = SnesHdSpriteAnyPalette;
+				auto anyIt = TileByKey.find(anyKey);
+				if(anyIt != TileByKey.end()) {
+					for(SnesHdPackTileInfo* tile : anyIt->second) {
+						if(tile->IsFullyTransparent) continue;
+						return tile;
+					}
 				}
 			}
 			return nullptr;
