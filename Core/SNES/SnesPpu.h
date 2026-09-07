@@ -145,15 +145,40 @@ private:
 		bool NativeOpaque = false;
 		uint8_t Priority = 0;
 
-		// S21b: a second sprite also covers this pixel opaquely. The line buffer
-		// keeps only the winner, so what is UNDER the top sprite is unknown — and
-		// blending its soft edge against the BG art would show the background
-		// through it instead of the sprite that is really behind (Dixie's hair in
-		// front of Diddy). Where this is set, the edge work stands down.
-		bool MultiOpaque = false;
 	};
 	HdSpritePixel _hdSpritePixels[256] = {};
 	HdSpritePixel _hdSpritePixelsCopy[256] = {};
+
+	// S22: the sprite that the winner above displaced at this pixel. Two sprites
+	// can cover one pixel, and the buffer above keeps only the top one — so when
+	// its soft edge asks "what is behind me", the honest answer is not the BG
+	// tile but the other character (Dixie's hair over Diddy, Kruncha's arm over
+	// the sun). S21b could only detect that case and stand down, which left the
+	// outer edge hard exactly where two sprites meet; keeping the displaced entry
+	// lets the filter blend against it instead. Written in FetchSpriteTile before
+	// the overwrite, carried out as Sprites[3] / SpriteCount bit 3.
+	HdSpritePixel _hdSpritePixelsUnder[256] = {};
+	HdSpritePixel _hdSpritePixelsUnderCopy[256] = {};
+
+	// S23: a sprite's soft fringe that lost the buffer above to an OPAQUE sprite.
+	// The fringe lives where its own sprite is natively transparent, so it can never
+	// win a pixel another sprite actually covers — and until now it was simply
+	// dropped there, which is why Kruncha's arm kept a hard edge in front of the sun
+	// while the same arm against the sky came out smooth. Highest sprite priority
+	// wins the slot; the filter decides against the pixel's real winner whether the
+	// fringe is drawn at all.
+	HdSpritePixel _hdSpritePixelsFringe[256] = {};
+	HdSpritePixel _hdSpritePixelsFringeCopy[256] = {};
+
+	// S24: both buffers above are empty on most scanlines — they only fill where
+	// two sprites meet. Copying and clearing them regardless tripled the per-scanline
+	// sprite-buffer traffic in the EMULATION thread, which is where this project's
+	// stutter has always come from (the filter's own ms barely moved). These flags
+	// keep the memcpy/memset for the scanlines that actually used them.
+	bool _hdSpriteUnderDirty = false;
+	bool _hdSpriteUnderCopyDirty = false;
+	bool _hdSpriteFringeDirty = false;
+	bool _hdSpriteFringeCopyDirty = false;
 
 	int32_t _debugMode7StartX = 0;
 	int32_t _debugMode7StartY = 0;

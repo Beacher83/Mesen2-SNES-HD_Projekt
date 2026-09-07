@@ -464,6 +464,24 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
 				// HD sprites (S1): swap the OBJ tile identity buffer in lockstep
 				// with the sprite line buffers (4KB, only while HD is active)
 				memcpy(_hdSpritePixels, _hdSpritePixelsCopy, sizeof(_hdSpritePixels));
+				// S24: skip the ones that stayed empty — see the flags in the header.
+				// Three states: copy has data (take it), copy is empty but the target
+				// still holds last scanline's (clear it, or that art smears down the
+				// screen), both empty (nothing to do — the common case).
+				if(_hdSpriteUnderCopyDirty) {
+					memcpy(_hdSpritePixelsUnder, _hdSpritePixelsUnderCopy, sizeof(_hdSpritePixelsUnder));
+					_hdSpriteUnderDirty = true;
+				} else if(_hdSpriteUnderDirty) {
+					memset(_hdSpritePixelsUnder, 0, sizeof(_hdSpritePixelsUnder));
+					_hdSpriteUnderDirty = false;
+				}
+				if(_hdSpriteFringeCopyDirty) {
+					memcpy(_hdSpritePixelsFringe, _hdSpritePixelsFringeCopy, sizeof(_hdSpritePixelsFringe));
+					_hdSpriteFringeDirty = true;
+				} else if(_hdSpriteFringeDirty) {
+					memset(_hdSpritePixelsFringe, 0, sizeof(_hdSpritePixelsFringe));
+					_hdSpriteFringeDirty = false;
+				}
 			}
 
 			memset(_spriteIndexes, 0xFF, sizeof(_spriteIndexes));
@@ -654,6 +672,14 @@ void SnesPpu::FetchSpriteData()
 		// fringe path has no such guard and would smear last scanline's art.
 		if(_hdData && _hdActiveScreen) {
 			memset(_hdSpritePixelsCopy, 0, sizeof(_hdSpritePixelsCopy));
+			if(_hdSpriteUnderCopyDirty) {
+				memset(_hdSpritePixelsUnderCopy, 0, sizeof(_hdSpritePixelsUnderCopy));
+				_hdSpriteUnderCopyDirty = false;
+			}
+			if(_hdSpriteFringeCopyDirty) {
+				memset(_hdSpritePixelsFringeCopy, 0, sizeof(_hdSpritePixelsFringeCopy));
+				_hdSpriteFringeCopyDirty = false;
+			}
 		}
 
 		_spriteTileCount = 0;
@@ -834,23 +860,53 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 			if(hdCapture) {
 				HdSpritePixel& sp = _hdSpritePixelsCopy[xPos + x];
 				const bool opaque = color != 0;
-				// S21b: remember that two sprites cover this pixel before the newer
-				// one overwrites the older — afterwards the information is gone.
-				const bool overlap = opaque && sp.NativeOpaque;
+				// S22: two sprites cover this pixel — keep the one being displaced
+				// instead of losing it. This is the only moment both are in hand, and
+				// the filter needs the lower one as the ground under the upper one's
+				// soft edge. With three or more stacked, the last displaced entry wins,
+				// which is the one directly beneath the winner — exactly the wanted one.
+				if(opaque && sp.NativeOpaque) {
+					_hdSpritePixelsUnderCopy[xPos + x] = sp;
+					_hdSpriteUnderCopyDirty = true;
+				}
+
+				// SCREEN-SPACE offsets (x = column within the displayed slice,
+				// TileRowOffset = displayed row) — HdTileSampler applies the
+				// mirror flags itself, exactly like the BG tile convention.
+				HdSpritePixel cur;
+				cur.ContentHash = hdHash;
+				cur.TileVramAddr = _currentSprite.TileVramAddr;
+				cur.OffsetX = (uint8_t)x;
+				cur.OffsetY = _currentSprite.TileRowOffset;
+				cur.Palette = _currentSprite.Palette;
+				cur.HMirror = _currentSprite.HorizontalMirror;
+				cur.VMirror = _currentSprite.VerticalMirror;
+				cur.NativeOpaque = opaque;
+				cur.Priority = _currentSprite.Priority;
+
+				// S23: a transparent entry is a FRINGE candidate — the sprite does not
+				// cover this pixel natively, but its 4x art may still reach into it. It
+				// can never hold the buffer above against an opaque sprite, so keep it
+				// aside instead of dropping it. Both fetch orders end up here: the
+				// candidate either arrives after the opaque sprite (else branch) or is
+				// displaced by one that arrives later (if branch). Highest sprite
+				// priority wins; the filter still decides against the pixel's real
+				// winner whether it gets drawn.
+				auto keepFringe = [&](const HdSpritePixel& e) {
+					HdSpritePixel& fr = _hdSpritePixelsFringeCopy[xPos + x];
+					if(fr.ContentHash == 0 || e.Priority > fr.Priority) {
+						fr = e;
+						_hdSpriteFringeCopyDirty = true;
+					}
+				};
+
 				if(opaque || sp.ContentHash == 0) {
-					// SCREEN-SPACE offsets (x = column within the displayed slice,
-					// TileRowOffset = displayed row) — HdTileSampler applies the
-					// mirror flags itself, exactly like the BG tile convention.
-					sp.ContentHash = hdHash;
-					sp.TileVramAddr = _currentSprite.TileVramAddr;
-					sp.OffsetX = (uint8_t)x;
-					sp.OffsetY = _currentSprite.TileRowOffset;
-					sp.Palette = _currentSprite.Palette;
-					sp.HMirror = _currentSprite.HorizontalMirror;
-					sp.VMirror = _currentSprite.VerticalMirror;
-					sp.NativeOpaque = opaque;
-					sp.Priority = _currentSprite.Priority;
-					sp.MultiOpaque = overlap;
+					if(opaque && sp.ContentHash != 0 && !sp.NativeOpaque) {
+						keepFringe(sp);
+					}
+					sp = cur;
+				} else {
+					keepFringe(cur);
 				}
 			}
 		}
@@ -1104,9 +1160,8 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 	// must check the final winner (IsSpritePixel / SubScreenHasSprite).
 	const uint16_t hdScanline = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
 	const bool hdValid = _hdData && _hdActiveScreen && hdScanline < SnesHdScreenInfo::ScreenHeight;
-	auto hdCaptureSprite = [&](int x, int slot, uint8_t spritePrio) {
+	auto hdCaptureSpriteFrom = [&](int x, int slot, uint8_t spritePrio, const HdSpritePixel& sp) {
 		SnesHdPpuPixelInfo& pi = _hdActiveScreen->ScreenTiles[hdScanline * SnesHdScreenInfo::ScreenWidth + x];
-		const HdSpritePixel& sp = _hdSpritePixels[x];
 		SnesHdPpuTileInfo& t = pi.Sprites[slot];
 		t.Key.ContentHash = sp.ContentHash;
 		t.Key.VramAddress = sp.TileVramAddr;
@@ -1119,14 +1174,44 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 		t.Priority = spritePrio;
 		t.VramWordAddr = sp.TileVramAddr;
 		pi.SpriteCount |= (1 << slot);
-		// S21b: bit 3 says "another sprite is opaque under this one" — the filter
-		// uses it to leave overlapping characters alone.
-		if(sp.MultiOpaque) {
+
+		// S22: publish the displaced sprite as slot 3 — slot and bit 3 belong
+		// together, and this was the last free pair. The filter treats it as the
+		// ground beneath a soft sprite edge, in place of the BG tile it would
+		// otherwise reach for. Idempotent: slots 0/1/2 all run through here and
+		// write the same entry.
+		const HdSpritePixel& un = _hdSpritePixelsUnder[x];
+		if(un.ContentHash != 0) {
+			SnesHdPpuTileInfo& u = pi.Sprites[3];
+			u.Key.ContentHash = un.ContentHash;
+			u.Key.VramAddress = un.TileVramAddr;
+			u.Key.PaletteIndex = un.Palette;
+			u.Key.LayerIndex = 4;
+			u.OffsetX = un.OffsetX;
+			u.OffsetY = un.OffsetY;
+			u.HorizontalMirror = un.HMirror;
+			u.VerticalMirror = un.VMirror;
+			u.Priority = priority[un.Priority & 0x03];
+			u.VramWordAddr = un.TileVramAddr;
 			pi.SpriteCount |= 0x08;
 		}
 	};
+	auto hdCaptureSprite = [&](int x, int slot, uint8_t spritePrio) {
+		hdCaptureSpriteFrom(x, slot, spritePrio, _hdSpritePixels[x]);
+	};
 
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
+		// S23: another sprite's soft fringe may reach into this pixel even when a
+		// sprite covers it natively — Kruncha's arm over the sun. The branch below
+		// only ever filled slot 2 where NO native sprite pixel existed, so exactly
+		// the overlapping case was left out. Priority is carried along; the filter
+		// compares it against the pixel's real winner before drawing anything.
+		if(hdValid && drawMain && x < SnesHdScreenInfo::ScreenWidth
+			&& _spritePriority[x] <= 3 && _hdSpritePixelsFringe[x].ContentHash != 0
+			&& !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
+			hdCaptureSpriteFrom(x, 2, priority[_hdSpritePixelsFringe[x].Priority & 0x03],
+				_hdSpritePixelsFringe[x]);
+		}
 		if(_spritePriority[x] <= 3) {
 			uint8_t spritePrio = priority[_spritePriority[x]];
 			if(drawMain && ((_mainScreenFlags[x] & 0x0F) < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {

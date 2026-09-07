@@ -18,7 +18,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S21"
+#define SNES_HD_BUILD_VERSION "S24"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -619,6 +619,12 @@ struct HdFilterFrameCtx
 // Both halves of the edge work hang off this one flag, so a single comparison
 // run answers whether it helps.
 static const bool s_noSpriteEdges = getenv("SNES_HD_NO_SPRITE_EDGES") != nullptr;
+// S22 A/B: ignore slot 3, so a soft sprite edge never blends against the sprite
+// behind it (wall 2 falls back to the BG search, i.e. S21 behaviour). Separate
+// from the switch above because S22 and S23 landed together and their effects
+// have to be told apart in a running build rather than argued about:
+//     set SNES_HD_NO_SPRITE_UNDER=1
+static const bool s_noSpriteUnder = getenv("SNES_HD_NO_SPRITE_UNDER") != nullptr;
 
 struct HdFilterFrameStats
 {
@@ -646,6 +652,8 @@ struct HdFilterFrameStats
 	uint32_t SprSubHd = 0;      // S7: sub-screen sprite rendered via an HD sprite tile (fog/water levels)
 	uint32_t SprEdge = 0;       // S21: pixels outside the native silhouette that carry sprite fringe art
 	uint32_t SprEdgeBlend = 0;  // S21: of those, sub-pixels where the fringe was actually drawn
+	uint32_t SprEdgeUnder = 0;  // S22: pixels blended against the sprite behind, not the BG
+	uint32_t SprEdgeTie = 0;    // S23: fringe present over a sprite, priority rejects it
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -671,6 +679,8 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SprSubHd += src.SprSubHd;
 	dst.SprEdge += src.SprEdge;
 	dst.SprEdgeBlend += src.SprEdgeBlend;
+	dst.SprEdgeUnder += src.SprEdgeUnder;
+	dst.SprEdgeTie += src.SprEdgeTie;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -1202,30 +1212,41 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					// anti-aliased silhouette visible at all. Where the background has no
 					// HD art the old behaviour stands: the native colour is all there is.
 					SnesHdScanlineInfo& slSpr = hdScreen->ScanlineInfo[y];
-					// S21b: not when a second sprite is opaque under this one. The line
-					// buffer keeps only the winner, so the BG tile is NOT what is behind
-					// this pixel — the other character is. Blending against the BG there
-					// shows the background through the front sprite's soft edge, which is
-					// what made Dixie's hair look wrong with Diddy standing behind her.
+					// S22: when a second sprite lies under this one, THAT is the ground —
+					// not the BG tile. S21b could only spot the case and stand down, which
+					// left the edge hard exactly where two sprites meet (Kruncha's arm in
+					// front of the sun, the Kongs behind one another). Now the displaced
+					// sprite arrives as slot 3 and the existing blend does the rest.
+					// No BG fallback in that case on purpose: the BG is the known-wrong
+					// backdrop, and a hard edge beats showing it through a character.
 					if(!s_noSpriteEdges && hdTile->HasTransparentPixels && !hdTileBot
-						&& !(pixelInfo.SpriteCount & 0x08)
 						&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[0].Key.ContentHash) != nullptr) {
-						for(int layer = 0; layer < 4 && !hdTileBot; layer++) {
-							if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
-							if(!(slSpr.MainScreenLayers & (1 << layer))) continue;
-							// MAIN screen only, and that gate is the whole underwater story:
-							// below the water line DKC2 switches Main to $00/$04 by HDMA and
-							// leaves BG1/BG2 on the SUB screen alone. Such a layer is not what
-							// lies behind the sprite on the main screen — blending Dixie's soft
-							// hair against its bright art is what put a light rim around her,
-							// and only under water, because nowhere else do the registers look
-							// like this. Issue T needed the same gate in July, one block up.
-							SnesHdPackTileInfo* below = CachedGetMatchingTile(hdData, hdScreen->Vram,
-								tileLookupCache, pixelInfo.BgTiles[layer].Key);
-							if(below) {
-								hdTileBot = below;
-								hdTileInfoBot = &pixelInfo.BgTiles[layer];
-								st.MultiLayer++;
+						if((pixelInfo.SpriteCount & 0x08) && !s_noSpriteUnder) {
+							SnesHdPackTileInfo* under = CachedGetMatchingTile(hdData, hdScreen->Vram,
+								tileLookupCache, pixelInfo.Sprites[3].Key);
+							if(under) {
+								hdTileBot = under;
+								hdTileInfoBot = &pixelInfo.Sprites[3];
+								st.SprEdgeUnder++;
+							}
+						} else {
+							for(int layer = 0; layer < 4 && !hdTileBot; layer++) {
+								if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
+								if(!(slSpr.MainScreenLayers & (1 << layer))) continue;
+								// MAIN screen only, and that gate is the whole underwater story:
+								// below the water line DKC2 switches Main to $00/$04 by HDMA and
+								// leaves BG1/BG2 on the SUB screen alone. Such a layer is not what
+								// lies behind the sprite on the main screen — blending Dixie's soft
+								// hair against its bright art is what put a light rim around her,
+								// and only under water, because nowhere else do the registers look
+								// like this. Issue T needed the same gate in July, one block up.
+								SnesHdPackTileInfo* below = CachedGetMatchingTile(hdData, hdScreen->Vram,
+									tileLookupCache, pixelInfo.BgTiles[layer].Key);
+								if(below) {
+									hdTileBot = below;
+									hdTileInfoBot = &pixelInfo.BgTiles[layer];
+									st.MultiLayer++;
+								}
 							}
 						}
 					}
@@ -1314,6 +1335,16 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			// that background into the picture — user-visible as a washed-out fringe on
 			// the hub objects, while gallery art like Kruncha looked right. Having a
 			// reference is precisely what separates the two.
+			// S23 tried dropping the !spriteWon guard here so a fringe could be drawn
+			// over a sprite that won the pixel. Measured, and put back: the A/B run of
+			// 07 Sep settled it. With the guard removed, Dixie's yellow hair showed
+			// THROUGH the crate she carries over her head, and the counters explain why
+			// that was the whole of its effect — sprFrOver stayed 0 while sprFrTie ran
+			// into the thousands, i.e. fringe and winner nearly always share a priority
+			// and the honest gate below rejects them anyway. The smoothing the user sees
+			// on Kruncha's arm comes from slot 3 (S22) instead: turning THAT off brings
+			// the hard edge back, turning this off does not.
+			// Telling one from the other needed a switch, not an argument.
 			if(!s_noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && !spriteWon
 				&& pixelInfo.Sprites[2].Key.ContentHash != 0
 				&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[2].Key.ContentHash) != nullptr
@@ -1326,6 +1357,13 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				} else {
 					edgeTile = nullptr;
 				}
+			} else if(!s_noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && spriteWon
+				&& pixelInfo.Sprites[2].Key.ContentHash != 0
+				&& pixelInfo.Sprites[2].Priority <= (pixelInfo.MainScreenFlags & 0x0F)) {
+				// S23 diagnostic: a fringe was recorded over a winning sprite but the
+				// priority test rejected it. A large number here means equal priorities
+				// are common and the tie-break has to come from OAM order after all.
+				st.SprEdgeTie++;
 			}
 			bool hasEdgeHd = edgeTile != nullptr;
 
@@ -1367,7 +1405,11 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				typedef const uint8_t (*PalLutRow)[256];
 				PalLutRow botLut = nullptr, mainLut = nullptr, subLut = nullptr;
 				if(anyPalTransform) {
-					if(botSampler.valid && palRowActive[hdTileInfoBot->Key.PaletteIndex & 7]) {
+					// S22: the bottom tile can now be a SPRITE (slot 3). Same OBJ-palette
+					// exemption as main/sub below — the R3 LUT covers BG CGRAM rows 0-7
+					// only, and running a sprite through it would tint it with a BG row.
+					if(botSampler.valid && hdTileInfoBot->Key.LayerIndex != 4
+						&& palRowActive[hdTileInfoBot->Key.PaletteIndex & 7]) {
 						botLut = palLut[hdTileInfoBot->Key.PaletteIndex & 7];
 					}
 					// S4: no LUT for sprites — the R3 transform covers BG CGRAM rows
@@ -1415,6 +1457,15 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				// S21: the fringe is the same sprite's art and follows the same live
 				// OBJ palette — without this it would be the one part of a character
 				// that ignores the level's tint.
+				// S22: a sprite used as the bottom tile needs the recolor too — it is
+				// the same art under the same live OBJ palette as any other sprite, and
+				// without this the character showing through a soft edge would keep its
+				// baked colors while the one in front follows the level's tint.
+				HdSpriteRecolor botRecolor;
+				if(!s_noRecolor && botSampler.valid && hdTileInfoBot->Key.LayerIndex == 4) {
+					botRecolor.Init(hdData->GetSpriteRefPalette(hdTileInfoBot->Key.ContentHash),
+						hdScreen->Cgram + 128 + (hdTileInfoBot->Key.PaletteIndex & 7) * 16);
+				}
 				HdSpriteRecolor edgeRecolor;
 				if(!s_noRecolor && edgeSampler.valid) {
 					edgeRecolor.Init(hdData->GetSpriteRefPalette(edgeTileInfo->Key.ContentHash),
@@ -1487,6 +1538,9 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								r = nmR; g = nmG; b = nmB;
 								if(botSampler.valid) {
 									uint32_t c = botSampler.Sample(dx, dy);
+									if(botRecolor.valid) {
+										c = botRecolor.Apply(c);
+									}
 									uint32_t ha = c >> 24;
 									if(ha == 255) {
 										r = (c >> 16) & 0xFF; g = (c >> 8) & 0xFF; b = c & 0xFF;
@@ -1874,6 +1928,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSprRecolorNoRef = total.SprRecolorNoRef;
 	uint32_t frameSprEdge = total.SprEdge;
 	uint32_t frameSprEdgeBlend = total.SprEdgeBlend;
+	uint32_t frameSprEdgeUnder = total.SprEdgeUnder;
+	uint32_t frameSprEdgeTie = total.SprEdgeTie;
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
@@ -1952,7 +2008,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
 			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
-			" sprEdge=%u/%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
+			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
@@ -1963,7 +2019,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameHdMiss, frameHdCm, frameMainNatHd, frameSubOpHd, frameSubOpFixed, frameLayerRetry, frameMultiLayer,
 			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameSprSubHd,
 			frameSprRecolor, frameSprRecolorNoRef,
-			frameSprEdge, frameSprEdgeBlend, frameMaskZero, frameHdmaSplit,
+			frameSprEdge, frameSprEdgeBlend, frameSprEdgeUnder,
+			frameSprEdgeTie, frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
