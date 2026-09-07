@@ -144,6 +144,13 @@ private:
 		//                  it needs the value the decision would have used.
 		bool NativeOpaque = false;
 		uint8_t Priority = 0;
+
+		// S21b: a second sprite also covers this pixel opaquely. The line buffer
+		// keeps only the winner, so what is UNDER the top sprite is unknown — and
+		// blending its soft edge against the BG art would show the background
+		// through it instead of the sprite that is really behind (Dixie's hair in
+		// front of Diddy). Where this is set, the edge work stands down.
+		bool MultiOpaque = false;
 	};
 	HdSpritePixel _hdSpritePixels[256] = {};
 	HdSpritePixel _hdSpritePixelsCopy[256] = {};

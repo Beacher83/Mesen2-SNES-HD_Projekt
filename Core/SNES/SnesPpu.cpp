@@ -834,6 +834,9 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 			if(hdCapture) {
 				HdSpritePixel& sp = _hdSpritePixelsCopy[xPos + x];
 				const bool opaque = color != 0;
+				// S21b: remember that two sprites cover this pixel before the newer
+				// one overwrites the older — afterwards the information is gone.
+				const bool overlap = opaque && sp.NativeOpaque;
 				if(opaque || sp.ContentHash == 0) {
 					// SCREEN-SPACE offsets (x = column within the displayed slice,
 					// TileRowOffset = displayed row) — HdTileSampler applies the
@@ -847,6 +850,7 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 					sp.VMirror = _currentSprite.VerticalMirror;
 					sp.NativeOpaque = opaque;
 					sp.Priority = _currentSprite.Priority;
+					sp.MultiOpaque = overlap;
 				}
 			}
 		}
@@ -1115,6 +1119,11 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 		t.Priority = spritePrio;
 		t.VramWordAddr = sp.TileVramAddr;
 		pi.SpriteCount |= (1 << slot);
+		// S21b: bit 3 says "another sprite is opaque under this one" — the filter
+		// uses it to leave overlapping characters alone.
+		if(sp.MultiOpaque) {
+			pi.SpriteCount |= 0x08;
+		}
 	};
 
 	for(int x = _drawStartX; x <= _drawEndX; x++) {

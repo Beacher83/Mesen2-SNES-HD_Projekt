@@ -1202,11 +1202,24 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					// anti-aliased silhouette visible at all. Where the background has no
 					// HD art the old behaviour stands: the native colour is all there is.
 					SnesHdScanlineInfo& slSpr = hdScreen->ScanlineInfo[y];
+					// S21b: not when a second sprite is opaque under this one. The line
+					// buffer keeps only the winner, so the BG tile is NOT what is behind
+					// this pixel — the other character is. Blending against the BG there
+					// shows the background through the front sprite's soft edge, which is
+					// what made Dixie's hair look wrong with Diddy standing behind her.
 					if(!s_noSpriteEdges && hdTile->HasTransparentPixels && !hdTileBot
+						&& !(pixelInfo.SpriteCount & 0x08)
 						&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[0].Key.ContentHash) != nullptr) {
 						for(int layer = 0; layer < 4 && !hdTileBot; layer++) {
 							if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
-							if(!((slSpr.MainScreenLayers | slSpr.SubScreenLayers) & (1 << layer))) continue;
+							if(!(slSpr.MainScreenLayers & (1 << layer))) continue;
+							// MAIN screen only, and that gate is the whole underwater story:
+							// below the water line DKC2 switches Main to $00/$04 by HDMA and
+							// leaves BG1/BG2 on the SUB screen alone. Such a layer is not what
+							// lies behind the sprite on the main screen — blending Dixie's soft
+							// hair against its bright art is what put a light rim around her,
+							// and only under water, because nowhere else do the registers look
+							// like this. Issue T needed the same gate in July, one block up.
 							SnesHdPackTileInfo* below = CachedGetMatchingTile(hdData, hdScreen->Vram,
 								tileLookupCache, pixelInfo.BgTiles[layer].Key);
 							if(below) {
@@ -1501,6 +1514,29 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 									b = hb + (b * (255 - (int)mha)) / 255;
 								}
 							}
+
+							// --- S21: sprite fringe, mixed into the PRE-MATH main colour ---
+							// It sits at a pixel the BG won, so whatever the PPU does to
+							// that pixel has to happen to the fringe as well. Mixing it in
+							// afterwards let it escape the underwater colour math in
+							// Lockjaw's Locker: the scene darkened around Dixie while her
+							// fringe kept full brightness, which read as a bright rim along
+							// her hair — and only under water, where that math runs.
+							if(edgeSampler.valid) {
+								uint32_t ec = edgeSampler.Sample(dx, dy);
+								if(edgeRecolor.valid) {
+									ec = edgeRecolor.Apply(ec);
+								}
+								uint32_t ea = ec >> 24;
+								if(ea) {
+									// premultiplied, like every other blend here
+									int er = (ec >> 16) & 0xFF, eg = (ec >> 8) & 0xFF, eb = ec & 0xFF;
+									r = er + (r * (255 - (int)ea)) / 255;
+									g = eg + (g * (255 - (int)ea)) / 255;
+									b = eb + (b * (255 - (int)ea)) / 255;
+									st.SprEdgeBlend++;
+								}
+							}
 						}
 
 						// --- Color math: exact port of SnesPpu::ApplyColorMathToPixel ---
@@ -1544,29 +1580,6 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								r = std::min(255, r + oR) >> halfShift;
 								g = std::min(255, g + oG) >> halfShift;
 								b = std::min(255, b + oB) >> halfShift;
-							}
-						}
-
-						// --- S21: sprite fringe over the finished background ---
-						// Deliberately AFTER color math: this pixel's math flags belong
-						// to the BG that won it, and DKC2 never applies color math to
-						// OBJ (every recorded context has CMEnabled with OBJ=0), so
-						// running the sprite's own texel through the BG's math would
-						// tint it with an effect the sprite never gets. Brightness
-						// still applies below — that one is global.
-						if(edgeSampler.valid) {
-							uint32_t ec = edgeSampler.Sample(dx, dy);
-							if(edgeRecolor.valid) {
-								ec = edgeRecolor.Apply(ec);
-							}
-							uint32_t ea = ec >> 24;
-							if(ea) {
-								// HdTileData is premultiplied, same as every other blend here
-								int er = (ec >> 16) & 0xFF, eg = (ec >> 8) & 0xFF, eb = ec & 0xFF;
-								r = er + (r * (255 - (int)ea)) / 255;
-								g = eg + (g * (255 - (int)ea)) / 255;
-								b = eb + (b * (255 - (int)ea)) / 255;
-								st.SprEdgeBlend++;
 							}
 						}
 
