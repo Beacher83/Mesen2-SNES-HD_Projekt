@@ -18,7 +18,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S27"
+#define SNES_HD_BUILD_VERSION "S28"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -1903,6 +1903,16 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// from the parallel render threads (under s_diagMutex) and reset below.
 	static int diagPalLogCount = 0;      // R3: CGRAM-diff transform detail lines
 	static int diagSprCapLogCount = 0;   // S1: SPRTILE sample-line batches per context
+	// S28: sprite tiles ranked by the AREA they cover, not by scan order.
+	// SPRTILE, the existing sample, stops after 16 tiles and walks the screen from
+	// pixel 0 — i.e. from the top edge, where the HUD sits. It reported 74 % of
+	// Gangplank's sprite tiles as having no reference palette while the complete
+	// per-pixel counter said 0.2 %. A sample that disagrees with the full count by
+	// that much cannot answer "which art covers the character", so this one counts
+	// pixels per tile and reports the largest.
+	static std::unordered_map<uint64_t, uint32_t> diagSprAreaPx;
+	static std::unordered_map<uint64_t, uint8_t> diagSprAreaPal;
+	static bool diagSprAreaLogged = false;
 	static bool hdmaDumped = false;
 	static int diagContextCount = 0;     // total context changes seen
 
@@ -2049,6 +2059,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		diagS9SampleCount = 0;
 		diagPalLogCount = 0;
 		diagSprCapLogCount = 0;
+		diagSprAreaPx.clear();
+		diagSprAreaPal.clear();
+		diagSprAreaLogged = false;
 		diagLoggedHashes.clear();
 		hdmaDumped = false;
 		diagMsMax = 0;
@@ -2306,6 +2319,50 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	}
 
 	// =====================================================================
+	// S28: which sprite art actually covers the screen, and does it carry a
+	// reference palette? Every edge mechanism -- the fringe (S21), the bottom layer
+	// under a soft texel (S21), and the sub-screen ground (S26/S27) -- is gated on
+	// `GetSpriteRefPalette(...) != nullptr`. That gate is deliberate: runtime-captured
+	// art has background baked into its border texels and smears when extended. But
+	// it means a level whose art shipped without references gets no smoothing at all,
+	// and the per-pixel counters (sprHd vs sprNoRef) can say THAT while not saying
+	// WHICH tiles. This does: pixels per tile, largest first, with the reference and
+	// pack status of each. Accumulates over a context, logs once.
+	// =====================================================================
+	if(diagBgFrameCount >= 20 && !diagSprAreaLogged && !diagSprAreaPx.empty()) {
+		diagSprAreaLogged = true;
+		std::vector<std::pair<uint64_t, uint32_t>> ranked(diagSprAreaPx.begin(), diagSprAreaPx.end());
+		std::sort(ranked.begin(), ranked.end(),
+			[](const std::pair<uint64_t, uint32_t>& a, const std::pair<uint64_t, uint32_t>& b) {
+				return a.second > b.second;
+			});
+		uint64_t totalPx = 0, refPx = 0;
+		for(auto& e : ranked) {
+			totalPx += e.second;
+			if(_hdData->GetSpriteRefPalette(e.first)) refPx += e.second;
+		}
+		char hdr[256];
+		snprintf(hdr, sizeof(hdr),
+			"[SNES HD diag] SPRAREA gfx=%d tiles=%zu px=%llu withRef=%llu (%.1f%% of area)",
+			(int)_hdData->ActiveGfxset, ranked.size(),
+			(unsigned long long)totalPx, (unsigned long long)refPx,
+			totalPx ? 100.0 * (double)refPx / (double)totalPx : 0.0);
+		DiagLog(hdr);
+		for(size_t i = 0; i < ranked.size() && i < 16; i++) {
+			uint64_t h = ranked[i].first;
+			uint8_t pal = diagSprAreaPal.count(h) ? diagSprAreaPal[h] : 0xFF;
+			SnesHdTileKey k; k.ContentHash = h; k.PaletteIndex = pal; k.LayerIndex = 4;
+			bool hasArt = _hdData->GetMatchingTile(k) != nullptr;
+			char line[256];
+			snprintf(line, sizeof(line),
+				"[SNES HD diag] SPRAREA   #%02zu hash=%016llX px=%u pal=%u art=%d ref=%d",
+				i + 1, (unsigned long long)h, ranked[i].second, pal,
+				hasArt ? 1 : 0, _hdData->GetSpriteRefPalette(h) ? 1 : 0);
+			DiagLog(line);
+		}
+	}
+
+	// =====================================================================
 	// S5a: sprite capture recording. Every distinct (contentHash, palette)
 	// pair seen on screen is appended to snes_hd_spritecap.txt together
 	// with the tile's 32 VRAM bytes and the OBJ palette's 16 CGRAM colors.
@@ -2317,6 +2374,21 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// recorded when the tile bytes still hash to the captured value — a
 	// tile replaced by OBJ streaming mid-frame is recorded on a later one.
 	// =====================================================================
+	if(!diagSprAreaLogged) {
+		// Only what the viewer actually shows: a sprite that won the MAIN screen,
+		// keyed by the tile recorded for it. Cheap -- one map bump per sprite pixel,
+		// and it stops as soon as the context has been reported.
+		constexpr uint32_t sprAreaPixels = (uint32_t)SnesHdScreenInfo::ScreenPixelCount;
+		for(uint32_t i = 0; i < sprAreaPixels; i++) {
+			const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[i];
+			if(!(pi.MainScreenFlags & 0x40) || !(pi.SpriteCount & 0x01)) continue;
+			uint64_t h = pi.Sprites[0].Key.ContentHash;
+			if(!h) continue;
+			diagSprAreaPx[h]++;
+			diagSprAreaPal[h] = pi.Sprites[0].Key.PaletteIndex;
+		}
+	}
+
 	if(hdScreen->Vram) {
 		static std::unordered_set<uint64_t> s_spriteCapSeen;
 		static FILE* s_spriteCapFile = nullptr;
