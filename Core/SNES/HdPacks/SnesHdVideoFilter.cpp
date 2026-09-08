@@ -18,7 +18,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S28"
+#define SNES_HD_BUILD_VERSION "S29"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -249,6 +249,7 @@ static void WriteSessionBanner(FILE* f, const char* what)
 		"SNES_HD_NO_SPRITE_RECOLOR",
 		"SNES_HD_CGRAMCAP",
 		"SNES_HD_OAMCAP",
+		"SNES_HD_DIAG_FRAMES",
 	};
 	char active[512];
 	active[0] = 0;
@@ -707,6 +708,16 @@ static const bool s_noSubUnder = getenv("SNES_HD_NO_SUB_UNDER") != nullptr;
 // again. That is the `!SubScreenHasSprite` limit S25 was deliberately kept inside:
 //     set SNES_HD_NO_SUB_SPRITE_UNDER=1
 static const bool s_noSubSprUnder = getenv("SNES_HD_NO_SUB_SPRITE_UNDER") != nullptr;
+// S29: how many GAMEPLAY frames per context are logged. 60 -- one second -- was
+// never a measurement of a level, it was a measurement of walking through the
+// door: the fade is still running, the level-name banner is on screen and the
+// player has not moved. That is how a bonus screen full of KONG letters came to
+// be analysed as Rambi Rumble. Raise it for a real look:
+//     set SNES_HD_DIAG_FRAMES=600
+// The area recorder below uses the same number to skip the first quarter and
+// report from the middle of the window, i.e. from actual play.
+static const int s_diagFrames = getenv("SNES_HD_DIAG_FRAMES")
+	? std::max(20, atoi(getenv("SNES_HD_DIAG_FRAMES"))) : 60;
 // S25w WAS HERE AND IS GONE — measured out, 08 Sep, five runs / 3634 frames.
 // The idea: even on a scanline that carries OBJ on the main screen, a sprite can LOSE
 // that screen to a background and reach the picture only as the colour-math operand,
@@ -750,6 +761,7 @@ struct HdFilterFrameStats
 	uint32_t SprEdgeTie = 0;    // S23: fringe present over a sprite, priority rejects it
 	uint32_t SubSprBot = 0;     // S26: sub-screen sprite given a BG ground to blend against
 	uint32_t SubSprUnder = 0;   // S27: sub-screen sprite blended against the SPRITE behind it
+	uint32_t SubSprNoBot = 0;   // S29: gate passed, but no ground found (no sub-screen BG with HD art)
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -779,6 +791,7 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SprEdgeTie += src.SprEdgeTie;
 	dst.SubSprBot += src.SubSprBot;
 	dst.SubSprUnder += src.SubSprUnder;
+	dst.SubSprNoBot += src.SubSprNoBot;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -1253,6 +1266,11 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 											st.SubSprBot++;
 										}
 									}
+									// S29: the gate let this pixel through and the search still
+									// came back empty. Rambi Rumble covers only ~52% of its HD
+									// sub-sprite pixels against Mainbrace's ~89%, and this says
+									// whether the missing half fails here or never gets this far.
+									if(!subTileBot) st.SubSprNoBot++;
 								}
 							}
 						} else {
@@ -2151,6 +2169,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSprEdgeTie = total.SprEdgeTie;
 	uint32_t frameSubSprBot = total.SubSprBot;
 	uint32_t frameSubSprUnder = total.SubSprUnder;
+	uint32_t frameSubSprNoBot = total.SubSprNoBot;
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
@@ -2221,7 +2240,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// DIAGNOSTIC: Per-frame summary
 	// =====================================================================
 	bool logThisFrame = frameTotalPixels > 0 &&
-		(diagFrameCount < 10 || (frameBgPixels > 0 && diagBgFrameCount < 60));
+		(diagFrameCount < 10 || (frameBgPixels > 0 && diagBgFrameCount < s_diagFrames));
 	if(logThisFrame) {
 		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
 		char buf[1024];
@@ -2229,7 +2248,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
 			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
-			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u subBot=%u subSprUnder=%u"
+			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u subBot=%u subSprUnder=%u subNoBot=%u"
 			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
@@ -2243,7 +2262,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameSprRecolor, frameSprRecolorNoRef,
 			frameSprEdge, frameSprEdgeBlend, frameSprEdgeUnder,
 			frameSprEdgeTie, frameSubSprBot,
-			frameSubSprUnder, frameMaskZero, frameHdmaSplit,
+			frameSubSprUnder, frameSubSprNoBot, frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
@@ -2329,7 +2348,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// WHICH tiles. This does: pixels per tile, largest first, with the reference and
 	// pack status of each. Accumulates over a context, logs once.
 	// =====================================================================
-	if(diagBgFrameCount >= 20 && !diagSprAreaLogged && !diagSprAreaPx.empty()) {
+	if(diagBgFrameCount >= (s_diagFrames * 3 / 4) && !diagSprAreaLogged && !diagSprAreaPx.empty()) {
 		diagSprAreaLogged = true;
 		std::vector<std::pair<uint64_t, uint32_t>> ranked(diagSprAreaPx.begin(), diagSprAreaPx.end());
 		std::sort(ranked.begin(), ranked.end(),
@@ -2378,18 +2397,24 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// recorded when the tile bytes still hash to the captured value — a
 	// tile replaced by OBJ streaming mid-frame is recorded on a later one.
 	// =====================================================================
-	if(!diagSprAreaLogged) {
-		// Only what the viewer actually shows: a sprite that won the MAIN screen,
-		// keyed by the tile recorded for it. Cheap -- one map bump per sprite pixel,
-		// and it stops as soon as the context has been reported.
+	if(!diagSprAreaLogged && diagBgFrameCount >= (s_diagFrames / 4)) {
+		// S29: count the SUB-screen sprite too. The first version only looked at
+		// sprites that won the MAIN screen -- and in an overlay level no sprite ever
+		// does (`sprWon=0` in every Rambi and Mainbrace frame), so the recorder
+		// collected nothing and never logged, in precisely the levels it was built
+		// for. Starts a quarter into the window so the entry banner is not what gets
+		// measured.
 		constexpr uint32_t sprAreaPixels = (uint32_t)SnesHdScreenInfo::ScreenPixelCount;
 		for(uint32_t i = 0; i < sprAreaPixels; i++) {
 			const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[i];
-			if(!(pi.MainScreenFlags & 0x40) || !(pi.SpriteCount & 0x01)) continue;
-			uint64_t h = pi.Sprites[0].Key.ContentHash;
+			int slot = -1;
+			if((pi.MainScreenFlags & 0x40) && (pi.SpriteCount & 0x01)) slot = 0;
+			else if(pi.SubScreenHasSprite && (pi.SpriteCount & 0x02)) slot = 1;
+			if(slot < 0) continue;
+			uint64_t h = pi.Sprites[slot].Key.ContentHash;
 			if(!h) continue;
 			diagSprAreaPx[h]++;
-			diagSprAreaPal[h] = pi.Sprites[0].Key.PaletteIndex;
+			diagSprAreaPal[h] = pi.Sprites[slot].Key.PaletteIndex;
 		}
 	}
 
