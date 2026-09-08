@@ -18,7 +18,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S24"
+#define SNES_HD_BUILD_VERSION "S27"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -203,6 +203,76 @@ static FILE* OpenRecorder(const char* fileName)
 	return f;
 }
 
+// S25: one line that says WHICH build and WHICH A/B switches produced the block of
+// log below it. Needed the moment more than one variant is tested in a sitting: the
+// diagnostics file used to be truncated on every start, so four comparison runs left
+// exactly one log — and even appended, four blocks are indistinguishable unless the
+// switches are written down. The switch names are spelled out here rather than read
+// from the statics further down, because those are declared after this point.
+// S27b: ALWAYS append, and bound the size by rotating instead of truncating.
+//
+// The first attempt made "fresh on every start" the default and put appending behind
+// a switch that the TEST_*.bat files set. It destroyed a test series within the hour:
+// a run started any other way — and a plain reference run is exactly that — wiped the
+// two comparison runs before it. A default that silently deletes the previous run's
+// evidence is the wrong default, whatever the switch says.
+//
+// So: never truncate. Once the file passes the cap it is moved aside to <name>_old
+// and a new one begins, which bounds the whole thing at twice the cap while the
+// current series is never the thing that gets thrown away. These two logs are small
+// (diag ~350 KB per run, context ~2 KB); they were never the disk problem — the OAM
+// recorder was, and that one is now off by default.
+static constexpr long kLogRotateBytes = 16L * 1024 * 1024;
+
+static void RotateLogIfLarge(const char* path)
+{
+	FILE* f = fopen(path, "rb");
+	if(!f) return;
+	fseek(f, 0, SEEK_END);
+	long size = ftell(f);
+	fclose(f);
+	if(size < kLogRotateBytes) return;
+
+	char oldPath[600];
+	snprintf(oldPath, sizeof(oldPath), "%s.old", path);
+	remove(oldPath);            // rename() will not overwrite on Windows
+	rename(path, oldPath);
+}
+
+static void WriteSessionBanner(FILE* f, const char* what)
+{
+	static const char* const switchNames[] = {
+		"SNES_HD_NO_SPRITE_EDGES",
+		"SNES_HD_NO_SPRITE_UNDER",
+		"SNES_HD_NO_SUB_FRINGE",
+		"SNES_HD_NO_SUB_UNDER",
+		"SNES_HD_NO_SUB_SPRITE_UNDER",
+		"SNES_HD_NO_SPRITE_RECOLOR",
+		"SNES_HD_CGRAMCAP",
+		"SNES_HD_OAMCAP",
+	};
+	char active[512];
+	active[0] = 0;
+	for(const char* name : switchNames) {
+		if(getenv(name)) {
+			if(active[0]) strncat(active, " ", sizeof(active) - strlen(active) - 1);
+			strncat(active, name, sizeof(active) - strlen(active) - 1);
+		}
+	}
+	time_t now = time(nullptr);
+	struct tm lt {};
+#ifdef _WIN32
+	localtime_s(&lt, &now);
+#else
+	localtime_r(&now, &lt);
+#endif
+	fprintf(f, "\n=== SESSION %04d-%02d-%02d %02d:%02d:%02d build=" SNES_HD_BUILD_VERSION
+		" | %s | A/B: %s ===\n",
+		lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec,
+		what, active[0] ? active : "(keine - Referenzlauf)");
+	fflush(f);
+}
+
 static void DiagLog(const char* msg)
 {
 	MessageManager::Log(msg);
@@ -221,11 +291,12 @@ static void DiagLog(const char* msg)
 #else
 			snprintf(path, sizeof(path), "%s/Downloads/snes_hd_diag.txt", home);
 #endif
-			diagFile = fopen(path, "w");
+			// S25/S27b: append, rotating at the cap. Before S25 this was truncated on
+			// every start, which made a series of A/B runs impossible.
+			RotateLogIfLarge(path);
+			diagFile = fopen(path, "a");
 			if(diagFile) {
-				fprintf(diagFile, "=== SNES HD Pack Diagnostics (build " SNES_HD_BUILD_VERSION ") ===\n");
-				fprintf(diagFile, "Log file: %s\n\n", path);
-				fflush(diagFile);
+				WriteSessionBanner(diagFile, "Diagnostics");
 			}
 		}
 	}
@@ -257,11 +328,11 @@ static void ContextLog(const char* msg)
 #else
 			snprintf(path, sizeof(path), "%s/Downloads/snes_hd_context.txt", home);
 #endif
-			ctxFile = fopen(path, "w");
+			// S25/S27b: same handling as the diagnostics file above.
+			RotateLogIfLarge(path);
+			ctxFile = fopen(path, "a");
 			if(ctxFile) {
-				fprintf(ctxFile, "=== SNES HD Context Log (build " SNES_HD_BUILD_VERSION ") ===\n");
-				fprintf(ctxFile, "One entry per level/context switch. PPU register snapshot from scanline 120.\n\n");
-				fflush(ctxFile);
+				WriteSessionBanner(ctxFile, "Context (register snapshot from scanline 120)");
 			}
 		}
 	}
@@ -625,6 +696,35 @@ static const bool s_noSpriteEdges = getenv("SNES_HD_NO_SPRITE_EDGES") != nullptr
 // have to be told apart in a running build rather than argued about:
 //     set SNES_HD_NO_SPRITE_UNDER=1
 static const bool s_noSpriteUnder = getenv("SNES_HD_NO_SPRITE_UNDER") != nullptr;
+// S25 A/B: drop the sprite fringe in the SUB-OPERAND path, so overlay levels
+// (Mainbrace, Rambi, Lockjaw under water) render exactly as S24 did — hard native
+// silhouette, no fringe at all, because slot 2 was never captured there:
+//     set SNES_HD_NO_SUB_FRINGE=1
+static const bool s_noSubFringe = getenv("SNES_HD_NO_SUB_FRINGE") != nullptr;
+// S26 A/B: do not give a sub-screen sprite a ground to blend against, i.e. keep
+// S24's behaviour where a semi-transparent texel mixes with the sprite's own SD
+// colour. Separate switch because S25 and S26 ship together and a single run has
+// to be able to tell them apart:
+//     set SNES_HD_NO_SUB_UNDER=1
+static const bool s_noSubUnder = getenv("SNES_HD_NO_SUB_UNDER") != nullptr;
+// S27 A/B: in the sub-operand path, do not use a second SPRITE as the ground — fall
+// straight to the BG search, i.e. S26 behaviour. The user saw the remaining case on
+// 08 Sep: under water, with the Kongs one behind the other, the outline goes hard
+// again. That is the `!SubScreenHasSprite` limit S25 was deliberately kept inside:
+//     set SNES_HD_NO_SUB_SPRITE_UNDER=1
+static const bool s_noSubSprUnder = getenv("SNES_HD_NO_SUB_SPRITE_UNDER") != nullptr;
+// S25w WAS HERE AND IS GONE — measured out, 08 Sep, five runs / 3634 frames.
+// The idea: even on a scanline that carries OBJ on the main screen, a sprite can LOSE
+// that screen to a background and reach the picture only as the colour-math operand,
+// so its fringe would be drawn by neither branch. It was shipped as a counter
+// (`sprEdgeWide`) plus an opt-in switch rather than as a change, and the counter came
+// back **0 in all five runs, including the one that enabled the switch**.
+// Why the estimate was wrong: it was extrapolated from `sprHdSub` (39.160 px in
+// Gangplank, $17/$10), but those pixels lie INSIDE the silhouette. Just outside it
+// there is no native sprite, and with $212D=$10 the sub screen carries OBJ and nothing
+// else — so a fringe pixel finds an EMPTY sub screen and `SubScreenEmpty` rejects it
+// before any of this matters. A counter answered in one run what the reasoning got
+// wrong; same as `sprFrOver` in S23.
 
 struct HdFilterFrameStats
 {
@@ -654,6 +754,10 @@ struct HdFilterFrameStats
 	uint32_t SprEdgeBlend = 0;  // S21: of those, sub-pixels where the fringe was actually drawn
 	uint32_t SprEdgeUnder = 0;  // S22: pixels blended against the sprite behind, not the BG
 	uint32_t SprEdgeTie = 0;    // S23: fringe present over a sprite, priority rejects it
+	uint32_t SprEdgeSub = 0;    // S25: fringe pixels routed into the color-math operand (overlay levels)
+	uint32_t SprEdgeSubBlend = 0; // S25: of those, sub-pixels where the fringe was actually drawn
+	uint32_t SubSprBot = 0;     // S26: sub-screen sprite given a BG ground to blend against
+	uint32_t SubSprUnder = 0;   // S27: sub-screen sprite blended against the SPRITE behind it
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -681,6 +785,10 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SprEdgeBlend += src.SprEdgeBlend;
 	dst.SprEdgeUnder += src.SprEdgeUnder;
 	dst.SprEdgeTie += src.SprEdgeTie;
+	dst.SprEdgeSub += src.SprEdgeSub;
+	dst.SprEdgeSubBlend += src.SprEdgeSubBlend;
+	dst.SubSprBot += src.SubSprBot;
+	dst.SubSprUnder += src.SubSprUnder;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -836,6 +944,16 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				st.HdmaSplit++;
 		}
 
+		// S25: which screen carries the sprites on THIS scanline. In overlay levels
+		// DKC2 takes OBJ off the main screen ($212C) and adds the characters back
+		// through colour math from the sub screen ($212D) — a fringe then has to be
+		// mixed into the OPERAND, not into the main colour, or it escapes the very
+		// math that puts the character on screen. Read off the registers, so no
+		// level detection is involved. Constant across the row.
+		const SnesHdScanlineInfo& slRow = hdScreen->ScanlineInfo[y];
+		const bool objOnMain = (slRow.MainScreenLayers & 0x10) != 0;
+		const bool objOnSub = (slRow.SubScreenLayers & 0x10) != 0;
+
 		for(uint32_t x = overscan.Left; x < baseWidth - overscan.Right; x++) {
 			uint32_t srcIndex = y * SnesHdScreenInfo::ScreenWidth + x;
 			SnesHdPpuPixelInfo& pixelInfo = hdScreen->ScreenTiles[srcIndex];
@@ -870,6 +988,8 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			SnesHdPpuTileInfo* hdTileInfoBot = nullptr;
 			SnesHdPackTileInfo* subTile = nullptr;     // P4.0: sub-screen winner HD tile (CM operand)
 			SnesHdPpuTileInfo* subTileInfo = nullptr;
+			SnesHdPackTileInfo* subTileBot = nullptr;  // S26: ground under a sub-screen SPRITE operand
+			SnesHdPpuTileInfo* subTileInfoBot = nullptr;
 			bool cmActive = false;  // hoisted so the rendering section (below) can see it too
 			uint8_t winLayer = 0xFF;  // hoisted so the rendering section (below) can see it too
 			bool subSprHdFired = false;  // S9: the S7 sub-sprite HD-operand path rendered this pixel
@@ -1108,6 +1228,53 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							hdTileBot = nullptr; hdTileInfoBot = nullptr;
 							st.SprSubHd++;
 							subSprHdFired = true;
+
+							// S26: the same wall S21 tore down in the main path, still
+							// standing here. A semi-transparent texel of this sprite is
+							// blended below against nsR/nsG/nsB — the native SUB-screen
+							// colour — and at a sprite pixel that IS the sprite's own SD
+							// colour. Mixing art with itself cannot show a soft edge, so
+							// in overlay levels the character kept a hard silhouette even
+							// where the art carries a gradient. The ground is whatever BG
+							// lies behind it ON THE SUB SCREEN: same reasoning as S21b's
+							// MainScreenLayers gate, mirrored to $212D, because here it is
+							// the sub screen that composites the character.
+							// Reference-palette gate as everywhere: runtime-captured art
+							// carries background in its border texels (S21).
+							if(!s_noSpriteEdges && !s_noSubUnder && subSprTile->HasTransparentPixels
+								&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[1].Key.ContentHash) != nullptr) {
+								// S27: when a second sprite lies under this one, THAT is the
+								// ground, not the background — the Kongs one behind the other
+								// under water, which the user reported on 08 Sep as the one
+								// place the outline still goes hard. `hdCaptureSpriteFrom`
+								// fills slot 3 for the SUB slot as well, so the displaced
+								// sprite is already on hand here; nothing new has to be
+								// recorded. Exactly what S22 does in the main path.
+								// No BG fallback when slot 3 exists, for S22's reason: the
+								// background is the known-wrong backdrop behind a character,
+								// and a hard edge beats showing terrain through a Kong.
+								if((pixelInfo.SpriteCount & 0x08) && !s_noSpriteUnder && !s_noSubSprUnder) {
+									SnesHdPackTileInfo* under = CachedGetMatchingTile(hdData, hdScreen->Vram,
+										tileLookupCache, pixelInfo.Sprites[3].Key);
+									if(under) {
+										subTileBot = under;
+										subTileInfoBot = &pixelInfo.Sprites[3];
+										st.SubSprUnder++;
+									}
+								} else {
+									for(int layer = 0; layer < 4 && !subTileBot; layer++) {
+										if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
+										if(!(sl.SubScreenLayers & (1 << layer))) continue;
+										SnesHdPackTileInfo* below = CachedGetMatchingTile(hdData, hdScreen->Vram,
+											tileLookupCache, pixelInfo.BgTiles[layer].Key);
+										if(below) {
+											subTileBot = below;
+											subTileInfoBot = &pixelInfo.BgTiles[layer];
+											st.SubSprBot++;
+										}
+									}
+								}
+							}
 						} else {
 						// P4.1f (Issue R fix): no HD sprite art — force the native path.
 						// Rendering the main winner's HD tile here would paint semi-
@@ -1327,6 +1494,10 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			// what the sprite would have had to beat.
 			SnesHdPackTileInfo* edgeTile = nullptr;
 			const SnesHdPpuTileInfo* edgeTileInfo = nullptr;
+			// S25: where the fringe has to be mixed in. false = into the pre-math main
+			// colour (S21, normal levels), true = into the colour-math operand, which
+			// is the only place the character exists in an overlay level.
+			bool edgeIsSubOperand = false;
 			// Only art whose baked palette we know takes part. That is not a colour
 			// argument but an origin one: runtime-captured tiles (world map objects —
 			// wasps, flag, torches) are grabbed off the live screen, so background
@@ -1345,7 +1516,11 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			// on Kruncha's arm comes from slot 3 (S22) instead: turning THAT off brings
 			// the hard edge back, turning this off does not.
 			// Telling one from the other needed a switch, not an argument.
-			if(!s_noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && !spriteWon
+			// S25: `objOnMain` is new and keeps this branch exactly as it was. Until now
+			// the PPU only ever recorded slot 2 while sprites were on the main screen, so
+			// the condition was implied; now that overlay levels record it too, saying it
+			// out loud is what stops a sub-screen fringe from being painted into the fog.
+			if(!s_noSpriteEdges && objOnMain && (pixelInfo.SpriteCount & 0x04) && !spriteWon
 				&& pixelInfo.Sprites[2].Key.ContentHash != 0
 				&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[2].Key.ContentHash) != nullptr
 				&& pixelInfo.Sprites[2].Priority > (pixelInfo.MainScreenFlags & 0x0F)) {
@@ -1357,13 +1532,70 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				} else {
 					edgeTile = nullptr;
 				}
-			} else if(!s_noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && spriteWon
+			} else if(!s_noSpriteEdges && objOnMain && (pixelInfo.SpriteCount & 0x04) && spriteWon
 				&& pixelInfo.Sprites[2].Key.ContentHash != 0
 				&& pixelInfo.Sprites[2].Priority <= (pixelInfo.MainScreenFlags & 0x0F)) {
 				// S23 diagnostic: a fringe was recorded over a winning sprite but the
 				// priority test rejected it. A large number here means equal priorities
 				// are common and the tie-break has to come from OAM order after all.
 				st.SprEdgeTie++;
+			} else if(!s_noSpriteEdges && !s_noSubFringe && !objOnMain && objOnSub
+				&& (pixelInfo.SpriteCount & 0x04) && !spriteWon
+				&& pixelInfo.Sprites[2].Key.ContentHash != 0
+				&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[2].Key.ContentHash) != nullptr
+				&& (pixelInfo.MainScreenFlags & 0x80) && !pixelInfo.SubScreenEmpty
+				&& !pixelInfo.SubScreenHasSprite && slRow.ColorMathAddSubscreen) {
+				// =====================================================================
+				// S25: the fringe in the SUB-OPERAND path (Mainbrace, Rambi, Lockjaw
+				// under water). Here the character never touches the main screen — the
+				// fog owns it — and reaches the picture only as the colour-math operand.
+				// So the fringe belongs in the operand as well, over whatever the sub
+				// screen holds at this pixel. Mixing it into the main colour instead
+				// would add the character to the fog rather than through it, which is
+				// the same class of mistake S21 corrected the other way round.
+				//
+				// The priority test is the operand's counterpart of the main-path one:
+				// what the sprite would have had to beat is the SUB-screen winner, and
+				// SubScreenWinnerPlus1 names that layer. BgTiles[].Priority carries the
+				// composited priority (RenderTilemap writes the same value it compares
+				// against), so the two are directly comparable. Backdrop counts as 0.
+				//
+				// KNOWN LIMIT, deliberate: an EMPTY sub screen is skipped. The PPU then
+				// switches the operand to FixedColor and turns halving off for the whole
+				// native pixel, and a fringe covers only part of it — there is no honest
+				// way to split that here. Rare in practice: it means "no background and
+				// no character on the sub screen".
+				//
+				// SECOND, AND THE ONE WITH A SCAR: `!SubScreenHasSprite`. Slot 2 is also
+				// recorded where a sprite DOES cover the pixel (the S23 branch, for one
+				// character's fringe reaching over another). Without this gate that
+				// fringe would be painted over the character that owns the operand here,
+				// and swp would be 0 so the priority test would wave it through. That is
+				// exactly how S23 put Dixie's hair through the crate she carries. This
+				// branch stays where the sub-screen winner is a BACKGROUND — the honest
+				// analogue of the main path, where the same restriction has held since
+				// S21. Sprite-over-sprite in overlay levels is a separate question and
+				// needs its own evidence, not a guess folded into this one.
+				// =====================================================================
+				uint8_t swp = pixelInfo.SubScreenWinnerPlus1;
+				uint8_t subWinPrio = (swp >= 1 && swp <= 4) ? pixelInfo.BgTiles[swp - 1].Priority : 0;
+				if(pixelInfo.Sprites[2].Priority > subWinPrio) {
+					edgeTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache,
+						pixelInfo.Sprites[2].Key);
+					if(edgeTile && !edgeTile->HdTileData.empty()) {
+						edgeTileInfo = &pixelInfo.Sprites[2];
+						edgeIsSubOperand = true;
+						// Same move as S10: over a BG hole the block that normally sets
+						// this never ran, and without it the colour math — the only thing
+						// that draws the character at all — would be skipped for this
+						// pixel. The gate above already established the PPU's own
+						// AllowColorMath bit, so this only mirrors it.
+						cmActive = true;
+						st.SprEdgeSub++;
+					} else {
+						edgeTile = nullptr;
+					}
+				}
 			}
 			bool hasEdgeHd = edgeTile != nullptr;
 
@@ -1393,17 +1625,20 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				// P4.1c perf: everything that is constant across the hdScale×hdScale
 				// sub-pixel block is decided once per native pixel. Semantics are an
 				// exact match of the previous per-sub-pixel ApplyColorMathToPixel port.
-				HdTileSampler botSampler, mainSampler, subSampler, edgeSampler;
+				HdTileSampler botSampler, mainSampler, subSampler, edgeSampler, subBotSampler;
 				botSampler.Init(hdTileBot, hdTileInfoBot, hdScale);
 				if(hasMainHd) mainSampler.Init(hdTile, hdTileInfo, hdScale);
 				if(hasSubHd) subSampler.Init(subTile, subTileInfo, hdScale);
 				if(hasEdgeHd) edgeSampler.Init(edgeTile, edgeTileInfo, hdScale);
+				// S26: only ever set for a sub-screen SPRITE operand, so this stays
+				// invalid — and costs nothing — for every ordinary BG operand pixel.
+				subBotSampler.Init(subTileBot, subTileInfoBot, hdScale);
 
 				// R3: per-tile palette-row transform (live CGRAM vs reference).
 				// Resolved once per native pixel; nullptr = identity.
 				// R3.1: pointer to the row's 3×256 LUT — one load per channel per sample.
 				typedef const uint8_t (*PalLutRow)[256];
-				PalLutRow botLut = nullptr, mainLut = nullptr, subLut = nullptr;
+				PalLutRow botLut = nullptr, mainLut = nullptr, subLut = nullptr, subBotLut = nullptr;
 				if(anyPalTransform) {
 					// S22: the bottom tile can now be a SPRITE (slot 3). Same OBJ-palette
 					// exemption as main/sub below — the R3 LUT covers BG CGRAM rows 0-7
@@ -1423,6 +1658,12 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					if(subSampler.valid && subTileInfo->Key.LayerIndex != 4
 						&& palRowActive[subTileInfo->Key.PaletteIndex & 7]) {
 						subLut = palLut[subTileInfo->Key.PaletteIndex & 7];
+					}
+					// S26: the ground under a sub-screen sprite is a BG tile, so unlike
+					// the sprite above it this one DOES belong under the R3 row LUT.
+					if(subBotSampler.valid && subTileInfoBot->Key.LayerIndex != 4
+						&& palRowActive[subTileInfoBot->Key.PaletteIndex & 7]) {
+						subBotLut = palLut[subTileInfoBot->Key.PaletteIndex & 7];
 					}
 				}
 
@@ -1465,6 +1706,16 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				if(!s_noRecolor && botSampler.valid && hdTileInfoBot->Key.LayerIndex == 4) {
 					botRecolor.Init(hdData->GetSpriteRefPalette(hdTileInfoBot->Key.ContentHash),
 						hdScreen->Cgram + 128 + (hdTileInfoBot->Key.PaletteIndex & 7) * 16);
+				}
+				// S27: the operand's ground can now be a sprite (slot 3) — same pair of
+				// traps S22 walked into in the main path: the R3 row LUT above is already
+				// guarded on LayerIndex != 4, and a sprite ground needs the recolor
+				// instead, or the character behind keeps its baked colours while the one
+				// in front follows the level's live OBJ palette.
+				HdSpriteRecolor subBotRecolor;
+				if(!s_noRecolor && subBotSampler.valid && subTileInfoBot->Key.LayerIndex == 4) {
+					subBotRecolor.Init(hdData->GetSpriteRefPalette(subTileInfoBot->Key.ContentHash),
+						hdScreen->Cgram + 128 + (subTileInfoBot->Key.PaletteIndex & 7) * 16);
 				}
 				HdSpriteRecolor edgeRecolor;
 				if(!s_noRecolor && edgeSampler.valid) {
@@ -1576,7 +1827,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							// Lockjaw's Locker: the scene darkened around Dixie while her
 							// fringe kept full brightness, which read as a bright rim along
 							// her hair — and only under water, where that math runs.
-							if(edgeSampler.valid) {
+							if(edgeSampler.valid && !edgeIsSubOperand) {
 								uint32_t ec = edgeSampler.Sample(dx, dy);
 								if(edgeRecolor.valid) {
 									ec = edgeRecolor.Apply(ec);
@@ -1601,19 +1852,44 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								oR = fxR; oG = fxG; oB = fxB;
 							} else {
 								oR = nsR; oG = nsG; oB = nsB;
+								uint32_t c = 0;
+								uint32_t ha = 0;
 								if(subSampler.valid) {
-									uint32_t c = subSampler.Sample(dx, dy);
+									c = subSampler.Sample(dx, dy);
 									if(subRecolor.valid) {
 										c = subRecolor.Apply(c);
 									}
-									uint32_t ha = c >> 24;
-									if(ha == 255) {
-										// R6.1: opaque fast path (blend reduces to o=h)
-										oR = (c >> 16) & 0xFF; oG = (c >> 8) & 0xFF; oB = c & 0xFF;
-										if(subLut) {
-											oR = subLut[0][oR]; oG = subLut[1][oG]; oB = subLut[2][oB];
+									ha = c >> 24;
+								}
+								if(ha == 255) {
+									// R6.1: opaque fast path (blend reduces to o=h)
+									oR = (c >> 16) & 0xFF; oG = (c >> 8) & 0xFF; oB = c & 0xFF;
+									if(subLut) {
+										oR = subLut[0][oR]; oG = subLut[1][oG]; oB = subLut[2][oB];
+									}
+								} else {
+									// S26: the operand gets a bottom layer, exactly as the main
+									// pixel has had one since S21 — this is the ground a soft
+									// sprite edge is supposed to be seen against. Invalid for
+									// every case but a sub-screen sprite, so ordinary operand
+									// pixels take the same path as before.
+									if(subBotSampler.valid) {
+										uint32_t bc = subBotSampler.Sample(dx, dy);
+										if(subBotRecolor.valid) {
+											bc = subBotRecolor.Apply(bc);
 										}
-									} else if(ha > 0) {
+										uint32_t ba = bc >> 24;
+										if(ba) {
+											int br = (bc >> 16) & 0xFF, bgc = (bc >> 8) & 0xFF, bb = bc & 0xFF;
+											if(subBotLut) {
+												br = subBotLut[0][br]; bgc = subBotLut[1][bgc]; bb = subBotLut[2][bb];
+											}
+											oR = br + (oR * (255 - (int)ba)) / 255;
+											oG = bgc + (oG * (255 - (int)ba)) / 255;
+											oB = bb + (oB * (255 - (int)ba)) / 255;
+										}
+									}
+									if(ha > 0) {
 										int hr = (c >> 16) & 0xFF, hg = (c >> 8) & 0xFF, hb = c & 0xFF;
 										if(subLut) {
 											hr = subLut[0][hr]; hg = subLut[1][hg]; hb = subLut[2][hb];
@@ -1621,6 +1897,26 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 										oR = hr + (oR * (255 - (int)ha)) / 255;
 										oG = hg + (oG * (255 - (int)ha)) / 255;
 										oB = hb + (oB * (255 - (int)ha)) / 255;
+									}
+								}
+
+								// --- S25: sprite fringe, mixed into the OPERAND ---
+								// Same rule as S21 in the main path, applied where the
+								// character actually lives: it goes in BEFORE the arithmetic
+								// below, so the fringe is darkened, halved and clipped by
+								// exactly the same math as the character it belongs to.
+								if(edgeSampler.valid && edgeIsSubOperand) {
+									uint32_t ec = edgeSampler.Sample(dx, dy);
+									if(edgeRecolor.valid) {
+										ec = edgeRecolor.Apply(ec);
+									}
+									uint32_t ea = ec >> 24;
+									if(ea) {
+										int er = (ec >> 16) & 0xFF, eg = (ec >> 8) & 0xFF, eb = ec & 0xFF;
+										oR = er + (oR * (255 - (int)ea)) / 255;
+										oG = eg + (oG * (255 - (int)ea)) / 255;
+										oB = eb + (oB * (255 - (int)ea)) / 255;
+										st.SprEdgeSubBlend++;
 									}
 								}
 							}
@@ -1930,6 +2226,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSprEdgeBlend = total.SprEdgeBlend;
 	uint32_t frameSprEdgeUnder = total.SprEdgeUnder;
 	uint32_t frameSprEdgeTie = total.SprEdgeTie;
+	uint32_t frameSprEdgeSub = total.SprEdgeSub;
+	uint32_t frameSprEdgeSubBlend = total.SprEdgeSubBlend;
+	uint32_t frameSubSprBot = total.SubSprBot;
+	uint32_t frameSubSprUnder = total.SubSprUnder;
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
@@ -2008,7 +2308,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
 			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
-			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
+			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u sprEdgeSub=%u/%u subBot=%u subSprUnder=%u"
+			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
@@ -2020,7 +2321,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameSprSubHd,
 			frameSprRecolor, frameSprRecolorNoRef,
 			frameSprEdge, frameSprEdgeBlend, frameSprEdgeUnder,
-			frameSprEdgeTie, frameMaskZero, frameHdmaSplit,
+			frameSprEdgeTie, frameSprEdgeSub, frameSprEdgeSubBlend, frameSubSprBot,
+			frameSubSprUnder, frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
@@ -2423,7 +2725,19 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// torch one frame per phase. Tile CONTENT still comes from spritemiss, which
 	// is why only the tile number is written here.
 	// =====================================================================
-	if(hdScreen->Oam && hdScreen->Vram) {
+	// S27: OFF by default (08 Sep). This recorder de-duplicates on an object's
+	// COMPOSITION, and a composition is "which objects stand where" — so almost every
+	// frame with a slightly different sprite arrangement counts as new material. Over
+	// 42 sessions the file reached 853 MB and was still growing, while spritecap,
+	// bgcap and spritemiss saturated back on 10 Aug and have not been written since:
+	// their keys are per TILE, of which there is a finite number.
+	// Kept, not deleted — the viewer's "Laufzeit" button reads it (`parseOam`) and it
+	// is what defines which HD tiles form one runtime object (S16/S17). Turn it on for
+	// the session in which objects are actually being captured, exactly as S18 did
+	// with cgramcap:
+	//     set SNES_HD_OAMCAP=1
+	static const bool s_oamEnabled = getenv("SNES_HD_OAMCAP") != nullptr;
+	if(s_oamEnabled && hdScreen->Oam && hdScreen->Vram) {
 		static FILE* s_oamFile = nullptr;
 		static bool s_oamAttempted = false;
 		static uint32_t s_oamFrames = 0;

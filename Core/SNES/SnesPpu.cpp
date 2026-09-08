@@ -1200,15 +1200,27 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 		hdCaptureSpriteFrom(x, slot, spritePrio, _hdSpritePixels[x]);
 	};
 
+	// S25: which screen the fringe slot follows. In overlay levels (Mainbrace,
+	// Rambi, Lockjaw under water) DKC2 takes OBJ off the MAIN screen by HDMA
+	// ($212C=$04) and brings the characters back through colour math from the sub
+	// screen ($212D=$13). Both fringe branches below were gated on `drawMain`, so
+	// slot 2 was never written there at all - `sprEdge=0/0` in every Mainbrace
+	// frame, which read like "the code does not work" but was only this gate. The
+	// fringe line buffers themselves are filled in FetchSpriteTile without any such
+	// gate, so the art was ready the whole time. Capture whenever sprites are drawn
+	// at all, and mask with the window of the screen they are actually on.
+	const bool objDrawn = drawMain || drawSub;
+	const uint8_t fringeWindowCount = drawMain ? mainWindowCount : subWindowCount;
+
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
 		// S23: another sprite's soft fringe may reach into this pixel even when a
 		// sprite covers it natively — Kruncha's arm over the sun. The branch below
 		// only ever filled slot 2 where NO native sprite pixel existed, so exactly
 		// the overlapping case was left out. Priority is carried along; the filter
 		// compares it against the pixel's real winner before drawing anything.
-		if(hdValid && drawMain && x < SnesHdScreenInfo::ScreenWidth
+		if(hdValid && objDrawn && x < SnesHdScreenInfo::ScreenWidth
 			&& _spritePriority[x] <= 3 && _hdSpritePixelsFringe[x].ContentHash != 0
-			&& !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
+			&& !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(fringeWindowCount, x)) {
 			hdCaptureSpriteFrom(x, 2, priority[_hdSpritePixelsFringe[x].Priority & 0x03],
 				_hdSpritePixelsFringe[x]);
 		}
@@ -1237,7 +1249,7 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 					hdCaptureSprite(x, 1, spritePrio);
 				}
 			}
-		} else if(hdValid && drawMain && x < SnesHdScreenInfo::ScreenWidth
+		} else if(hdValid && objDrawn && x < SnesHdScreenInfo::ScreenWidth
 			&& _hdSpritePixels[x].ContentHash != 0 && !_hdSpritePixels[x].NativeOpaque) {
 			// S21: no native sprite pixel here, but a sprite's 8x8 tile does cover it —
 			// its HD art may still have a soft fringe reaching into this pixel. Record
@@ -1248,7 +1260,7 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 			// is deliberately left to the filter, because at this point the tilemaps
 			// have not rendered yet and _mainScreenFlags still holds the backdrop.
 			// Slot 2 carries the sprite's own priority for that comparison.
-			if(!ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
+			if(!ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(fringeWindowCount, x)) {
 				hdCaptureSprite(x, 2, priority[_hdSpritePixels[x].Priority & 0x03]);
 			}
 		}
