@@ -2348,7 +2348,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			(unsigned long long)totalPx, (unsigned long long)refPx,
 			totalPx ? 100.0 * (double)refPx / (double)totalPx : 0.0);
 		DiagLog(hdr);
-		for(size_t i = 0; i < ranked.size() && i < 16; i++) {
+		// 40, not 16: in Rambi Rumble the first sixteen were all KONG letters -- one
+		// letter is several 32x32 tiles and they sit still, so they dominate an area
+		// ranking, while a character is many small tiles that each cover less. The
+		// list has to reach past them to show the art the user is actually asking about.
+		for(size_t i = 0; i < ranked.size() && i < 40; i++) {
 			uint64_t h = ranked[i].first;
 			uint8_t pal = diagSprAreaPal.count(h) ? diagSprAreaPal[h] : 0xFF;
 			SnesHdTileKey k; k.ContentHash = h; k.PaletteIndex = pal; k.LayerIndex = 4;
