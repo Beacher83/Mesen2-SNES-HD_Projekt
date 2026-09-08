@@ -21,6 +21,82 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-08] — HINWEIS: LÜCKE 13.07.–08.09.
+
+Zwischen P3.10 und hier wurde die Mesen-Arbeit (M5.x, R*, S1–S27) **nicht in dieser
+Datei** geführt, sondern in den Projektnotizen und — ab 07.09. — fälschlich im
+**Viewer**-Changelog, obwohl am Viewer nichts geändert wurde. Die Kopfzeile oben regelt
+die Aufteilung eindeutig: C++-Änderungen gehören hierher. Ab S25–S27 wieder korrekt.
+Die älteren fehlgeleiteten Einträge (S21b, S22–S24) stehen noch im Viewer-Changelog.
+
+---
+
+## [2026-09-08] — S25 wieder ausgebaut (Rekonstruktion: Commit `4482908a`)
+
+Nur Mesen. **S25 zeichnete, aber niemand konnte es sehen** — also raus, bevor es zu Code
+wird, dessen einziger Beleg ist, dass er ausgeführt wird. Genau so hat sich der S23-Zweig
+zu lange gehalten.
+
+**Entfernt:** die Aufzeichnung des Saum-Slots auf dem Sub-Screen in `RenderSprites`
+(`objDrawn`/`fringeWindowCount` zurück auf `drawMain`/`mainWindowCount`), die
+Scanline-Flags `objOnMain`/`objOnSub`, der dritte Saum-Zweig im Filter samt Prio-Test gegen
+den Sub-Gewinner, der Saum-Blend im Operanden, der Schalter `SNES_HD_NO_SUB_FRINGE` und die
+Zähler `sprEdgeSub=A/B`.
+
+**Beleg:** fünf A/B-Läufe über 3.634 Frames. S25 zeichnete 747 Subpixel je Frame in
+Mainbrace — mit S25 aus meldete der User **keinen** Unterschied, mit dem Untergrund
+(S26/S27) aus dagegen „nicht geglättet“. Vermutung, ungeprüft: der Operand wird zum Nebel
+addiert und oft halbiert, was ein schwach gedeckter Saum nicht überlebt.
+**Einschränkung:** Augen-A/B, kein Standbildvergleich derselben Stelle — wer S25
+rehabilitieren will, macht genau den.
+
+**S26 und S27 bleiben** und hängen nicht an S25: Slot 3 wird über den `drawSub`-Pfad
+gefüllt, nicht über den Saum-Slot. Log-Rotation und OAM-Gate bleiben ebenfalls.
+
+## [2026-09-08] — S25–S27: die Kantenglättung erreicht die Overlay-Level
+
+Nur Mesen (`SnesPpu.cpp`, `SnesHdVideoFilter.cpp`), Commit `4482908a`.
+
+**In Mainbrace, Rambi Rumble und Lockjaw unter Wasser lief die Kantenglättung nie — und die
+Ursache war eine einzige Gate-Bedingung.** DKC2 nimmt OBJ per HDMA vom Main-Screen
+(`$212C=$04`), also war `drawMain` für Sprites falsch und `RenderSprites` füllte den
+Saum-Slot dort gar nicht erst. `sprEdge=0/0` in jedem Frame las sich wie kaputter Code und
+war dieses Tor; die Saum-Zeilenpuffer waren die ganze Zeit gefüllt.
+
+**S25** zeichnet den Saum in den **Color-Math-Operanden** statt in die Hauptfarbe — in einem
+Overlay-Level existiert die Figur nur dort, ein Saum in der Hauptfarbe würde zum Nebel
+*addiert* statt durch ihn hindurch gezeichnet.
+**S26** gibt dem Sub-Sprite einen Untergrund. Es mischte noch gegen `nsR/nsG/nsB`, und das
+ist an einem Sprite-Pixel die **eigene SD-Farbe** — dieselbe Wand, die S21 im Main-Pfad
+eingerissen hat, hier unangetastet. Der Untergrund ist streng begründet: in diesem Zweig hat
+das Sprite jede Sub-BG-Ebene geschlagen, sonst hätte `RenderTilemap` `SubScreenHasSprite`
+gelöscht.
+**S27** nimmt bevorzugt ein **zweites Sprite** als diesen Untergrund, exakt wie S22 im
+Main-Pfad. `Sprites[3]` wird auch für den Sub-Slot gefüllt — nichts Neues aufzuzeichnen.
+Beide S22-Fallen mitgenommen: die R3-Zeilen-LUT bleibt von einer Sprite-Unterlage fern, und
+die Unterlage braucht die Umfärbung.
+
+**Gemessen, nicht argumentiert.** Fünf A/B-Läufe über 3.634 Frames haben S25/S26 getrennt:
+mit S26 aus meldet der User „nicht geglättet“ in Mainbrace und Lockjaw, während S25 weiter
+über 400 Subpixel je Frame zeichnet — **der sichtbare Effekt ist S26, S25s Nutzen ist
+unbelegt.** S27 hat eine saubere A/B/A-Kette am Fass, das Dixie über dem Kopf trägt:
+glatt → hart → glatt, bei `subSprUnder` = 106 px/Frame in 140 von 248 Frames.
+
+**Ein Zweig wurde als Zähler ausgeliefert und danach entfernt.** Die Vermutung, auch auf
+Scanlines *mit* OBJ auf Main fehle Saum, war aus `sprHdSub` hochgerechnet — aber diese Pixel
+liegen INNERHALB der Silhouette, und direkt daneben lässt `$212D=$10` den Sub-Screen leer.
+Der Zähler kam in allen fünf Läufen als **0** zurück, auch in dem, der den Schalter
+einschaltete. Raus statt auf der Begründung behalten — wie `sprFrOver` in S23.
+
+**Recorder aufgeräumt.** `snes_hd_oam.txt` dedupliziert auf die **Komposition** eines Frames,
+also zählte fast jedes Frame als neu; die Datei war auf **813 MB** gewachsen, während
+`spritecap`/`bgcap`/`spritemiss` (Dedup je Kachel) seit dem 10.08. gesättigt sind. OAM ist
+jetzt aus per Vorgabe (`SNES_HD_OAMCAP=1`) — dieselbe Behandlung wie `cgramcap` in S18; der
+Viewer liest die Datei weiterhin über `parseOam` für die Laufzeit-Objekte.
+Die zwei kleinen Logs hängen an und rotieren bei 16 MB. Ein erster Versuch mit „frisch je
+Start“ hat binnen einer Stunde eine Vergleichsserie zerstört, weil ein außerhalb der
+Testskripte gestarteter Lauf die beiden davor löschte.
+
 ## [2026-07-13] — Phase 3.10: Targeted BG3 Overlay Swap (P3.10)
 
 ### BG3+Mode1Bg3Priority Overlay Swap + Lockjaw Fix
