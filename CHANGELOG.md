@@ -21,6 +21,80 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-09] — S28–S34: Rambi Rumble — die Kantenglättung greift
+
+**Ergebnis:** In Rambi Rumble blieb die Silhouette der Kongs hart, während sie in Mainbrace
+weich ist. Ursache gefunden und behoben. `subNoBot` fällt von 42,8 % auf **1,7 %**, die
+Untergrund-Abdeckung steigt von 54,1 % auf **93,1 %** (Mainbrace: 84,9 %). Im Spiel bestätigt.
+
+### S34 — der eigentliche Fix (fünf Zeilen)
+Der S26-Untergrundsuche fehlte der **BG1↔BG2 layer-agnostische Retry**, den die beiden
+Rendering-Pfade seit jeher haben (`SnesHdVideoFilter.cpp` ~1059 und ~1211). Sie fragte
+einmal streng nach `BgTiles[layer].Key` und gab auf.
+
+**Warum das nur Rambi traf — chr-Basen vertauscht.** ppuConfig `DATA_FD7ADF` (`bank_FD.asm`):
+`$210B = $0725` → **BG1 = $5000, BG2 = $2000**. Die Kunst liegt im Pack unter dem anderen
+Layer-Index. Mainbrace `DATA_FD7AB6`: `$210B = $0642` → BG1 = $2000, BG2 = $4000, normal.
+Messwert: `lRetry` = **36.427 px/Frame = 64 % des Bildschirms** in Rambi, **0 in jedem
+anderen Level im Log**. Die Rendering-Pfade überbrücken das — deshalb sah das Level
+makellos aus — die Untergrundsuche nicht. Kunst vorhanden, Level sauber, Kanten hart.
+Von `subBot` (656.340) kommen nach dem Fix **642.312 = 97,9 % über den Retry**.
+
+Das ist das Laufzeit-Gegenstück zum `terrainChrBase`-Export-Fix im Viewer vom 2026-07-02
+(siehe `SNES_HD_PACK_PROJECT.md`, Abschnitt „Viewer-Fix Session").
+
+### Levelarchitektur — aus der Disassembly belegt (`bank_FD.asm`)
+Beide Level: Mode 1 + BG3-Priority, `$2130 = $02` (Sub-Screen als CM-Operand), ADD ohne
+Halbierung. Gleiche Struktur, vertauschte Rollen:
+
+| | Schleier auf MAIN | Welt + Kongs auf SUB | `$210B` | `$2131` |
+|---|---|---|---|---|
+| Rambi `DATA_FD7ADF` | **BG1** (Honig) | BG2+BG3+OBJ | `$0725` | `$21` |
+| Mainbrace `DATA_FD7AB6` | **BG3** (Nebel) | BG1+BG2+OBJ | `$0642` | `$24` |
+
+Der Main-Screen trägt in beiden Fällen **eine** durchscheinende Ebene, der Sub-Screen die
+Welt samt Kongs. In Mainbrace liegt die Level-Geometrie (BG1) mit auf dem Sub-Screen und
+wird von der Untergrundsuche gefunden; in Rambi liegt sie als Schleier auf dem Main-Screen.
+
+### Diagnostik
+- **S28/S29** — `SPRAREA` zählt jetzt auch Sub-Screen-Sprites (in Overlay-Leveln ist
+  `sprWon = 0`, der Recorder war dort blind — also in genau den Leveln, für die er gebaut
+  war) und meldet aus der Mitte des Fensters statt vom Levelanfang.
+- **`SNES_HD_DIAG_FRAMES` Default 60 → 600.** 60 Frames = 1 Sekunde maßen den
+  Türdurchgang, nicht das Level. Ein Default, den man überschreiben muss, damit er stimmt,
+  ist der falsche Default — und er erzwang eine Wrapper-`.bat` zum Starten. Entfällt.
+- **`sprHoleHd`** trennt die zweite `SprSubHd`-Fundstelle heraus. Sie liegt außerhalb der
+  `if(cmActive && ColorMathAddSubscreen)`-Kette, die `SprSub` erhöht, und feuert nur, wo
+  `cmActive` falsch war — also auf Pixeln, die der Nenner ausschließt. `sprHdSub/sprSub`
+  war damit keine Quote. (In den untersuchten Leveln ist der Zähler 0, die Zahlen waren
+  dort also unverzerrt.)
+- **`subNoRef` / `subOpaque`** messen erstmals das Referenz-Tor im **Sub**-Pfad. Die
+  bisherigen Zähler `sprRecol`/`sprNoRef` hängen am MAIN-Sprite-Pfad und sind in
+  Overlay-Leveln strukturell 0 — auch in Mainbrace, wo alles funktioniert. Ergebnis:
+  **0–99 px.** Das Referenz-Tor ist an der harten Kante unbeteiligt.
+- **`nbEmpty` / `nbNoHd`** trennen in `subNoBot` „kein BG auf dem Sub-Screen" von „BG da,
+  aber ohne HD-Kachel". In Rambi 1,1 % / 98,9 %; in Mudhole Marsh (noch ohne HD-Kunst)
+  100 % / 0 % — der Gegencheck, dass die Zähler das Richtige messen.
+- **`subBotRetry`** zeigt, wie viel der S34-Retry zurückholt.
+
+### Verworfen, gemessen, dokumentiert (nicht erneut versuchen)
+- **S30 — Untergrund vom Main-Screen.** `subNoBot` → 0, `subMainBot` = 326.902, **Bild
+  unverändert**. Bei `Main=$01` ist die einzige findbare Ebene der Main-Screen-Gewinner
+  selbst, und `r = min(255, r + oR)` addiert ihn danach auf sich. Wieder ausgebaut.
+- **S32 — Backdrop für alle `subNoBot`.** Wirkte leicht verschlechternd: 98,9 % davon sind
+  Fälle mit echtem Terrain hinter der Figur, dessen Farbe durch die Backdrop ersetzt wurde.
+  In S33 auf `!anyBgOnSub` eingeschränkt, wo die Backdrop tatsächlich das ist, was der
+  Sub-Screen ausgibt. Aktiv, aber ohne nachgewiesene Bildwirkung — Aufräumkandidat nach dem
+  Vorbild von `18f6381f` (S25).
+
+### Was NICHT die Ursache war
+Rambi Rumble hat **keine HD-Lücken** — der Pack ist für dieses Level vollständig, der
+Honig-Overlay (`cmFg/gfxset_04`, 336 Kacheln) inbegriffen. `bg/bg2/gfxset_04` hat nur 65
+Dateien, aber BG2 gehört hier nicht zur Architektur; das ist kein Defizit. Fehlend sind
+lediglich einige Gegner-Sprites und das HUD.
+
+---
+
 ## [2026-09-08] — HINWEIS: LÜCKE 13.07.–08.09.
 
 Zwischen P3.10 und hier wurde die Mesen-Arbeit (M5.x, R*, S1–S27) **nicht in dieser

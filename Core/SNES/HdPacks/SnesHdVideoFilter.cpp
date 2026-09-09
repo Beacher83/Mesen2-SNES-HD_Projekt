@@ -18,7 +18,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S29"
+#define SNES_HD_BUILD_VERSION "S34"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -250,6 +250,7 @@ static void WriteSessionBanner(FILE* f, const char* what)
 		"SNES_HD_CGRAMCAP",
 		"SNES_HD_OAMCAP",
 		"SNES_HD_DIAG_FRAMES",
+		"SNES_HD_NO_BACKDROP_GROUND",
 	};
 	char active[512];
 	active[0] = 0;
@@ -708,16 +709,28 @@ static const bool s_noSubUnder = getenv("SNES_HD_NO_SUB_UNDER") != nullptr;
 // again. That is the `!SubScreenHasSprite` limit S25 was deliberately kept inside:
 //     set SNES_HD_NO_SUB_SPRITE_UNDER=1
 static const bool s_noSubSprUnder = getenv("SNES_HD_NO_SUB_SPRITE_UNDER") != nullptr;
-// S29: how many GAMEPLAY frames per context are logged. 60 -- one second -- was
-// never a measurement of a level, it was a measurement of walking through the
-// door: the fade is still running, the level-name banner is on screen and the
-// player has not moved. That is how a bonus screen full of KONG letters came to
-// be analysed as Rambi Rumble. Raise it for a real look:
-//     set SNES_HD_DIAG_FRAMES=600
+// S32: when the sub screen carries no BG behind a sub-screen sprite, blend the sprite's
+// soft edge against the BACKDROP -- which is what the sub screen actually outputs there.
+// On by default; this turns it off for an A/B run:
+//     set SNES_HD_NO_BACKDROP_GROUND=1
+static const bool s_noBackdropGround = getenv("SNES_HD_NO_BACKDROP_GROUND") != nullptr;
+// How many GAMEPLAY frames per context are logged.
+// S29 raised this from a hard-wired 60 to an environment variable, because 60 --
+// one second -- was never a measurement of a level, it was a measurement of
+// walking through the door: the fade is still running, the level-name banner is
+// on screen and the player has not moved. That is how a bonus screen full of
+// KONG letters came to be analysed as Rambi Rumble.
+// S30 makes 600 (ten seconds) the DEFAULT. Leaving the useful window behind an
+// environment variable meant every real measurement needed a wrapper .bat to
+// start the emulator, which is friction on the one action taken most often --
+// and a default that has to be overridden to be correct is the wrong default.
+// The variable stays, for turning the log DOWN on a long play session as much as
+// up for a very long look:
+//     set SNES_HD_DIAG_FRAMES=60
 // The area recorder below uses the same number to skip the first quarter and
 // report from the middle of the window, i.e. from actual play.
 static const int s_diagFrames = getenv("SNES_HD_DIAG_FRAMES")
-	? std::max(20, atoi(getenv("SNES_HD_DIAG_FRAMES"))) : 60;
+	? std::max(20, atoi(getenv("SNES_HD_DIAG_FRAMES"))) : 600;
 // S25w WAS HERE AND IS GONE — measured out, 08 Sep, five runs / 3634 frames.
 // The idea: even on a scanline that carries OBJ on the main screen, a sprite can LOSE
 // that screen to a background and reach the picture only as the colour-math operand,
@@ -762,6 +775,12 @@ struct HdFilterFrameStats
 	uint32_t SubSprBot = 0;     // S26: sub-screen sprite given a BG ground to blend against
 	uint32_t SubSprUnder = 0;   // S27: sub-screen sprite blended against the SPRITE behind it
 	uint32_t SubSprNoBot = 0;   // S29: gate passed, but no ground found (no sub-screen BG with HD art)
+	uint32_t SprHoleHd = 0;     // S31: HD sub sprite via the BgLayerMask==0 hole path -- NOT part of SprSub
+	uint32_t SubGateNoRef = 0;  // S31: sub-sprite ground REFUSED -- no reference palette for this tile
+	uint32_t SubGateOpaque = 0; // S31: sub-sprite ground refused -- tile has no transparent pixels
+	uint32_t SubNoBotEmpty = 0; // S33: of SubSprNoBot -- no BG layer on the sub screen at all
+	uint32_t SubNoBotNoHd = 0;  // S33: of SubSprNoBot -- a BG IS there, it just has no HD art
+	uint32_t SubBotRetry = 0;   // S34: ground found only via the BG1<->BG2 layer-agnostic retry
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -792,6 +811,12 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SubSprBot += src.SubSprBot;
 	dst.SubSprUnder += src.SubSprUnder;
 	dst.SubSprNoBot += src.SubSprNoBot;
+	dst.SprHoleHd += src.SprHoleHd;
+	dst.SubGateNoRef += src.SubGateNoRef;
+	dst.SubGateOpaque += src.SubGateOpaque;
+	dst.SubNoBotEmpty += src.SubNoBotEmpty;
+	dst.SubNoBotNoHd += src.SubNoBotNoHd;
+	dst.SubBotRetry += src.SubBotRetry;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -986,6 +1011,8 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			bool cmActive = false;  // hoisted so the rendering section (below) can see it too
 			uint8_t winLayer = 0xFF;  // hoisted so the rendering section (below) can see it too
 			bool subSprHdFired = false;  // S9: the S7 sub-sprite HD-operand path rendered this pixel
+			// S32: gate passed, ground search empty -- the sub screen shows the BACKDROP here.
+			bool subGroundIsBackdrop = false;
 			bool spriteIsSubOperand = false;  // P4.1f: sprite is the final sub winner AND the CM operand → force native
 
 			if(pixelInfo.BgLayerMask != 0 && !spriteWon && !blockBgHd) {
@@ -1234,8 +1261,21 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							// the sub screen that composites the character.
 							// Reference-palette gate as everywhere: runtime-captured art
 							// carries background in its border texels (S21).
+							// S31: WHY the gate refuses, counted separately. Until now the
+							// only reference counters were SprRecolor/SprRecolorNoRef, and
+							// both hang off the MAIN-screen sprite path -- where sprWon is 0
+							// in every overlay level. They read 0/0 in Mainbrace too, where
+							// everything works, so "Rambi has no reference problem, sprNoRef
+							// is 0" was never a measurement. Third counter in a row that is
+							// blind in exactly the levels it was needed for; see the notes.
+							bool subHasRef = hdData->GetSpriteRefPalette(pixelInfo.Sprites[1].Key.ContentHash) != nullptr;
+							if(!subSprTile->HasTransparentPixels) {
+								st.SubGateOpaque++;
+							} else if(!subHasRef) {
+								st.SubGateNoRef++;
+							}
 							if(!s_noSpriteEdges && !s_noSubUnder && subSprTile->HasTransparentPixels
-								&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[1].Key.ContentHash) != nullptr) {
+								&& subHasRef) {
 								// S27: when a second sprite lies under this one, THAT is the
 								// ground, not the background — the Kongs one behind the other
 								// under water, which the user reported on 08 Sep as the one
@@ -1255,11 +1295,40 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 										st.SubSprUnder++;
 									}
 								} else {
+									// S33: does a BG lie on the sub screen behind the character
+									// at all? `subNoBot` alone could not say -- it fired both
+									// when no layer qualified AND when one did but carried no HD
+									// art. Those need opposite grounds, and S32 gave both of
+									// them the backdrop, which is why Rambi came back looking
+									// slightly WORSE: where terrain really is behind the Kong,
+									// its colour got replaced by the backdrop.
+									bool anyBgOnSub = false;
 									for(int layer = 0; layer < 4 && !subTileBot; layer++) {
 										if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
 										if(!(sl.SubScreenLayers & (1 << layer))) continue;
+										anyBgOnSub = true;
 										SnesHdPackTileInfo* below = CachedGetMatchingTile(hdData, hdScreen->Vram,
 											tileLookupCache, pixelInfo.BgTiles[layer].Key);
+										// S34: the SAME BG1<->BG2 layer-agnostic retry the two
+										// rendering paths already do (lines ~1059 and ~1211).
+										// This search did not have it, and that is the whole
+										// difference in Rambi Rumble: measured `lRetry` there is
+										// 36.427 px per frame -- 64% of the screen -- against 0
+										// in every other level in the log. Rambi's chr bases are
+										// swapped (ppuConfig DATA_FD7ADF: $210B=$0725, so BG1 =
+										// $5000 and BG2 = $2000), so its art sits in the pack
+										// under the other layer index. The render paths bridge
+										// that with the retry and the level looks perfect; this
+										// search asked once, strictly, and gave up -- in exactly
+										// the level where the strict question never works.
+										// Hence: art present, level clean, edges hard.
+										if(!below && layer <= 1) {
+											SnesHdTileKey altKey = pixelInfo.BgTiles[layer].Key;
+											altKey.LayerIndex = layer ^ 1;
+											below = CachedGetMatchingTile(hdData, hdScreen->Vram,
+												tileLookupCache, altKey);
+											if(below) st.SubBotRetry++;
+										}
 										if(below) {
 											subTileBot = below;
 											subTileInfoBot = &pixelInfo.BgTiles[layer];
@@ -1267,10 +1336,41 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 										}
 									}
 									// S29: the gate let this pixel through and the search still
-									// came back empty. Rambi Rumble covers only ~52% of its HD
-									// sub-sprite pixels against Mainbrace's ~89%, and this says
-									// whether the missing half fails here or never gets this far.
-									if(!subTileBot) st.SubSprNoBot++;
+									// came back empty -- 338.741 px per 652 frames of Rambi
+									// Rumble (48%), against ZERO in Mainbrace. The cause is
+									// $212D, not the art:
+									//     Rambi     Main=$01 BG1     Sub=$16 BG2+BG3+OBJ
+									//     Mainbrace Main=$04 BG3     Sub=$13 BG1+BG2+OBJ
+									// Rambi keeps its scenery on the MAIN screen, so wherever
+									// the character hangs in open air the sub screen carries no
+									// BG at all and this loop searches an empty screen.
+									//
+									// S30 TRIED TO FILL THAT FROM THE MAIN SCREEN AND WAS WRONG.
+									// Measured: the fallback fired on 326.902 px and drove
+									// subNoBot to 0, and the picture did not change. It cannot
+									// help, because with Main=$01 the only layer it can find IS
+									// the main-screen winner -- and the operand is then added
+									// back onto that same winner below, so BG1 lands on itself.
+									// The operand already carries the right ground without it:
+									// `oR = nsR` is the native sub-screen colour, which is the
+									// backdrop exactly where this loop finds nothing, and the
+									// backdrop is what the real PPU composites there too.
+									// A ground for these pixels has to come from the SUB screen
+									// or not at all.
+									if(!subTileBot) {
+										st.SubSprNoBot++;
+										if(anyBgOnSub) st.SubNoBotNoHd++; else st.SubNoBotEmpty++;
+										// S32: nothing on the sub screen behind the character, so
+										// the sub screen outputs the BACKDROP at this pixel. That
+										// is the ground the soft edge has to fade into. Without
+										// it the fringe blends against `nsR`, which at a sprite
+										// pixel IS the sprite's own SD colour -- art mixed with
+										// itself, which is why the silhouette stayed hard.
+										// NOT the main screen: S30 tried that and it does
+										// nothing, because colour math adds the operand back
+										// onto the main screen and BG1 would land on itself.
+										subGroundIsBackdrop = !anyBgOnSub && !s_noBackdropGround;
+									}
 								}
 							}
 						} else {
@@ -1346,7 +1446,15 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 						subTileInfo = &pixelInfo.Sprites[1];
 						cmActive = true;  // the rendering section gates color math on this
 						subSprHdFired = true;
-						st.SprSubHd++;
+						// S31: NOT SprSubHd. This block sits outside the
+						// `if(cmActive && ColorMathAddSubscreen)` chain that increments
+						// SprSub, and it only runs where cmActive was false -- so every
+						// hit here is a pixel the SprSub denominator excludes by
+						// construction. Counting it as SprSubHd made sprHdSub/sprSub a
+						// ratio of two different populations, inflating it by a
+						// level-dependent amount. That is where "39% of the sprite pixels
+						// have no HD art" came from, twice, and it was wrong both times.
+						st.SprHoleHd++;
 					}
 				}
 			}
@@ -1800,6 +1908,23 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								oR = fxR; oG = fxG; oB = fxB;
 							} else {
 								oR = nsR; oG = nsG; oB = nsB;
+								// S32: at a sub-screen sprite pixel whose ground search came
+								// back empty, `nsR` is the sprite's OWN SD colour, so blending
+								// the HD art's soft edge against it mixes art with itself and
+								// no gradient can appear -- the silhouette stays hard at native
+								// resolution. What the sub screen really outputs behind the
+								// character there is the BACKDROP (no sub-screen BG at this
+								// pixel), so that is what the edge must fade into. Measured on
+								// Rambi Rumble: 38,8% of its HD sub-sprite pixels, against 0%
+								// in Mainbrace -- which is exactly why the smoothing works in
+								// one and not the other. Levels like Mainbrace never reach
+								// this line.
+								if(subGroundIsBackdrop) {
+									uint16_t bd = hdScreen->Cgram[0];
+									oR = ColorUtilities::Convert5BitTo8Bit(bd & 0x1F);
+									oG = ColorUtilities::Convert5BitTo8Bit((bd >> 5) & 0x1F);
+									oB = ColorUtilities::Convert5BitTo8Bit((bd >> 10) & 0x1F);
+								}
 								uint32_t c = 0;
 								uint32_t ha = 0;
 								if(subSampler.valid) {
@@ -2170,6 +2295,12 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSubSprBot = total.SubSprBot;
 	uint32_t frameSubSprUnder = total.SubSprUnder;
 	uint32_t frameSubSprNoBot = total.SubSprNoBot;
+	uint32_t frameSprHoleHd = total.SprHoleHd;
+	uint32_t frameSubGateNoRef = total.SubGateNoRef;
+	uint32_t frameSubGateOpaque = total.SubGateOpaque;
+	uint32_t frameSubNoBotEmpty = total.SubNoBotEmpty;
+	uint32_t frameSubNoBotNoHd = total.SubNoBotNoHd;
+	uint32_t frameSubBotRetry = total.SubBotRetry;
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
@@ -2248,7 +2379,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
 			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
-			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u subBot=%u subSprUnder=%u subNoBot=%u"
+			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u subBot=%u subSprUnder=%u subNoBot=%u sprHoleHd=%u subNoRef=%u subOpaque=%u nbEmpty=%u nbNoHd=%u subBotRetry=%u"
 			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
@@ -2262,7 +2393,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameSprRecolor, frameSprRecolorNoRef,
 			frameSprEdge, frameSprEdgeBlend, frameSprEdgeUnder,
 			frameSprEdgeTie, frameSubSprBot,
-			frameSubSprUnder, frameSubSprNoBot, frameMaskZero, frameHdmaSplit,
+			frameSubSprUnder, frameSubSprNoBot, frameSprHoleHd, frameSubGateNoRef, frameSubGateOpaque, frameSubNoBotEmpty, frameSubNoBotNoHd, frameSubBotRetry, frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],

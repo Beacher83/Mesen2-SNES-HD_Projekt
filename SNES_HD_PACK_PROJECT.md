@@ -1012,6 +1012,63 @@ vollständige Lösung, ist aber ein separater Meilenstein.
 - HD-Tiles im Tile-Viewer-Debugger anzeigen (wenn EnableHdPacks aktiv)
 - `SnesPpuTools.cpp` + `TileViewerViewModel.cs` anpassen
 
+## Levelarchitektur aus der Disassembly lesen (ppuConfig)
+
+**Regel: Bei jeder Unsicherheit über Ebenen, Prioritäten, Farbmathematik, chr-Basen oder
+Tilemap-Adressen zuerst hier nachsehen — nicht aus Zählern oder der Spielreihenfolge
+erschließen.** Am 2026-09-09 kosteten vier Builds einen Tag, weil die Architektur geraten
+statt nachgelesen wurde; die Lösung stand in Minuten fest, sobald die ppuConfig vorlag.
+
+**Quelle:** `C:\DEV Claude\SNES Remaster Projekt\dkc_research\disassembly\`
+| Datei | Inhalt |
+|---|---|
+| `bank_FD.asm` | **ppuConfig-Tabellen je Level** — die Registerprofile |
+| `notes.txt` | Sprite-Init-Kommandos `$80`–`$8E`, DMA-/Code-Landkarte |
+| `level_format_notes.txt` | Level-Settings-Parser |
+| `bank_B5/BB/FC.asm`, `ram.asm` | Sprite-Handler, Grafik-DMA, RAM-Karte |
+
+**Finden:** `grep -n '\$212C' bank_FD.asm` listet alle Level-Profile.
+
+**Blockformat** (Beispiel Rambi Rumble, `DATA_FD7ADF`):
+```asm
+dw $2105 : db $09          ; BGMODE: Mode 1 (Bits 0-2), Bit3 = BG3-Priority
+dw $2107|$8000 : dw $796C  ; BG1SC = $6C, BG2SC = $79   (Tilemap-Adressen)
+dw $2109 : db $68          ; BG3SC
+dw $210B|$8000 : dw $0725  ; BG12NBA = $25 -> BG1 chr = $5000, BG2 chr = $2000
+                           ; BG34NBA = $07 -> BG3 chr = $7000
+dw $2101 : db $00
+dw $212C|$8000 : dw $1601  ; $212C = $01 (MAIN), $212D = $16 (SUB)
+dw $2130 : db $02          ; CGWSEL: Bit1 = Sub-Screen als 2. Operand
+dw $2131 : db $21          ; CGADSUB: Bit7=0 ADD, Bit6=0 keine Halbierung,
+                           ;          Bit5 Backdrop, Bit0 BG1
+```
+`dw $212C|$8000 : dw $XXYY` ist ein 16-Bit-Schreibzugriff: **`$212C = $YY` (Main),
+`$212D = $XX` (Sub)**. Bitbelegung beider Register: Bit0-3 = BG1-BG4, Bit4 = OBJ.
+
+### Belegte Profile
+
+| Level | Label | `$212C`/`$212D` | `$210B` | `$2131` |
+|---|---|---|---|---|
+| Rambi Rumble | `DATA_FD7ADF` | `$01` / `$16` | `$0725` | `$21` |
+| Mainbrace Mayhem | `DATA_FD7AB6` | `$04` / `$13` | `$0642` | `$24` |
+
+**Gemeinsames Muster der Overlay-Level:** Der Main-Screen trägt **eine** durchscheinende
+Ebene (den Schleier), der Sub-Screen die Welt samt Kongs; die Farbmathematik addiert beide.
+
+| | Schleier auf MAIN | Welt + Kongs auf SUB |
+|---|---|---|
+| Rambi | **BG1** (Honig-Overlay) | BG2 + BG3 + OBJ |
+| Mainbrace | **BG3** (Nebel) | BG1 + BG2 + OBJ |
+
+**Praktische Folge (S34):** In Mainbrace liegt die Level-Geometrie (BG1) mit auf dem
+Sub-Screen, die S26-Untergrundsuche findet sie. In Rambi liegt sie als Schleier auf dem
+Main-Screen — dort ist der Untergrund BG2/BG3, und weil Rambis chr-Basen vertauscht sind
+(`$210B = $0725`), liegt die Kunst im Pack unter dem anderen Layer-Index. Ohne den
+BG1↔BG2-Retry findet die Suche nichts, obwohl der Pack vollständig ist. Vgl. den
+`terrainChrBase`-Export-Fix im Viewer (Abschnitt „Viewer-Fix Session (2026-07-02)").
+
+---
+
 ## Architecture
 
 ```
