@@ -462,6 +462,7 @@
     <ClInclude Include="NES\DefaultNesPpu.h" />
     <ClInclude Include="SNES\HdPacks\SnesHdData.h" />
     <ClInclude Include="SNES\HdPacks\SnesHdPackLoader.h" />
+    <ClInclude Include="SNES\HdPacks\SnesHdPerf.h" />
     <ClInclude Include="SNES\HdPacks\SnesHdVideoFilter.h" />
     <ClInclude Include="NES\HdPacks\HdAudioDevice.h" />
     <ClInclude Include="NES\HdPacks\HdData.h" />

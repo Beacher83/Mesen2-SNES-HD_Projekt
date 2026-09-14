@@ -21,6 +21,145 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-14] — Test I ausgewertet: der Emulator liefert jeden Frame pünktlich
+
+**Drei Läufe am 14.09., je ~2,5 min, Mainbrace Mayhem dann Lockjaw's Locker, Build S36.**
+Lauf A und B liegen in einer Mesen-Sitzung (Haken live umgelegt), C ist die Sitzung aus
+`TEST_I_LaufC_ohne_Pack.bat`. Trennung von A/B über `filter=0.0/0.0` ab 09:17:14.
+
+| | Dauer | Frames | `over` | `late` | `drop` | Periode Mittel/p99 | Arbeit ⌀ | `sleep` ⌀ |
+|---|---|---|---|---|---|---|---|---|
+| **A** Pack + Filter an | 155 s | 9.454 | 1 | 1 | 1 | 16,65 / 19,1 ms | 5,8 ms | 10,9 ms |
+| **B** Filter aus, Erfassung an | 127 s | 7.746 | **0** | **0** | **0** | 16,62 / 18,8 ms | 5,5 ms | 11,2 ms |
+| **C** gar kein Pack | 140 s | 8.540 | 0 | 1 | 1 | 16,66 / 18,8 ms | 3,3 ms | 13,4 ms |
+
+Die je eine Ausnahme in A und C ist kein Spielgeschehen: A bei t=12,5 s ein Levelübergang
+(`wait=348 ms`, der Filter schreibt Recorder-Dateien), C bei t=0,000 der allererste Frame
+(`sleep=395 ms`, Start). **In 25.740 Frames Spielbetrieb kein einziger verspäteter Frame.**
+
+Die Periodenverteilung ist über alle drei Läufe deckungsgleich (Median der Sekundenmaxima
+18,1 ms, p90 18,4 ms, p99 18,8–19,1 ms) — der Frame-Limiter schwankt um ±1,5 ms, in jeder
+Konfiguration gleich. **Der Pack kostet nachweislich Arbeit (5,8 gegen 3,3 ms) und kostet
+nachweislich keine Pünktlichkeit.**
+
+**Entscheidend ist die Beobachtung des Users:** Lauf C — gar kein Pack, die geringste Last,
+13,4 ms Reserve je Frame — kam ihm vor wie der **ruckeligste** der drei. Damit ist das
+Ruckeln von unserer Bildrate unabhängig. Zwei Ursachen kommen infrage, beide außerhalb des
+HD-Packs:
+
+**1. Bildausgabe gegen 60 Hz ohne VSync (periodischer Mikroruckler).**
+`SnesConsole::GetFps()` liefert NTSC **60,0988118623484** fps. Der Bildschirm läuft mit
+1920×1080 @ **60 Hz** (Intel Iris Xe), in `settings.json` steht `VerticalSync = False` und
+`IntegerFpsMode = False`. Differenz 0,0988 fps ⇒ **alle ~10,1 s ein Bild zu viel**, das die
+Anzeige verschluckt oder zerreißt. Für unsere Messung unsichtbar: sie endet am Emulations-
+Thread, nicht an der Ausgabe. Passt zu „kleine Slowdowns immer mal wieder im Level".
+Abhilfe ohne Code: Video → *Enable integer FPS mode* (rundet auf 60,00 und zieht die
+Audio-Abtastrate mit, `Emulator.cpp:750`, `SoundResampler.cpp:82`) **plus** VSync.
+
+**2. DKC2s eigene Verlangsamung (Ruckeln bei vielen Gegnern).**
+Läuft die Spiellogik in einem Frame nicht fertig, wiederholt das Spiel das Bild. Der Emulator
+gibt das originalgetreu wieder — 60 pünktliche Frames, aber weniger Bewegung darin.
+Originalverhalten, nicht behebbar und nicht wünschenswert zu beheben.
+
+**Nicht bestätigt:** Der HD-Filter als Engpass. `wait` (Emu-Thread wartet auf den Filter) war
+außerhalb der Levelübergänge durchgehend 0,0–0,1 ms.
+
+**Offen als Aufräumarbeit, nicht als Ruckler-Ursache:** `rec` kostet in Lauf A weiterhin
+~1 ms je Frame für Recorder, die gerade nichts sammeln, und `clear` 1,3 ms für das
+16-MB-Löschen. Zusammen ~14 % des Budgets — vorhanden, aber ohne Wirkung auf die Pünktlichkeit.
+
+---
+
+## [2026-09-14] — S36: Der Messlauf sagt: die Arbeit ist es nicht
+
+**Messlauf S35 vom 14.09., 08:15:23–08:19:58** (Mainbrace Mayhem, dann Lockjaw's Locker),
+User meldete Ruckler gegen 08:16, 08:18 und 08:19. 275 Zeilen, davon 271 `PERF`.
+
+**Ergebnis: zu den gemeldeten Zeiten ist kein einziger Frame über dem Budget.**
+
+| | |
+|---|---|
+| Sekunden mit `over>0` | 3 von 271 — alle in den ersten 36 s (Levelübergänge), keine davon 08:16/08:18/08:19 |
+| `fps` | 268× 61, je 1× 59/60/62 |
+| `work` (emu+send) | Mittel 6,2 ms von 16,64 ms Budget; Maximum über den ganzen Lauf 14,8 ms |
+| `sleep` (Reserve des Limiters) | Mittel ~10,4 ms pro Frame — knapp zwei Drittel des Budgets ungenutzt |
+| `wait` (Emu-Thread wartet auf den Filter) | 0,0/0,1 ms ab 08:16 durchgehend |
+| `filter` | Mittel 4–6 ms, Maximum 16,9 ms (08:17), sonst < 7 ms |
+
+Die drei `SLOW`-Frames (127 ms, 391 ms, 31 ms bei t=0 / 13,6 / 35,3) sind Levelübergänge:
+`wait` und `rec` dominieren, d. h. der Filter schreibt gerade Recorder-Dateien. Das passiert
+beim Kontextwechsel, nicht im Spiel.
+
+**Zwei Scheinbefunde, die keine sind:**
+- `fps=61` statt 60: die Sekunde wird beim ersten Frame ab 1000 ms geschlossen, deckt also
+  ~1015 ms ab. 61 Frames / 1,015 s = 60,1 fps = NTSC. Korrekt.
+- Scheinbar periodische Sprünge alle ~68 s (`t=78 -> 80`, Uhrzeit `+2 s`): dieselbe
+  Bucket-Drift. 1,5 % Überdeckung je Zeile ergibt nach ~67 Zeilen eine Sekunde Versatz.
+  **Kein Ereignis im Spiel.**
+
+**Was die Messung nicht gesehen hat — und warum:** `over` und `SLOW` hängen beide an `work`.
+Ein Frame kann aber auch zu spät kommen, ohne dass Arbeit anfällt: der Frame-Limiter
+verschläft, das Betriebssystem entzieht den Thread, die Ausgabe blockiert. Die Periode
+(Frameende → Frameende) wurde zwar mitgerechnet, aber **nie ausgegeben**.
+
+**Neu in dieser Messung (`SnesHdPerf.h`):**
+- `PERF`-Zeile: `period=Mittel/Max` sowie `late=` (Frames > 20 ms Periode) und
+  `drop=` (Frames > 25 ms — die Anzeige wiederholt das vorige Bild).
+- `SLOW` löst jetzt auch bei langer Periode aus, nicht nur bei langer Arbeit; `why=` sagt,
+  welche Bedingung gegriffen hat (`work`, `period` oder `work+period`).
+- Die 500-ms-Grenze aus S35 (Pause/Laden/Menü zählen nicht) gilt unverändert.
+
+**Lesart des nächsten Laufs:**
+- `late`/`drop` ≈ 0, Ruckler trotzdem sichtbar → es ist **nicht die Bildrate**, sondern
+  DKC2s eigene Verlangsamung bei vielen Objekten. Originalverhalten, nichts zu beheben.
+- `late`/`drop` > 0 **nur mit Pack** → unser Pfad; `period` gegen `work` halten.
+- `late`/`drop` > 0 **auch ohne Pack** → Mesens Frame-Pacing / VSync, unabhängig vom HD-Pack.
+
+Build-Kennung **S36**. Nur `SnesHdPerf.h` + Versionsstring — inkrementeller Build reicht.
+
+---
+
+## [2026-09-10] — S35: Frame-Zeit-Messung — wo ein langsamer Frame seine Zeit verbringt
+
+**Anlass:** Das Spiel ruckelt an manchen Stellen, vor allem wenn viel los ist (viele Gegner).
+Weltkarte und Level-Laden sind unauffällig. **Nur eine Messung, keine Verhaltensänderung.**
+
+**Warum die bisherigen Zahlen die Frage nicht beantworten:** `ms=` in der FRAME-Zeile misst
+**nur die parallele Pixelschleife** des Filters (Median ~2,5 ms, max 4,9 ms am 10.09.) — und
+FRAME-Zeilen gibt es nur in den ersten 600 Frames eines Kontexts, also am **Levelanfang**. Die
+vollen Szenen später im Level wurden nie gemessen, und nichts rund um die Schleife auch nicht.
+
+**Wie ein Frame läuft** (`VideoDecoder::UpdateFrame`, `SnesPpu::SendFrame`): der
+Emulations-Thread übergibt jeden Frame an den Decode-Thread; ist der noch mit dem vorigen
+beschäftigt, **dreht UpdateFrame Warteschleifen**. Ein Frame kommt also zu spät, wenn
+- der Emulations-Thread (CPU + PPU inkl. HD-Erfassung je Pixel, dann das Löschen von
+  ~16 MB `SnesHdPpuPixelInfo` je Frame) über 16,64 ms braucht, oder
+- der Decode-Thread (der ganze HD-Filter) länger braucht und der Emulations-Thread wartet.
+
+**Neu: `%USERPROFILE%\Downloads\snes_hd_perf.txt`** (`SnesHdPerf.h`, header-only)
+- Jede Zeile trägt die **Uhrzeit** (`PERF 21:42:13 …`), damit „um 21:42 hat es geruckelt"
+  direkt auffindbar ist, und `t=` (Sekunden seit dem ersten Frame).
+- `PERF` — eine Zeile pro Sekunde, jeweils Mittel/Max:
+  `fps` · `over` (Frames, deren Arbeit > 16,64 ms) · `work` = emu + send ·
+  `emu` (CPU+PPU dieses Frames) · `scan` (davon RenderScanline) · `wait` (UpdateFrame wartet
+  auf den Filter) · `clear` (Pixelinfo löschen) · `sleep` (Limiter-Reserve) ·
+  `filter` gesamt mit `pre` (Kontext, Fingerprints, LUT) / `render` (Pixelschleife) /
+  `rec` (spritecap, bgcap, cgramcap, spritemiss, OAM) / `post` (Summen, Diagnose, Log) ·
+  Szenenlast `sprWon`, `sprHd`, `sprSub` · Kontext `sig`.
+- `SLOW` — eine Zeile pro Frame mit Arbeit > 20 ms (höchstens 6 pro Sekunde), mit seiner
+  Aufschlüsselung und der des zuletzt gefilterten Frames.
+- Immer an, solange ein HD-Pack aktiv ist (ein paar hundert Uhr-Abfragen pro Frame).
+  `SNES_HD_PERF=1` erzwingt es ohne Pack — für den A/B-Lauf mit HD aus.
+- Perioden ≥ 500 ms (Pause, Laden, Menü) werden nicht gezählt.
+
+**Lesart:** `over` > 0 und `wait` hoch → der **Filter** ist der Engpass (dann `filter` und
+seine Teile ansehen). `over` > 0 und `emu`/`scan` hoch, `wait` klein → die **Emulation bzw.
+HD-Erfassung** in der PPU. Periodische Spitzen in `emu` bei ruhigem `scan` → etwas außerhalb
+der PPU (z. B. Rewind-Zustände).
+
+Build-Kennung **S35**. Nur `.cpp` + neuer Header — inkrementeller Build reicht.
+
+
 ## [2026-09-09] — S28–S34: Rambi Rumble — die Kantenglättung greift
 
 **Ergebnis:** In Rambi Rumble blieb die Silhouette der Kongs hart, während sie in Mainbrace

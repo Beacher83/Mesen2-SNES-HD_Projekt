@@ -1208,6 +1208,33 @@ Mesen2 (unsere Fork-Basis) ist seit Juli 2025 eingefroren. Die Community hat unt
 
 ---
 
+### Sprite-Kantenglättung braucht eine Referenzpalette (belegt 2026-09-10)
+
+**Jede** Kantenmechanik für Sprites im Filter — Außensaum (S21), Untergrund unter weichen
+Texeln (S21), Sub-Screen-Untergrund (S26/S27) — ist an
+`GetSpriteRefPalette(hash) != nullptr` gebunden (`SnesHdVideoFilter.cpp`, S28-Notiz). Ohne
+Referenz mischt ein halbtransparenter Texel gegen die eigene SD-Farbe: **HD, aber hart**,
+egal wie weich die Kunst ist. Das Tor ist ein Stellvertreter für „Galerie-Kunst" (alte
+Laufzeit-Kunst von vor dem Kantenfix 05.08. hatte Schwarz in den Randtexeln).
+
+**Folge für jede neue Sprite-Kunst-Quelle:** der Pack-Export muss ihr eine Referenz in
+`sprite_palettes.bin` mitgeben, sonst gibt es keine Glättung. Gesehen am 10.09. an den
+Weltkarten-Köpfen (Namenskaskade fand keine Palette) und den HUD-Ziffern (Laufzeit-Kunst,
+Referenz per Veto entfernt) — beide HD, beide hart, beide nach Referenz im Spiel glatt.
+**Diagnose:** `SPRAREA … withRef=` im Diag-Log (Anteil der Sprite-Fläche mit Referenz) und
+je Kachel `art=1 ref=0`. Eine Referenz, die der Live-CGRAM-Zeile gleicht, ist harmlos:
+`HdSpriteRecolor::Init` setzt dann `valid=false`, die Umfärbung ist die Identität.
+
+### Performance-Messung (S35)
+
+`%USERPROFILE%\Downloads\snes_hd_perf.txt` — `PERF` je Sekunde, `SLOW` je Frame mit
+Arbeit > 20 ms, aufgeteilt in Emulation (`emu`, davon `scan`), Warten auf den Filter
+(`wait`), Pixelinfo-Löschen (`clear`) und die Filterteile (`pre`/`render`/`rec`/`post`).
+Die `ms=` der Diag-FRAME-Zeile misst dagegen **nur** die Pixelschleife und nur am
+Kontextanfang. Lesart: Mesen-`CHANGELOG.md`, Eintrag S35.
+
+---
+
 ### Allgemeine Hinweise
 
 - Scale factor is defined in `manifest.json` (currently hardcoded to 4 in loader)

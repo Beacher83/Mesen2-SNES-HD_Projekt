@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "SNES/HdPacks/SnesHdVideoFilter.h"
+#include "SNES/HdPacks/SnesHdPerf.h"
 #include "SNES/SnesConsole.h"
 #include "Shared/Emulator.h"
 #include "Shared/EmuSettings.h"
@@ -18,7 +19,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S34"
+#define SNES_HD_BUILD_VERSION "S36"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -2017,6 +2018,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	if(_frameData == nullptr) {
 		return;
 	}
+	// S35: start of the whole filter frame (see SnesHdPerf.h).
+	const SnesHdPerf::Clock::time_point perfT0 = SnesHdPerf::Clock::now();
 
 	SnesHdScreenInfo* hdScreen = (SnesHdScreenInfo*)_frameData;
 	uint32_t* outputBuffer = GetOutputBuffer();
@@ -2258,7 +2261,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	GetHdFilterPool().RunFrame(renderCtx, overscan.Top, 239 - overscan.Bottom, statsSlots, callerStats);
 	// R6.1: filter time for this frame — logged in the FRAME line (ms=cur/max).
 	// Budget is 16.7 ms; frames above it stall the emu thread (P4.1b wait).
-	double filterMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - filterT0).count();
+	const std::chrono::steady_clock::time_point perfRenderT1 = std::chrono::steady_clock::now();
+	double filterMs = std::chrono::duration<double, std::milli>(perfRenderT1 - filterT0).count();
 	if(filterMs > diagMsMax) {
 		diagMsMax = filterMs;
 	}
@@ -2515,6 +2519,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			DiagLog(line);
 		}
 	}
+
+	// S35: the recorders (spritecap, bgcap, cgramcap, spritemiss, OAM) run from
+	// here to the HDMA dump below — timed as one block, "rec" in snes_hd_perf.txt.
+	const SnesHdPerf::Clock::time_point perfRecT0 = SnesHdPerf::Clock::now();
 
 	// =====================================================================
 	// S5a: sprite capture recording. Every distinct (contentHash, palette)
@@ -2984,6 +2992,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		}
 	}
 
+	const SnesHdPerf::Clock::time_point perfRecT1 = SnesHdPerf::Clock::now();
+
 	// =====================================================================
 	// DIAGNOSTIC: Per-scanline HDMA dump (once per context, first BG frame)
 	// Shows scanline ranges where MainScreenLayers/Sub/CM/FixedColor change.
@@ -3179,5 +3189,24 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		snprintf(buf, sizeof(buf), "[SNES HD diag] Build version: " SNES_HD_BUILD_VERSION);
 		DiagLog(buf);
 		buildVersionLogged = true;
+	}
+
+	// S35: hand this frame's timing to the collector. pre = everything before the
+	// pixel loop (context detection, fingerprints, palette LUT), render = the loop,
+	// rec = the recorders, post = the rest (counter sums, diagnostics, log writes).
+	{
+		const SnesHdPerf::Clock::time_point perfT1 = SnesHdPerf::Clock::now();
+		SnesHdPerf::FilterFrame pf;
+		pf.Total = SnesHdPerf::Ms(perfT0, perfT1);
+		pf.Pre = SnesHdPerf::Ms(perfT0, filterT0);
+		pf.Render = filterMs;
+		pf.Rec = SnesHdPerf::Ms(perfRecT0, perfRecT1);
+		pf.Post = pf.Total - pf.Pre - pf.Render - pf.Rec;
+		pf.SprWon = frameSpriteWon;
+		pf.SprHd = frameSprHd;
+		pf.SprSub = frameSprSub;
+		pf.SprHdSub = frameSprSubHd;
+		pf.Sig = vramSig;
+		SnesHdPerf::AddFilterFrame(pf, SNES_HD_BUILD_VERSION);
 	}
 }
