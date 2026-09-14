@@ -18,9 +18,9 @@
 // Both sides feed this collector. The emulation thread writes one line per
 // second to %USERPROFILE%\Downloads\snes_hd_perf.txt, plus one SLOW line for
 // every frame whose work does not fit the frame, with that frame's breakdown and
-// the most recent filter frame's. Always on while an HD pack is active (a few
-// hundred clock reads per frame); SNES_HD_PERF=1 forces it on without a pack,
-// for an A/B run with HD disabled.
+// the most recent filter frame's. Off by default since S38 --
+// SNES_HD_PERF=1 turns it on, with or without a pack, which is also how the A/B
+// run against a disabled pack is made.
 // ---------------------------------------------------------------------------
 #include <chrono>
 #include <mutex>
@@ -102,10 +102,16 @@ namespace SnesHdPerf
 		return s;
 	}
 
-	inline bool Forced()
+	// S38: off unless asked for. The collector answered its question -- the stutter
+	// was the display, not the emulation (see the S35/S36 notes) -- and leaving it on
+	// costs a clock read per scanline plus a mutex and a file write per frame in every
+	// session, for a number nobody reads. It stays in the build: the next performance
+	// question then gets an answer in one run instead of being argued about.
+	//     set SNES_HD_PERF=1
+	inline bool Enabled()
 	{
-		static const bool forced = getenv("SNES_HD_PERF") != nullptr;
-		return forced;
+		static const bool enabled = getenv("SNES_HD_PERF") != nullptr;
+		return enabled;
 	}
 
 	// Caller holds the lock.

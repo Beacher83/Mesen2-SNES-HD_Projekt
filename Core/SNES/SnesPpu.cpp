@@ -424,9 +424,15 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
 	if(hClock >= 1364 || (hClock == 1360 && _scanline == 240 && _oddFrame && !_state.ScreenInterlace)) {
 		//"In non-interlace mode scanline 240 of every other frame (those with $213f.7=1) is only 1360 cycles."
 		if(_scanline < _vblankStartScanline) {
-			const SnesHdPerf::Clock::time_point perfScan0 = SnesHdPerf::Clock::now();
+			// S38: the only per-SCANLINE clock reads in the build -- skipped entirely
+			// unless the measurement is switched on.
+			const bool perfOn = SnesHdPerf::Enabled();
+			const SnesHdPerf::Clock::time_point perfScan0 =
+				perfOn ? SnesHdPerf::Clock::now() : SnesHdPerf::Clock::time_point{};
 			RenderScanline();
-			s_perfScanMs += SnesHdPerf::Ms(perfScan0, SnesHdPerf::Clock::now());
+			if(perfOn) {
+				s_perfScanMs += SnesHdPerf::Ms(perfScan0, SnesHdPerf::Clock::now());
+			}
 
 			if(_scanline == 0) {
 				_overscanFrame = _state.OverscanMode;
@@ -540,7 +546,7 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
 			// this frame; sleep = what the limiter still had to wait. A period of
 			// half a second or more is a pause, a load or a menu, not a stutter.
 			const SnesHdPerf::Clock::time_point perfEnd = SnesHdPerf::Clock::now();
-			if(s_perfHaveLast && (_hdData || SnesHdPerf::Forced())) {
+			if(s_perfHaveLast && SnesHdPerf::Enabled()) {
 				SnesHdPerf::EmuFrame pe;
 				pe.Period = SnesHdPerf::Ms(s_perfLastEnd, perfEnd);
 				pe.Emu = SnesHdPerf::Ms(s_perfLastEnd, perfSend0);
@@ -1954,10 +1960,13 @@ void SnesPpu::SendFrame()
 
 	// S35: UpdateFrame spins until the decode thread has finished the previous
 	// frame — the time the emulation thread loses to the HD filter.
-	const SnesHdPerf::Clock::time_point perfUpd0 = SnesHdPerf::Clock::now();
+	const bool perfOn = SnesHdPerf::Enabled();
+	const SnesHdPerf::Clock::time_point perfUpd0 =
+		perfOn ? SnesHdPerf::Clock::now() : SnesHdPerf::Clock::time_point{};
 	_emu->GetVideoDecoder()->UpdateFrame(frame, isRewinding, isRewinding);
-	const SnesHdPerf::Clock::time_point perfUpd1 = SnesHdPerf::Clock::now();
-	s_perfWaitMs = SnesHdPerf::Ms(perfUpd0, perfUpd1);
+	const SnesHdPerf::Clock::time_point perfUpd1 =
+		perfOn ? SnesHdPerf::Clock::now() : SnesHdPerf::Clock::time_point{};
+	if(perfOn) s_perfWaitMs = SnesHdPerf::Ms(perfUpd0, perfUpd1);
 
 	// Clear next frame's screen info AFTER UpdateFrame: the buffer being cleared
 	// was attached to the PREVIOUS frame, and the async HD filter may still be
@@ -1969,7 +1978,7 @@ void SnesPpu::SendFrame()
 	if(_hdData) {
 		memset(_hdActiveScreen->ScreenTiles, 0, sizeof(SnesHdPpuPixelInfo) * SnesHdScreenInfo::ScreenPixelCount);
 		memset(_hdActiveScreen->ScanlineInfo, 0, sizeof(SnesHdScanlineInfo) * SnesHdScreenInfo::ScreenHeight);
-		s_perfClearMs = SnesHdPerf::Ms(perfUpd1, SnesHdPerf::Clock::now());
+		if(perfOn) s_perfClearMs = SnesHdPerf::Ms(perfUpd1, SnesHdPerf::Clock::now());
 	}
 
 	if(!_skipRender) {

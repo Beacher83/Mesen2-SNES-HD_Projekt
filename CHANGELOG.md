@@ -21,6 +21,36 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-14] — S38: die Messung aus dem Standardpfad nehmen
+
+Die Frage, für die S35/S36 gebaut wurden, ist beantwortet: das Ruckeln war die Bildausgabe
+(60,0988 fps gegen 60 Hz ohne VSync), nicht die Emulation und nicht der HD-Pack. Damit gibt es
+keinen Grund mehr, in jeder Sitzung mitzumessen.
+
+**`SnesHdPerf::Forced()` → `SnesHdPerf::Enabled()`, Standard AUS.** Vorher lief die Messung,
+sobald ein HD-Pack aktiv war, und `SNES_HD_PERF=1` erzwang sie zusätzlich ohne Pack. Jetzt ist
+die Umgebungsvariable der einzige Schalter — mit oder ohne Pack, womit auch der A/B-Lauf gegen
+einen abgeschalteten Pack weiter funktioniert.
+
+Gegatet ist alles, was etwas kostet:
+- **Die Uhr-Abfragen je SCANLINE** in `ProcessEndOfScanline` — die einzigen im Build, 224 Zeilen
+  × 2 pro Frame. Ohne Schalter wird `RenderScanline()` wieder nackt aufgerufen.
+- `SendFrame`: die Wartezeit auf den Decoder und das 16-MB-Clear.
+- `AddEmuFrame` (Mutex + Dateischreiben je Frame) und `AddFilterFrame` im Filter.
+
+**Der Code bleibt im Build.** Die nächste Performance-Frage bekommt damit in einem Lauf eine
+Antwort, statt wieder diskutiert zu werden — und die Lesart steht in den Einträgen S35/S36.
+
+Die Recorder (`spritecap`, `bgcap`, `spritemiss`) bleiben unverändert an: sie sind seit
+2026-08-10 fertig — `SeedRecorderSet()` liest sie ein und hängt nur neue Schlüssel an, es ist
+nichts Neues mehr aufgetaucht — und sollen weiterlaufen, solange noch nicht jedes Level im
+Detail geprüft ist.
+
+Build-Kennung **S38**. `SnesHdPerf.h`, `SnesPpu.cpp`, `SnesHdVideoFilter.cpp` — inkrementeller
+Build reicht.
+
+---
+
 ## [2026-09-14] — S37: der Untergrund, den nur die Sprites hatten — jetzt auch für BG-Kacheln
 
 **Anlass (User):** In Mainbrace Mayhem sind die BG1-Level-Kacheln an den **Rändern** pixelig,

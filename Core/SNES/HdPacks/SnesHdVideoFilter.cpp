@@ -19,7 +19,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S37"
+#define SNES_HD_BUILD_VERSION "S38"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -3264,7 +3264,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// S35: hand this frame's timing to the collector. pre = everything before the
 	// pixel loop (context detection, fingerprints, palette LUT), render = the loop,
 	// rec = the recorders, post = the rest (counter sums, diagnostics, log writes).
-	{
+	if(SnesHdPerf::Enabled()) {
 		const SnesHdPerf::Clock::time_point perfT1 = SnesHdPerf::Clock::now();
 		SnesHdPerf::FilterFrame pf;
 		pf.Total = SnesHdPerf::Ms(perfT0, perfT1);
