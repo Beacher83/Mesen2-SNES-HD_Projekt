@@ -21,6 +21,70 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-14] — S37: der Untergrund, den nur die Sprites hatten — jetzt auch für BG-Kacheln
+
+**Anlass (User):** In Mainbrace Mayhem sind die BG1-Level-Kacheln an den **Rändern** pixelig,
+obwohl geglättete HD-Kunst für alle Ebenen im Pack liegt und nichts in SD gezeichnet wird.
+Für die BG1-HD-Kacheln war bis hierher **keine Glättung aktiv** — S21–S34 haben ausschließlich
+Sprite-Silhouetten behandelt.
+
+### Levelaufbau — aus der Disassembly, `bank_FD.asm`, `DATA_FD7AB6`
+```
+$212C = $04   MAIN: nur BG3 (der Nebel)
+$212D = $13   SUB:  BG1 + BG2 + OBJ  (Level-Geometrie, Hintergrund, Kongs)
+$210B = $0642 BG1 chr = $2000, BG2 chr = $4000   (normal — Rambi hat $0725, vertauscht)
+$2130 = $02   Sub-Screen ist der zweite Color-Math-Operand
+$2131 = $24   ADD, keine Halbierung
+```
+**BG1 ist die Level-Geometrie und liegt auf dem Sub-Screen** — sie kommt ausschließlich als
+Color-Math-Operand ins Bild. Deckt sich mit `SNES_HD_PACK_PROJECT.md` („Belegte Profile") und
+dem S34-Eintrag.
+
+### Root Cause
+Im Sub-Operanden-Pfad (`SnesHdVideoFilter.cpp:1929-1976`) startet der Operand `oR/oG/oB` als
+**native Sub-Screen-Farbe**. Ein voll deckendes HD-Texel nimmt den Schnellpfad; ein
+**halbtransparentes** wird über `oR/oG/oB` gemischt, davor optional der `subBotSampler`.
+
+`subTileBot` wurde aber **nur im Sprite-Zweig** gesetzt (Zuweisungen bei 1294 und 1334, beide
+tief in dem `} else {` ab 1225). Der BG-Zweig `} else if(!pixelInfo.SubScreenHasSprite) {`
+(1208–1224) hat ihn nie gesetzt — der Kommentar bei 1944 sagt es selbst: *„Invalid for every
+case but a sub-screen sprite."*
+
+Für eine BG1-Kachel blieb `subBotSampler` also ungültig, und ein halbtransparentes Texel wurde
+gegen die native SD-Farbe **desselben Pixels** gemischt — BG1s eigene Farbe. **Kunst mit sich
+selbst gemischt kann keine weiche Kante zeigen:** die Silhouette folgt der SD-8×8-Maske und
+wird bei 4× zur Treppe. Wörtlich dieselbe Wand, die S21 im Main-Pfad und S26 für
+Sub-Screen-Sprites eingerissen hat — für BG-Kacheln stand sie noch.
+
+### Fix
+Der BG-Operand bekommt dieselbe Untergrundsuche wie der Sprite-Operand in S26:
+- Schleife über die BG-Ebenen, die **auf dem Sub-Screen** liegen und an diesem Pixel Inhalt
+  haben, eigene Ebene übersprungen. `sLayer` **ist** der Sub-Screen-Gewinner, also hat jede
+  andere dort vorhandene Ebene gegen ihn verloren und liegt hinter ihm — es muss keine
+  Prioritätsordnung nachgebaut werden.
+- **Mit dem S34-Retry BG1↔BG2**, aus demselben Grund wie dort: bei vertauschten chr-Basen
+  liegt die Kunst im Pack unter dem anderen Layer-Index, und die strenge Abfrage findet nichts,
+  obwohl der Pack vollständig ist.
+- Findet die Suche nichts und liegt überhaupt keine BG-Ebene dahinter, gibt der Sub-Screen dort
+  den **Backdrop** aus — das ist dann der Grund, in den die weiche Kante ausläuft (Logik von S32,
+  dort für Sprites hergeleitet).
+- Voll deckende Kacheln werden übersprungen: sie haben keine Kante zu glätten.
+
+**Die Sprite-Pfade sind unberührt.**
+
+### Neue Zähler in der FRAME-Zeile
+`bgBot` (BG-Operand hat einen Untergrund bekommen) · `bgBotRetry` (davon nur über den
+BG1↔BG2-Retry gefunden) · `bgNoBot` (transparente Kachel, kein Untergrund gefunden) ·
+`bgOpaque` (Kachel voll deckend — der ehrliche Nenner, massives Terrain braucht keinen Grund).
+
+### A/B
+`set SNES_HD_NO_SUB_BG_UNDER=1` stellt das Verhalten bis S36 wieder her (Texel mischt mit der
+eigenen SD-Farbe). Batch: `bin\win-x64\Release\TEST_S37_ohne_BG_Untergrund.bat`.
+
+Build-Kennung **S37**. Nur `SnesHdVideoFilter.cpp` — inkrementeller Build reicht.
+
+---
+
 ## [2026-09-14] — Test I ausgewertet: der Emulator liefert jeden Frame pünktlich
 
 **Drei Läufe am 14.09., je ~2,5 min, Mainbrace Mayhem dann Lockjaw's Locker, Build S36.**

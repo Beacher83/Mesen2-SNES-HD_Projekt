@@ -19,7 +19,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S36"
+#define SNES_HD_BUILD_VERSION "S37"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -715,6 +715,10 @@ static const bool s_noSubSprUnder = getenv("SNES_HD_NO_SUB_SPRITE_UNDER") != nul
 // On by default; this turns it off for an A/B run:
 //     set SNES_HD_NO_BACKDROP_GROUND=1
 static const bool s_noBackdropGround = getenv("SNES_HD_NO_BACKDROP_GROUND") != nullptr;
+// S37 A/B: do not give a sub-screen BG operand a ground, i.e. keep the behaviour up to
+// S36 where a semi-transparent texel of a BG tile mixed with that tile's own SD colour:
+//     set SNES_HD_NO_SUB_BG_UNDER=1
+static const bool s_noSubBgUnder = getenv("SNES_HD_NO_SUB_BG_UNDER") != nullptr;
 // How many GAMEPLAY frames per context are logged.
 // S29 raised this from a hard-wired 60 to an environment variable, because 60 --
 // one second -- was never a measurement of a level, it was a measurement of
@@ -782,6 +786,10 @@ struct HdFilterFrameStats
 	uint32_t SubNoBotEmpty = 0; // S33: of SubSprNoBot -- no BG layer on the sub screen at all
 	uint32_t SubNoBotNoHd = 0;  // S33: of SubSprNoBot -- a BG IS there, it just has no HD art
 	uint32_t SubBotRetry = 0;   // S34: ground found only via the BG1<->BG2 layer-agnostic retry
+	uint32_t SubBgBot = 0;      // S37: sub-screen BG operand given a ground to blend against
+	uint32_t SubBgBotRetry = 0; // S37: of those, found only via the BG1<->BG2 retry
+	uint32_t SubBgNoBot = 0;    // S37: transparent BG operand, no ground found on the sub screen
+	uint32_t SubBgOpaque = 0;   // S37: BG operand tile is fully opaque -- it has no edge to soften
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -818,6 +826,10 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SubNoBotEmpty += src.SubNoBotEmpty;
 	dst.SubNoBotNoHd += src.SubNoBotNoHd;
 	dst.SubBotRetry += src.SubBotRetry;
+	dst.SubBgBot += src.SubBgBot;
+	dst.SubBgBotRetry += src.SubBgBotRetry;
+	dst.SubBgNoBot += src.SubBgNoBot;
+	dst.SubBgOpaque += src.SubBgOpaque;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -1220,6 +1232,57 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								subTileInfo = &pixelInfo.BgTiles[sLayer];
 								st.SubOpHd++;
 								if(!hdTile) st.MainNatHd++;
+
+								// S37: give the BG operand the ground the sub-screen SPRITE
+								// got in S26. Until now `subTileBot` was set only in the
+								// sprite branch below, so a semi-transparent texel of a BG
+								// tile was blended against nsR/nsG/nsB -- the native
+								// sub-screen colour, which at a BG pixel IS that same tile's
+								// own SD colour. Art mixed with itself cannot show a soft
+								// edge, so the level geometry kept its native 8x8 silhouette
+								// and went stair-stepped at 4x. Mainbrace carries its terrain
+								// (BG1) on the sub screen (DATA_FD7AB6: Main=$04, Sub=$13),
+								// which is where the user saw it.
+								if(!subTile->HasTransparentPixels) {
+									st.SubBgOpaque++;
+								} else if(!s_noSubBgUnder) {
+									bool anyBgBehind = false;
+									for(int layer = 0; layer < 4 && !subTileBot; layer++) {
+										if(layer == sLayer) continue;
+										if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
+										if(!(sl.SubScreenLayers & (1 << layer))) continue;
+										// `sLayer` IS the sub-screen winner, so any other layer
+										// still present on that screen lost to it and is behind
+										// it -- no priority order has to be rebuilt here.
+										anyBgBehind = true;
+										SnesHdPackTileInfo* below = CachedGetMatchingTile(hdData,
+											hdScreen->Vram, tileLookupCache, pixelInfo.BgTiles[layer].Key);
+										// S34's BG1<->BG2 retry, needed here for its reason:
+										// with swapped chr bases the art sits in the pack under
+										// the other layer index, and a strict lookup finds
+										// nothing while the pack is complete.
+										if(!below && layer <= 1) {
+											SnesHdTileKey altKey = pixelInfo.BgTiles[layer].Key;
+											altKey.LayerIndex = layer ^ 1;
+											below = CachedGetMatchingTile(hdData, hdScreen->Vram,
+												tileLookupCache, altKey);
+											if(below) st.SubBgBotRetry++;
+										}
+										if(below) {
+											subTileBot = below;
+											subTileInfoBot = &pixelInfo.BgTiles[layer];
+											st.SubBgBot++;
+										}
+									}
+									if(!subTileBot) {
+										st.SubBgNoBot++;
+										// Nothing behind it on the sub screen: the sub screen
+										// outputs the BACKDROP at this pixel, so that is what
+										// the soft edge has to fade into. Same reasoning as S32,
+										// which reached this conclusion for sprites.
+										if(!anyBgBehind) subGroundIsBackdrop = !s_noBackdropGround;
+									}
+								}
 							}
 						}
 					} else {
@@ -2296,6 +2359,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSprEdgeBlend = total.SprEdgeBlend;
 	uint32_t frameSprEdgeUnder = total.SprEdgeUnder;
 	uint32_t frameSprEdgeTie = total.SprEdgeTie;
+	uint32_t frameSubBgBot = total.SubBgBot;
+	uint32_t frameSubBgBotRetry = total.SubBgBotRetry;
+	uint32_t frameSubBgNoBot = total.SubBgNoBot;
+	uint32_t frameSubBgOpaque = total.SubBgOpaque;
 	uint32_t frameSubSprBot = total.SubSprBot;
 	uint32_t frameSubSprUnder = total.SubSprUnder;
 	uint32_t frameSubSprNoBot = total.SubSprNoBot;
@@ -2384,6 +2451,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
 			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
 			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u subBot=%u subSprUnder=%u subNoBot=%u sprHoleHd=%u subNoRef=%u subOpaque=%u nbEmpty=%u nbNoHd=%u subBotRetry=%u"
+			" bgBot=%u bgBotRetry=%u bgNoBot=%u bgOpaque=%u"
 			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
@@ -2397,7 +2465,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameSprRecolor, frameSprRecolorNoRef,
 			frameSprEdge, frameSprEdgeBlend, frameSprEdgeUnder,
 			frameSprEdgeTie, frameSubSprBot,
-			frameSubSprUnder, frameSubSprNoBot, frameSprHoleHd, frameSubGateNoRef, frameSubGateOpaque, frameSubNoBotEmpty, frameSubNoBotNoHd, frameSubBotRetry, frameMaskZero, frameHdmaSplit,
+			frameSubSprUnder, frameSubSprNoBot, frameSprHoleHd, frameSubGateNoRef, frameSubGateOpaque, frameSubNoBotEmpty, frameSubNoBotNoHd, frameSubBotRetry,
+			frameSubBgBot, frameSubBgBotRetry, frameSubBgNoBot, frameSubBgOpaque,
+			frameMaskZero, frameHdmaSplit,
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
