@@ -19,7 +19,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S38"
+#define SNES_HD_BUILD_VERSION "S39"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -2715,7 +2715,6 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 						^ ((uint64_t)t.Key.PaletteIndex * 0x9E3779B97F4A7C15ULL)
 						^ ((uint64_t)layer * 0xC2B2AE3D27D4EB4FULL);
 					if(s_bgCapSeen.find(seenKey) != s_bgCapSeen.end()) continue;
-					s_bgCapSeen.insert(seenKey);
 					// S14: ask the RENDER PATH whether this tile is covered, not the
 					// raw map. SnesHdTileKey carries no gfxset — that lives on the
 					// tile and is applied by GetMatchingTile's strict scoping — so a
@@ -2723,23 +2722,24 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					// current context blocks it and the screen shows plain SD. Those
 					// tiles were invisible here: present in the pack, never matched,
 					// never recorded. The sprite recorder below already does this.
-					if(_hdData->GetMatchingTile(t.Key, hdScreen->Vram)) continue;  // covered
+					// S39: memo a COVERED tile here. See the sprite recorder below for
+					// why the key must not enter the set before the seeding step.
+					if(_hdData->GetMatchingTile(t.Key, hdScreen->Vram)) { s_bgCapSeen.insert(seenKey); continue; }  // covered
 
 					// Verify live VRAM still matches the captured hash (2bpp
-					// layers hash 8 words, 4bpp 16 words — same as the PPU)
+					// layers hash 8 words, 4bpp 16 words — same as the PPU).
+					// Not memoed: a later frame must look at it again.
 					const uint16_t words = (layer <= 1) ? 16 : 8;
-					if(ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, words) != t.Key.ContentHash) {
-						s_bgCapSeen.erase(seenKey);  // retry on a later frame
-						continue;
-					}
+					if(ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, words) != t.Key.ContentHash) continue;
 
 					if(!s_bgCapAttempted) {
 						s_bgCapAttempted = true;
 						SeedRecorderSet("snes_hd_bgcap.txt", s_bgCapSeen, ParseBgCapKey);
-						if(s_bgCapSeen.find(seenKey) != s_bgCapSeen.end()) continue;   // earlier session had it
 						s_bgCapFile = OpenRecorder("snes_hd_bgcap.txt");
 					}
 					if(!s_bgCapFile) break;
+					if(s_bgCapSeen.find(seenKey) != s_bgCapSeen.end()) continue;   // earlier session had it
+					s_bgCapSeen.insert(seenKey);
 
 					char line[320];
 					int off = snprintf(line, sizeof(line), "BGA G%d L%d P%d A%04X H%016llX T",
@@ -2888,20 +2888,33 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 					^ ((uint64_t)t.Key.PaletteIndex * 0x9E3779B97F4A7C15ULL)
 					^ ((uint64_t)s * 0xC2B2AE3D27D4EB4FULL);
 				if(s_sprMissSeen.find(missKey) != s_sprMissSeen.end()) continue;
-				s_sprMissSeen.insert(missKey);
-				if(_hdData->GetMatchingTile(t.Key)) continue;  // covered → not a miss
-				if(ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, 16) != t.Key.ContentHash) {
-					s_sprMissSeen.erase(missKey);  // stale (OBJ stream) → retry later
-					continue;
-				}
+				// S39: memo COVERED tiles here, not before the check. The old order
+				// inserted the key first and then asked, after seeding, whether the
+				// set already contained it — it always did, because that was our own
+				// entry. So the "earlier session had it" branch fired on the very
+				// first miss, OpenRecorder was never reached, and every later tile hit
+				// the `!s_sprMissFile` break. This recorder and bgcap have been dead
+				// since SeedRecorderSet was added on 10 Aug 2026; only spritecap
+				// survived, because it inserts AFTER the open. The files stopped
+				// growing that day, which the comment further down took for
+				// saturation — it was this.
+				if(_hdData->GetMatchingTile(t.Key)) { s_sprMissSeen.insert(missKey); continue; }  // covered → not a miss
+				// Stale (OBJ stream replaced the bytes mid-frame): do NOT memo, so a
+				// later frame looks at it again. Replaces the old insert/erase pair.
+				if(ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, 16) != t.Key.ContentHash) continue;
 
+				// Seed and open on the first real miss, while missKey is still absent
+				// from the set. The open no longer depends on the seed's answer: a
+				// first miss that an earlier session had already logged used to leave
+				// the file closed for the whole run.
 				if(!s_sprMissAttempted) {
-						s_sprMissAttempted = true;
-						SeedRecorderSet("snes_hd_spritemiss.txt", s_sprMissSeen, ParseSprMissKey);
-						if(s_sprMissSeen.find(missKey) != s_sprMissSeen.end()) continue;   // earlier session had it
-						s_sprMissFile = OpenRecorder("snes_hd_spritemiss.txt");
-					}
+					s_sprMissAttempted = true;
+					SeedRecorderSet("snes_hd_spritemiss.txt", s_sprMissSeen, ParseSprMissKey);
+					s_sprMissFile = OpenRecorder("snes_hd_spritemiss.txt");
+				}
 				if(!s_sprMissFile) break;
+				if(s_sprMissSeen.find(missKey) != s_sprMissSeen.end()) continue;   // earlier session had it
+				s_sprMissSeen.insert(missKey);
 
 				char line[320];
 				int off = snprintf(line, sizeof(line), "SPRMISS %c P%d O%d G%d H%016llX T",
@@ -2943,6 +2956,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// torch one frame per phase. Tile CONTENT still comes from spritemiss, which
 	// is why only the tile number is written here.
 	// =====================================================================
+	// S39 NOTE: the sentence below about bgcap and spritemiss having "saturated back
+	// on 10 Aug" was wrong. They stopped because SeedRecorderSet, added that day, was
+	// consulted AFTER the tile's own key had been inserted — see the fix above. Their
+	// keys really are per tile and finite, so they will saturate eventually; they had
+	// simply never been given the chance.
 	// S27: OFF by default (08 Sep). This recorder de-duplicates on an object's
 	// COMPOSITION, and a composition is "which objects stand where" — so almost every
 	// frame with a slightly different sprite arrangement counts as new material. Over
