@@ -19,7 +19,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S41"
+#define SNES_HD_BUILD_VERSION "S43"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -252,6 +252,8 @@ static void WriteSessionBanner(FILE* f, const char* what)
 		"SNES_HD_OAMCAP",
 		"SNES_HD_DIAG_FRAMES",
 		"SNES_HD_NO_BACKDROP_GROUND",
+		"SNES_HD_NO_SUB_BG_UNDER",
+		"SNES_HD_SPRWATCH",
 	};
 	char active[512];
 	active[0] = 0;
@@ -719,6 +721,37 @@ static const bool s_noBackdropGround = getenv("SNES_HD_NO_BACKDROP_GROUND") != n
 // S36 where a semi-transparent texel of a BG tile mixed with that tile's own SD colour:
 //     set SNES_HD_NO_SUB_BG_UNDER=1
 static const bool s_noSubBgUnder = getenv("SNES_HD_NO_SUB_BG_UNDER") != nullptr;
+// S43: the reference-palette gate is GONE from all three edge paths.
+//
+// S21 (2756fa1c, 12 Aug) made every edge path conditional on the tile shipping a
+// reference palette, and said plainly that this is an ORIGIN test, not a colour
+// one: runtime-captured tiles are grabbed off the live screen with background
+// baked into their border texels, the export drops their reference for that
+// reason, and extending them outwards smeared that background in -- washed-out
+// world map objects on the first test run.
+//
+// That premise no longer holds, and both halves of it were measured on 21 Sep
+// with SNES_HD_EDGE_IGNORE_REF (S42), an A/B pair on the same day:
+//
+//   * The world map is the case the gate was built for. In August the fringe
+//     covered 898,087 sub-pixels per frame -- 97.9% of a 4x screen -- and washed
+//     the objects out. With the gate bypassed it now draws 5,643 per frame,
+//     0.6%, a factor of 159 less, and the user reports the objects look clean.
+//     The test was not vacuous: SPRAREA puts only 33.1% / 51.9% of the sprite
+//     area in those contexts behind a reference, so the switch really did
+//     unlock half to two thirds of the art there.
+//
+//   * The Kleever sword splinters are the first object that reached the pack
+//     entirely through the runtime category: 158 tiles, not one with a
+//     reference, so the gate switched their smoothing off no matter how the art
+//     was made. SPRWATCH over 705 frames: 43,638 fringe pixels -- 2.7x their own
+//     silhouette -- and the pack answers 100% of them, on all three slots.
+//
+// What remains is the ordinary escape hatch, unchanged:
+//     set SNES_HD_NO_SPRITE_EDGES=1
+// Runtime art whose border texels really do carry baked-in background is a
+// pipeline problem and belongs to the export, not to a per-pixel test that
+// cannot tell the two apart.
 // How many GAMEPLAY frames per context are logged.
 // S29 raised this from a hard-wired 60 to an environment variable, because 60 --
 // one second -- was never a measurement of a level, it was a measurement of
@@ -1323,9 +1356,10 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							// lies behind it ON THE SUB SCREEN: same reasoning as S21b's
 							// MainScreenLayers gate, mirrored to $212D, because here it is
 							// the sub screen that composites the character.
-							// Reference-palette gate as everywhere: runtime-captured art
-							// carries background in its border texels (S21).
-							// S31: WHY the gate refuses, counted separately. Until now the
+							// S43: the reference-palette gate that used to stand here is
+							// gone; the counters below stay, because they are the only
+							// per-pixel reading of how much art is baked per palette slot.
+							// S31: WHY the gate refused, counted separately. Until then the
 							// only reference counters were SprRecolor/SprRecolorNoRef, and
 							// both hang off the MAIN-screen sprite path -- where sprWon is 0
 							// in every overlay level. They read 0/0 in Mainbrace too, where
@@ -1338,8 +1372,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							} else if(!subHasRef) {
 								st.SubGateNoRef++;
 							}
-							if(!s_noSpriteEdges && !s_noSubUnder && subSprTile->HasTransparentPixels
-								&& subHasRef) {
+							if(!s_noSpriteEdges && !s_noSubUnder && subSprTile->HasTransparentPixels) {
 								// S27: when a second sprite lies under this one, THAT is the
 								// ground, not the background — the Kongs one behind the other
 								// under water, which the user reported on 08 Sep as the one
@@ -1556,8 +1589,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					// sprite arrives as slot 3 and the existing blend does the rest.
 					// No BG fallback in that case on purpose: the BG is the known-wrong
 					// backdrop, and a hard edge beats showing it through a character.
-					if(!s_noSpriteEdges && hdTile->HasTransparentPixels && !hdTileBot
-						&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[0].Key.ContentHash) != nullptr) {
+					if(!s_noSpriteEdges && hdTile->HasTransparentPixels && !hdTileBot) {
 						if((pixelInfo.SpriteCount & 0x08) && !s_noSpriteUnder) {
 							SnesHdPackTileInfo* under = CachedGetMatchingTile(hdData, hdScreen->Vram,
 								tileLookupCache, pixelInfo.Sprites[3].Key);
@@ -1699,7 +1731,6 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			// it did.
 			if(!s_noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && !spriteWon
 				&& pixelInfo.Sprites[2].Key.ContentHash != 0
-				&& hdData->GetSpriteRefPalette(pixelInfo.Sprites[2].Key.ContentHash) != nullptr
 				&& pixelInfo.Sprites[2].Priority > (pixelInfo.MainScreenFlags & 0x0F)) {
 				edgeTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache,
 					pixelInfo.Sprites[2].Key);
@@ -2544,14 +2575,17 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 	// =====================================================================
 	// S28: which sprite art actually covers the screen, and does it carry a
-	// reference palette? Every edge mechanism -- the fringe (S21), the bottom layer
-	// under a soft texel (S21), and the sub-screen ground (S26/S27) -- is gated on
-	// `GetSpriteRefPalette(...) != nullptr`. That gate is deliberate: runtime-captured
-	// art has background baked into its border texels and smears when extended. But
-	// it means a level whose art shipped without references gets no smoothing at all,
-	// and the per-pixel counters (sprHd vs sprNoRef) can say THAT while not saying
-	// WHICH tiles. This does: pixels per tile, largest first, with the reference and
-	// pack status of each. Accumulates over a context, logs once.
+	// reference palette? Pixels per tile, largest first, with the reference and pack
+	// status of each. Accumulates over a context, logs once.
+	//
+	// S43 changed what this measures. It was built when every edge mechanism was
+	// gated on `GetSpriteRefPalette(...) != nullptr`, to name the tiles a level was
+	// losing its smoothing on -- and it did that job: it is what showed that only
+	// 33.1% / 51.9% of the sprite area in the world map contexts sat behind a
+	// reference, which is why bypassing the gate there was a real test and not a
+	// vacuous one. The gate is gone now, so `ref=` no longer decides whether a tile
+	// is smoothed. It still says whether the tile follows the live CGRAM row or is
+	// baked for one palette slot, which is what the recolor path turns on.
 	// =====================================================================
 	if(diagBgFrameCount >= (s_diagFrames * 3 / 4) && !diagSprAreaLogged && !diagSprAreaPx.empty()) {
 		diagSprAreaLogged = true;

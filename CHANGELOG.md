@@ -21,6 +21,142 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-21] — S42/S43: der Herkunfts-Gate der Kantenglättung ist gemessen und entfernt
+
+**Beobachtung:** die Kleever-Schwertsplitter sind nach dem Upscale in HD im Spiel, aber ohne
+sichtbare Kantenglättung.
+
+**Die Kunst ist es nicht.** Die Kette einmal auf derselben Menge gezählt:
+
+| Stufe | weiche Texel (Alpha 1–247) |
+|---|---|
+| Upscale-Ausgabe `..._hd4x_edge.zip` | 1,9 % aller Texel, 0,49 je deckendem Texel |
+| Installierter Pack, dieselben Kacheln | 14,4 % der Kachelfläche, 0,38 je deckendem |
+| 400 zufällige andere Sprite-Kacheln | 0,18 je deckendem |
+
+Gegen die SD-Quelle aufgeteilt (158 Bildpaare): **27.867 weiche Texel, 75,7 % innerhalb der
+nativen Silhouette, 24,3 % außerhalb.**
+
+**Die Ursache ist ein Gate.** Von den 1.159 Kacheln, die seit dem Pack vom 18.09. neu sind,
+haben **162 keine Referenzpalette — und alle 18 Splitter-Objektpräfixe sind darunter**
+(im übrigen Pack: 1,4 %). An `GetSpriteRefPalette(...) != nullptr` hängen aber **alle drei**
+Glättungspfade: der Untergrund im Main-Pfad (S21/S22), der Untergrund im Sub-Pfad (S26/S27)
+und der Fransen-Slot 2 (S21/S23). Für Laufzeit-Kunst ist die Kantenglättung damit dauerhaft
+abgeschaltet, und die Splitter sind der erste Gegenstand, der komplett über die
+Laufzeit-Kategorie in den Pack kam.
+
+Das ist kein Versehen. S21 (`2756fa1c`, 12.08.) sagt ausdrücklich:
+
+> Both halves are limited to art that ships a reference palette. **That is an origin test, not
+> a colour one:** runtime-captured tiles are grabbed off the live screen with background baked
+> into their border texels […] Extending those outwards smeared that background in — visible
+> as washed-out world map objects on the first test run.
+
+**Warum die Prämisse neu zu prüfen ist:** hätten die Splitter eingebackenen Hintergrund in den
+Randtexeln, wäre ihre SD-Silhouette nahezu deckend — dann könnten nicht 24,3 % der weichen
+Texel *außerhalb* davon liegen. Die Laufzeit-Erfassung hat sich seit dem 12.08. geändert
+(OAM-Layout, geprüfter Export: 158 Objekte, 158 distinkte Kacheln, keine fremde Kunst).
+
+**S42** führte `SNES_HD_EDGE_IGNORE_REF=1` ein, um den Gate an allen drei Stellen zu umgehen.
+**S43 entfernt ihn ganz.** Zwei A/B-Läufe am 21.09. haben beide Hälften der Prämisse geprüft.
+
+### Lauf 1 (09:04 Referenz ohne Schalter, 11.658 Frames / 09:36 mit Schalter, 17.482 Frames)
+
+Reichweite: **56,2 % der gesamten Sprite-Fläche** des Laufs hat keine Referenzpalette.
+Gemischte Fransen-Subpixel pro Frame, nach Registerprofil:
+
+| Kontext | Frames A/B | Franse S41 → S42 | Faktor |
+|---|---|---|---|
+| `$13/$14/$23` | 707/1199 | 644 → 7.725 | ×12 |
+| `$13/$04/$23` | 3/606 | 83 → 6.990 | ×84 |
+| `$11/$00/$00` (Weltkartenprofil) | 606/1246 | 1.254 → 5.260 | ×4,2 |
+| `WORLDMAP $11/$00/$00` | 0/772 | — → 5.643 | nur S42 |
+| `$17/$00/$07` | 8990/9738 | 1.326 → 1.365 | ×1,03 |
+
+**Die Weltkarte ist der Fall, für den der Gate gebaut wurde.** Im August lag die Franse dort
+auf **898.087 Subpixeln pro Frame — 97,9 % eines 4×-Schirms**, und die Objekte waren
+ausgewaschen. Jetzt sind es **5.643 = 0,6 %**, Faktor 159 darunter, und der User meldet sie als
+sauber. Der Test ist nicht leer: `SPRAREA` weist in diesen Kontexten nur **33,1 % bzw. 51,9 %**
+der Sprite-Fläche eine Referenz zu — der Schalter hat dort die Hälfte bis zwei Drittel der
+Kunst neu freigeschaltet.
+
+### Lauf 2 (10:28, `SNES_HD_EDGE_IGNORE_REF` + `SNES_HD_SPRWATCH` auf acht Splitter-Hashes)
+
+933 Messzeilen über **705 Frames** Schwertzerfall:
+
+| | Pixel |
+|---|---|
+| Silhouette (Slot 0) | 16.035, davon 16.035 im Pack |
+| **Franse (Slot 2)** | **43.638, davon 43.638 im Pack** |
+| Verdrängtes Sprite (Slot 3) | 715, davon 715 im Pack |
+| `wonMain` | 15.946 von 16.035 = 99,4 % |
+
+**Pack-Trefferquote 100,0 % auf allen drei Slots**, und die Franse ist das **2,7-fache der
+eigenen Silhouette**. Kein `fringe=0/0` wie beim Bonusfass — die Kunst wird erfasst, der Pack
+antwortet, und die einzige Sperre war der Gate.
+
+### Was der Gate wirklich war
+
+S21 nennt ihn ausdrücklich einen **Herkunftstest, keinen Farbtest**. Laufzeit-erfasste Kacheln
+hatten 2026-08 Hintergrund in den Randtexeln, und nach außen gezogen schmierte der mit.
+Das ist ein **Pipeline-Problem und gehört in den Export**, nicht in einen Pro-Pixel-Test, der
+die beiden Fälle gar nicht unterscheiden kann. Der Notausgang bleibt unverändert:
+`SNES_HD_NO_SPRITE_EDGES=1`.
+
+### Ein Irrweg, der dokumentiert gehört
+
+Zwischendurch sah es so aus, als würfe der Prioritäts-Gleichstand die Splitter-Franse weg:
+`sprFrTie` steigt in den Splitter-Frames um **+60,9/Frame**, und SPRWATCH beziffert den Beitrag
+der Splitter auf **+61,9 Fransenpixel/Frame** — 98 % Deckung. **Die Gegenprobe pro Frame hat es
+umgeworfen** (`r = −0,148`, die Bänder widersprechen sich). Die Kontrollrechnung zeigt warum:
+Splitter-Silhouette gegen `sprHd` müsste Steigung 1 haben und liefert **3,96** — in den
+Todesframes skaliert der ganze Bildinhalt mit, die Frames sind nicht vergleichbar. Zwei
+zufällig gleiche Gruppenmittel. **Merke: eine Übereinstimmung zweier Aggregate ist erst ein
+Befund, wenn sie die Auflösung pro Frame überlebt.**
+
+### Was dabei trotzdem herauskam: der Prioritäts-Gleichstand kostet real
+
+| Kontext | Frames | Franse gefunden | vom Gleichstand abgelehnt | Verlust |
+|---|---|---|---|---|
+| `$17/$00/$07` (Kleever) | 5.145 | 980 | 230 | **19,0 %** |
+| `$13/$14/$23` | 855 | 1.422 | 77 | 5,1 % |
+| `WORLDMAP $11/$00/$00` | 325 | 1.613 | 86 | 5,1 % |
+| `$11/$00/$00` | 509 | 1.623 | 37 | 2,2 % |
+| **Gesamt** | **7.229** | **1.074** | **179** | **14,3 %** |
+
+Der Zweig ist `Sprites[2].Priority <= (MainScreenFlags & 0x0F)` — die Franse eines Sprites über
+einem Sprite **gleicher** OBJ-Priorität. Der S23-Kommentar hat das wörtlich vorhergesagt:
+*„A large number here means equal priorities are common and the tie-break has to come from OAM
+order after all."* Jetzt steht die Zahl da: **14,3 % aller Fransen-Kandidaten, im
+Kleever-Kontext jeder fünfte.** Das ist kein Splitter-Problem, sondern trifft jede Überlappung
+zweier Sprites derselben Priorität — und im heutigen Pro-Pixel-Modell gibt es die OAM-Reihenfolge
+schlicht nicht.
+
+Nebenbei nachgetragen: `SNES_HD_NO_SUB_BG_UNDER` (S37) und `SNES_HD_SPRWATCH` (S41) fehlten in
+der A/B-Liste von `WriteSessionBanner` — ein A/B-Lauf gehört ins Banner.
+
+Die Zähler `subGateNoRef` / `subGateOpaque` und die `ref=`-Spalte von `SPRAREA` bleiben. Sie
+entscheiden nichts mehr, sagen aber weiterhin, welche Kunst der lebenden CGRAM-Zeile folgt und
+welche per Palettenslot gebacken ist — das ist, was den Recolor-Pfad steuert.
+
+**Der größere Befund, noch nicht umgesetzt:** neun Commits (`S21`, `S21b`, `S22/S24`,
+`S25–S27`, `S25 zurück`, `S30`, `S32`, `S34`, `S37`) haben dieselbe Form — der Filter löst
+Sichtbarkeit nativ auf, komponiert in HD, und muss für jeden halbtransparenten Texel raten,
+was dahinter liegt. Die Zahl der Fälle ist das Produkt aus {Main, Sub} × {BG, Sprite, Backdrop,
+nichts} × {Farbmath an/aus} × {Overlay oder nicht}, deshalb ist die Liste nicht abgeschlossen.
+Der allgemeine Ausweg wäre ein **zweiter Durchgang**, der die HD-Sprite-Kunst mit Alpha über
+das bereits fertige HD-Bild legt: dann ist der Mischpartner per Konstruktion das, was wirklich
+dahinter steht — ohne Slot 3, ohne Ground-Suche, auf Main wie Sub wie Overlay. Position trägt
+Slot 2 (die PPU-Hälfte von S21), Priorität `MainScreenFlags & 0x0F`, und die Farbmath des
+Zielpixels muss auf den Texel angewandt werden (sonst kommt Lockjaws heller Saum zurück).
+Die `drawMain`-Sperre auf Slot 2 — der Grund für das kantige B auf dem Bonusfass — fällt
+dabei mit weg.
+
+**Und er erbt den Prioritäts-Gleichstand oben.** Auch wer über das fertige Bild malt, muss
+entscheiden, ob er hinter dem Sprite davor liegt. Die Antwort steht seit S23 im Code: bei
+Gleichstand entscheidet die OAM-Reihenfolge. Der zweite Durchgang hat sie ohnehin in der Hand,
+weil er in Reihenfolge malt — das Pro-Pixel-Modell hat sie nicht.
+
 ## [2026-09-18] — S41: ein Recorder für Treffer, nicht für Fehlschläge
 
 `snes_hd_spritemiss.txt` zeichnet eine Kachel nur auf, wenn sie **erfasst** wurde **und** keine
