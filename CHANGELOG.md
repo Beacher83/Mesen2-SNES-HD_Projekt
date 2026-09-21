@@ -21,6 +21,102 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-18] — S41: ein Recorder für Treffer, nicht für Fehlschläge
+
+`snes_hd_spritemiss.txt` zeichnet eine Kachel nur auf, wenn sie **erfasst** wurde **und** keine
+HD-Kunst fand. Eine nie erfasste Kachel hinterlässt keine Spur — „nicht in spritemiss" heißt
+also nicht „abgedeckt", und genau diese Lesart hat zwei Objekte für geklärt erklärt, die der
+User als SD im Spiel meldet:
+
+- **`Gfx 3170`**, das Sternemblem mit dem B auf dem Bonusfass: 10 von 10 Kacheln im Pack, alle
+  slot-frei geladen, und die Referenzpalette ist zeichengleich mit der lebenden CGRAM-Zeile
+  (`00C8 012E 1DB5 027B 077F 7FFF 6B5A`) — `HdSpriteRecolor::Init` setzt bei lauter
+  Null-Deltas `valid = false`, das Umfärben läuft also gar nicht.
+- **`Gfx 2D40`–`2D64`**, die großen weißen Ziffern 0–9: 60 von 60 Kacheln im Pack.
+
+Beide in zwei Läufen kein einziger Miss. Fehlende Kunst, falscher Palettenslot und Umfärben
+sind damit ausgeschlossen — offen ist die Erfassungsseite, und dafür gab es kein Instrument.
+
+**`SNES_HD_SPRWATCH=<16hex>[,<16hex>...]`** (max. 8 Hashes) schreibt je Frame und beobachtetem
+Hash eine Diag-Zeile: Pixel je Erfassungs-Slot (`main` = Slot 0, `sub` = 1, `fringe` = 2 aus
+S23, `under` = 3 aus S22), wie viele davon `GetMatchingTile` beantwortet, die Palettenslots und
+`wonMain`/`wonSub`. **Keine Zeile bedeutet: nie erfasst** — dann kann der Pack nicht die
+Ursache sein. Pro Pixel werden nur zwei Sprite-Kacheln erfasst, ein kleines Aufkleber-Sprite
+auf einem Fass kann alle vier Slots verlieren; das ist die Hypothese, die der Lauf prüft.
+
+Liegt im Recorder-Block und kostet nichts, solange die Variable nicht gesetzt ist. Der
+Hex-Parser ist gegen echte Eingaben geprüft (`DKC2-HD-Tools/tools/spritemiss/test_sprwatch_parser.py`,
+8 Fälle). **Im Spiel bestätigt:** der Lauf mit
+`SNES_HD_SPRWATCH=E563D7702FE967CC,38E78F2E2A1400EC` hat das Bonusfass-Emblem entschieden —
+100 % Trefferquote, aber ausschließlich auf dem Sub-Screen (`main=0/0 sub=21250/21250`),
+`fringe=0/0` in allen 341 Frames. Das Instrument hat genau die Frage beantwortet, für die es
+gebaut wurde.
+
+---
+
+## [2026-09-17] — S40: spritecap war ebenfalls seit dem 10. August tot
+
+S39 hat zwei Recorder geweckt und `spritecap` ausdrücklich als das gesunde der drei
+eingeordnet („inserts AFTER the open"). Das war nur halb richtig. spritecap hatte den
+**zweiten** Fehler, den dieselbe Commit-Nachricht benennt und nur in spritemiss behoben hat:
+der `OpenRecorder` hing an der Antwort des Seedings.
+
+```cpp
+SeedRecorderSet(...);
+if(seen.find(setKey) != end) continue;   // bei 88 MB Datei fast immer wahr
+s_spriteCapFile = OpenRecorder(...);     // nie erreicht
+```
+
+Der erste Kandidat eines Laufs ist bei einer gesättigten Datei fast immer einer, den eine
+frühere Sitzung schon hatte. Dann greift `continue` bei noch geschlossener Datei,
+`s_spriteCapAttempted` bleibt `true`, und ab der zweiten Kachel endet der Scan am
+`!s_spriteCapFile`-`break`.
+
+**Beleg:** das letzte Sitzungsbanner in `snes_hd_spritecap.txt` war
+`=== SESSION 2026-08-10 21:24:30 build=S19 ===` — 17 Banner, keines aus den fünf Wochen
+danach, und 10. August ist der Tag, an dem `SeedRecorderSet` dazukam.
+
+Fix: seeden und öffnen, **danach** die „hatte eine frühere Sitzung"-Abfrage — dieselbe Form,
+die S39 spritemiss gegeben hat. Dazu der Kommentar über dem OAM-Recorder korrigiert, damit die
+falsche Einordnung nicht ein zweites Mal als Beleg gelesen wird.
+
+**Im Spiel bestätigt** (Lauf 17.09. 22:04): Banner `build=S40`, die Datei ist von 38.289 auf
+43.006 distinkte Hashes gewachsen.
+
+**Warum das mehr als ein Recorder-Fehler ist:** der Pack-Export des Viewers liefert eine
+Kachel nur aus, wenn sie in spritecap steht (`spriteCapPairs.get(hash)` leer → `continue`) —
+der Palettenslot ist Spiellogik und aus dem ROM nicht herleitbar. Gemessen: **30.610 von
+30.610 Sprite-Hashes des installierten Packs haben einen spritecap-Eintrag, keine Ausnahme.**
+Fünf Wochen lang wurde also jede upgescalte Kachel, die nicht bereits vor dem 10.08. im Spiel
+gesehen worden war, beim Export stillschweigend verworfen. Auf die Kachel genau belegt:
+DD Ducking hat 108 ROM-Kacheln, 14 davon standen im alten spritecap — und genau **14** liegen
+im Export-ZIP (DX Ducking 14 / 5 / **5**). Nach dem S40-Lauf sind es 252 von 252.
+
+---
+
+## [2026-09-16] — S39: die zwei Recorder, die seit August tot waren (`1954cc80`)
+
+`snes_hd_spritemiss.txt` und `snes_hd_bgcap.txt` wurden seit dem 10.08. nicht mehr
+geschrieben. Der Kommentar über dem OAM-Recorder erklärte das mit Sättigung („saturated back
+on 10 Aug") — ihre Schlüssel sind pro Kachel, und davon gibt es endlich viele. Diese Lesart
+blieb fünf Wochen unhinterfragt und war falsch: der 10.08. ist der Tag, an dem
+`SeedRecorderSet` dazukam, und beide Recorder befragten es in der falschen Reihenfolge — der
+Schlüssel ging vor dem Seeding ins Dedup-Set, danach fand die Abfrage den eigenen Eintrag,
+`OpenRecorder` wurde nie erreicht, und ab der zweiten Kachel beendete der `!file`-`break` den
+Scan.
+
+Der Fix behält alle drei Eigenschaften der alten Reihenfolge: das Seeding bleibt faul, gedeckte
+Kacheln werden weiter memoisiert (sonst läuft `GetMatchingTile` je Sprite-Pixel je Frame), und
+der Stale-Zweig memoisiert gar nicht mehr, was das alte insert/erase-Paar erübrigt.
+
+**Im Spiel bestätigt:** spritemiss kommt zurück (1.199 Zeilen, 635 distinkte Hashes aus einem
+kurzen gezielten Lauf) und benennt zwei Animationen, deren Kunst wirklich fehlt — DD Ducking
+(94 von 108 Kacheln) und DX Ducking (9 von 14). `bgcap` schrieb im Vormittagslauf noch nicht,
+im Abendlauf dann doch (986 Zeilen, Kopf `build=S39`, gfxset 32 und 4 auf BG2) — der damals
+notierte Verdacht auf die Live-VRAM-Gegenprobe war unbegründet.
+
+---
+
 ## [2026-09-14] — S38: die Messung aus dem Standardpfad nehmen
 
 Die Frage, für die S35/S36 gebaut wurden, ist beantwortet: das Ruckeln war die Bildausgabe

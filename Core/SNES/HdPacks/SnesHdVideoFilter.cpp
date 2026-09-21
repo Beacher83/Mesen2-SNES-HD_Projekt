@@ -19,7 +19,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S39"
+#define SNES_HD_BUILD_VERSION "S41"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -2644,13 +2644,23 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				uint64_t liveHash = ComputeTileContentHash(hdScreen->Vram, t.VramWordAddr, 16);
 				if(liveHash != t.Key.ContentHash) continue;
 
+				// S40: open the file BEFORE asking whether an earlier session already
+				// logged this key. S39 read this recorder as the healthy one because it
+				// inserts after the open -- true, but it still had the second failure
+				// that commit named and only fixed in spritemiss: the open depended on
+				// the seeding's answer. With a 88 MB file the first candidate of a run
+				// is almost always one an earlier session had, so `continue` fired with
+				// the file still closed, s_spriteCapAttempted stayed true, and every
+				// later tile died on the `!file` break. The last session banner in
+				// snes_hd_spritecap.txt is 2026-08-10 21:24 build=S19 -- the day
+				// SeedRecorderSet was added. Dead for five weeks, like the other two.
 				if(!s_spriteCapAttempted) {
 						s_spriteCapAttempted = true;
 						SeedRecorderSet("snes_hd_spritecap.txt", s_spriteCapSeen, ParseSpriteCapKey);
-						if(s_spriteCapSeen.find(setKey) != s_spriteCapSeen.end()) continue;   // earlier session had it
 						s_spriteCapFile = OpenRecorder("snes_hd_spritecap.txt");
 					}
 				if(!s_spriteCapFile) break;
+				if(s_spriteCapSeen.find(setKey) != s_spriteCapSeen.end()) continue;   // earlier session had it
 				s_spriteCapSeen.insert(setKey);
 
 				char line[320];
@@ -2894,10 +2904,11 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// entry. So the "earlier session had it" branch fired on the very
 				// first miss, OpenRecorder was never reached, and every later tile hit
 				// the `!s_sprMissFile` break. This recorder and bgcap have been dead
-				// since SeedRecorderSet was added on 10 Aug 2026; only spritecap
-				// survived, because it inserts AFTER the open. The files stopped
+				// since SeedRecorderSet was added on 10 Aug 2026. The files stopped
 				// growing that day, which the comment further down took for
-				// saturation — it was this.
+				// saturation — it was this. S40: spritecap did NOT survive either,
+				// as this comment first claimed; it inserts after the open, but its
+				// open hung on the seeding's answer, so it died the same day.
 				if(_hdData->GetMatchingTile(t.Key)) { s_sprMissSeen.insert(missKey); continue; }  // covered → not a miss
 				// Stale (OBJ stream replaced the bytes mid-frame): do NOT memo, so a
 				// later frame looks at it again. Replaces the old insert/erase pair.
@@ -2933,6 +2944,91 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			}
 		}
 		if(s_sprMissFile) fflush(s_sprMissFile);
+	}
+
+	// =====================================================================
+	// S41: positive sprite probe — the counterpart to spritemiss.
+	//
+	// spritemiss only records a tile that was CAPTURED and then found no art.
+	// A tile that is never captured leaves no trace at all, so "not in
+	// spritemiss" has been read as "covered" when it can equally mean "never
+	// seen". Two objects hit that blind spot: the bonus barrel's B emblem
+	// (gfxRef $3170) and the big white digits ($2D40-$2D64) are complete in the
+	// pack, carry a reference palette identical to the live CGRAM row (so the
+	// recolor is the exact identity and does not even run), and were missed in
+	// neither of two runs — and are still reported as blocky on screen.
+	//
+	// Only two sprite tiles per pixel are captured (main + sub), plus the
+	// displaced one as slot 3 and the fringe as slot 2; a small sprite stacked
+	// on another one can lose every slot. This probe says which case it is:
+	//
+	//   SNES_HD_SPRWATCH=E563D7702FE967CC,38E78F2E2A1400EC
+	//
+	// Per frame and watched hash: pixels per capture slot, whether the pack has
+	// art for the captured key, and whether the sprite actually won the pixel.
+	// No line at all for a whole level means the tile never reaches the HD path,
+	// and then the pack cannot be the reason it looks native.
+	// =====================================================================
+	{
+		constexpr int MaxWatch = 8;
+		static uint64_t s_watch[MaxWatch] = {};
+		static int s_watchCount = -1;
+		if(s_watchCount < 0) {
+			s_watchCount = 0;
+			if(const char* env = getenv("SNES_HD_SPRWATCH")) {
+				const char* q = env;
+				while(*q && s_watchCount < MaxWatch) {
+					uint64_t h = 0; int n = 0;
+					while(*q && *q != ',') {
+						char c = *q++;
+						int v = (c >= '0' && c <= '9') ? c - '0'
+						      : (c >= 'A' && c <= 'F') ? c - 'A' + 10
+						      : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+						if(v >= 0) { h = (h << 4) | (uint64_t)v; n++; }
+					}
+					if(n > 0) s_watch[s_watchCount++] = h;
+					if(*q == ',') q++;
+				}
+				char msg[64];
+				snprintf(msg, sizeof(msg), "SPRWATCH: %d Hash(es) beobachtet", s_watchCount);
+				DiagLog(msg);
+			}
+		}
+
+		if(s_watchCount > 0) {
+			constexpr uint32_t px = (uint32_t)SnesHdScreenInfo::ScreenPixelCount;
+			for(int wi = 0; wi < s_watchCount; wi++) {
+				const uint64_t want = s_watch[wi];
+				uint32_t slotPx[4] = {}, slotHd[4] = {}, wonMain = 0, wonSub = 0;
+				uint8_t pal[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+				for(uint32_t i = 0; i < px; i++) {
+					const SnesHdPpuPixelInfo& pi = hdScreen->ScreenTiles[i];
+					if(!pi.SpriteCount) continue;
+					for(int s = 0; s < 4; s++) {
+						if(!(pi.SpriteCount & (1 << s))) continue;
+						const SnesHdPpuTileInfo& t = pi.Sprites[s];
+						if(t.Key.ContentHash != want) continue;
+						slotPx[s]++;
+						pal[s] = t.Key.PaletteIndex;
+						if(_hdData->GetMatchingTile(t.Key)) slotHd[s]++;
+						if(s == 0 && (pi.MainScreenFlags & 0x40)) wonMain++;
+						if(s == 1 && pi.SubScreenHasSprite) wonSub++;
+					}
+				}
+				if(slotPx[0] || slotPx[1] || slotPx[2] || slotPx[3]) {
+					char line[256];
+					snprintf(line, sizeof(line),
+						"SPRWATCH F%u H%016llX main=%u/%u sub=%u/%u fringe=%u/%u under=%u/%u "
+						"P%d/%d/%d/%d wonMain=%u wonSub=%u",
+						hdScreen->FrameNumber, (unsigned long long)want,
+						slotHd[0], slotPx[0], slotHd[1], slotPx[1],
+						slotHd[2], slotPx[2], slotHd[3], slotPx[3],
+						(int)(int8_t)pal[0], (int)(int8_t)pal[1], (int)(int8_t)pal[2], (int)(int8_t)pal[3],
+						wonMain, wonSub);
+					DiagLog(line);
+				}
+			}
+		}
 	}
 
 	// =====================================================================
