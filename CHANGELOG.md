@@ -21,6 +21,47 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-21] — S44: Kantenglättung als SNES-Einstellung, live umschaltbar
+
+S43 ist im Spiel bestätigt (Lauf 11:45, `build=S43`, A/B leer): Franse je Frame deckungsgleich
+mit dem Schalterlauf um 10:28 (Kleever 1.340→1.347, `$13/$14/$23` 8.885→8.844, WORLDMAP
+6.779→6.383), Frame-Zeit Median **2,76 ms** gegen 2,82 (S42) und 2,95 (S41) — eher schneller,
+weil drei Hash-Nachschläge pro Pixel entfallen. `spritemiss` nur 50 Zeilen. Vom User bestätigt,
+Lockjaw (Unterwasser-Farbmath) ebenfalls sauber.
+
+Damit war die Glättung nur noch über eine Umgebungsvariable abschaltbar — also bekommt sie
+eine echte Einstellung, wie `EnableHdPacks` eine hat.
+
+**`SnesConfig.HdSmoothSpriteEdges`** (Standard an), Checkbox unter der HD-Pack-Checkbox in
+`SnesConfigView.axaml`, `IsEnabled` an `EnableHdPacks` gebunden. SNES-only ergibt sich von
+selbst, weil `SnesConfig` eine eigene Struktur ist.
+
+**Live umschaltbar, ohne Neustart.** Die Glättung ist eine reine Kompositions-Entscheidung pro
+Pixel in `ApplyFilter`: nichts wird beim Laden gebacken, die Pack-Kacheln behalten ihren
+Alphakanal so oder so, und die PPU füllt Slot 2 unabhängig von der Einstellung. Es gibt keinen
+Zustand, der neu aufgebaut werden müsste — anders als bei `EnableHdPacks`, das über
+`ForceFilterUpdate()` das ganze Filterobjekt tauscht. Dass die `SNES_HD_*`-Schalter einen
+Neustart brauchen, liegt allein daran, dass sie `static const bool getenv(...)` sind.
+
+**Wo der Schalter sitzt:** als `smoothEdges` im `HdFilterFrameCtx`, einmal pro Frame in
+`ApplyFilter` gefüllt. Nicht als weitere statische Variable, und vor allem nicht in der
+Pixelschleife: die Render-Threads bekommen den Kontext per `const&`, ein Settings-Zugriff pro
+Pixel wäre ein Datenrennen **und** 57.344 überflüssige Nachschläge je Frame.
+`SNES_HD_NO_SPRITE_EDGES=1` bleibt als Zwangs-Aus für kopflose A/B-Läufe, verknüpft mit ODER:
+`noSpriteEdges = s_noSpriteEdges || !ctx.smoothEdges`.
+
+**⚠ Die Struktur wird zwischen C# und C++ feldweise gemarshallt.** Beide enden jetzt auf
+`EnableHdPacks`, dann `HdSmoothSpriteEdges`; `[StructLayout(LayoutKind.Sequential)]` ist
+gesetzt. Ein Feld an anderer Stelle einzufügen hätte still **jede** Einstellung dahinter
+verschoben — deshalb steht der Hinweis auch als Kommentar in `SettingTypes.h`.
+
+**C++ und C# geändert: komplette Solution bauen**, nicht nur inkrementell.
+
+**Im Spiel bestätigt:** der Haken wirkt live, ohne Neustart. Damit ist zum ersten Mal ein
+A/B-Vergleich der Kantenglättung am laufenden Bild möglich, statt zwei Spielsitzungen aus
+Zahlenreihen gegeneinanderzuhalten — für eine Frage, die zuletzt fünfmal am fehlenden Bild
+statt an fehlenden Zählern hängen geblieben ist, ist das das nützlichere Werkzeug.
+
 ## [2026-09-21] — S42/S43: der Herkunfts-Gate der Kantenglättung ist gemessen und entfernt
 
 **Beobachtung:** die Kleever-Schwertsplitter sind nach dem Upscale in HD im Spiel, aber ohne

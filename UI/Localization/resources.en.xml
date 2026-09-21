@@ -230,6 +230,7 @@
 		<Form ID="SnesConfigView">
 			<Control ID="tpgGeneral">General</Control>
 			<Control ID="lblRegion">Region:</Control>
+			<Control ID="chkHdSmoothSpriteEdges">Smooth HD sprite edges</Control>
 			
 			<Control ID="tpgAudio">Audio</Control>
 			<Control ID="lblAudioInterpolation">Audio interpolation type:</Control>

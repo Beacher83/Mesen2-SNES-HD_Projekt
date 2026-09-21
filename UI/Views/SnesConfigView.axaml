@@ -42,6 +42,7 @@
 						/>
 					</StackPanel>
 					<CheckBox IsChecked="{Binding Config.EnableHdPacks}" Content="{l:Translate chkEnableHdPacks}" />
+					<CheckBox IsChecked="{Binding Config.HdSmoothSpriteEdges}" Content="{l:Translate chkHdSmoothSpriteEdges}" Margin="20 0 0 0" IsEnabled="{Binding Config.EnableHdPacks}" />
 				</StackPanel>
 			</ScrollViewer>
 		</TabItem>

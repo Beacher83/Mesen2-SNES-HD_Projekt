@@ -576,6 +576,11 @@ struct SnesConfig
 	int64_t BsxCustomDate = -1;
 
 	bool EnableHdPacks = true;
+	// S44: HD sprite edge smoothing, toggled live from the SNES settings.
+	// It lives at the END of the struct because this is marshalled
+	// field-for-field against UI/Config/SnesConfig.cs -- inserting anywhere
+	// else silently shifts every setting after it.
+	bool HdSmoothSpriteEdges = true;
 };
 
 enum class StereoFilterType

@@ -68,6 +68,7 @@ namespace Mesen.Config
 
 		//HD Packs
 		[Reactive] public bool EnableHdPacks { get; set; } = true;
+		[Reactive] public bool HdSmoothSpriteEdges { get; set; } = true;
 
 		//BSX
 		[Reactive] public bool BsxUseCustomTime { get; set; } = false;
@@ -126,7 +127,8 @@ namespace Mesen.Config
 				RamPowerOnState = this.RamPowerOnState,
 				SpcClockSpeedAdjustment = this.SpcClockSpeedAdjustment,
 				BsxCustomDate = BsxUseCustomTime ? (this.BsxCustomDate.ToUnixTimeSeconds() + (long)this.BsxCustomTime.TotalSeconds) : -1,
-				EnableHdPacks = this.EnableHdPacks
+				EnableHdPacks = this.EnableHdPacks,
+				HdSmoothSpriteEdges = this.HdSmoothSpriteEdges
 			});
 		}
 
@@ -187,6 +189,7 @@ namespace Mesen.Config
 
 		public long BsxCustomDate;
 		[MarshalAs(UnmanagedType.I1)] public bool EnableHdPacks;
+		[MarshalAs(UnmanagedType.I1)] public bool HdSmoothSpriteEdges;
 	}
 
 	public enum DspInterpolationType

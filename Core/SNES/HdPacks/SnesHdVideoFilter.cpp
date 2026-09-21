@@ -19,7 +19,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S43"
+#define SNES_HD_BUILD_VERSION "S44"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -674,6 +674,15 @@ struct HdFilterFrameCtx
 	uint32_t ppuWidth = 256;
 	bool isHiRes = false;
 	bool isWorldmap = false;
+	// S44: sprite edge smoothing, read once per frame from SnesConfig in
+	// ApplyFilter. It rides in the frame context instead of a file-scope
+	// static because the render threads take this struct by const ref --
+	// a setting read inside the pixel loop would be both a data race and
+	// 57,344 redundant lookups. Changing the checkbox takes effect on the
+	// NEXT frame: nothing about the edge paths is baked at load time, the
+	// pack tiles keep their alpha either way, and the PPU fills slot 2
+	// regardless of the setting.
+	bool smoothEdges = true;
 	// M5.7's worldmap lockout, narrowed. Blocking BG HD on the worldmap was only
 	// ever a stand-in for scoping: back then any level tile could match a map tile
 	// by hash alone. P4.2's strict gfxset scoping does that job properly, and the
@@ -998,6 +1007,9 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 	const bool isHiRes = ctx.isHiRes;
 	const bool isWorldmap = ctx.isWorldmap;
 	const bool blockBgHd = ctx.blockBgHd;
+	// S44: the environment switch stays as a force-off for headless A/B runs;
+	// the setting is the master. Either one off means off.
+	const bool noSpriteEdges = s_noSpriteEdges || !ctx.smoothEdges;
 	const uint64_t vramSig = ctx.vramSig;
 	const bool anyPalTransform = ctx.anyPalTransform;
 	const bool* palRowActive = ctx.palRowActive;
@@ -1372,7 +1384,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							} else if(!subHasRef) {
 								st.SubGateNoRef++;
 							}
-							if(!s_noSpriteEdges && !s_noSubUnder && subSprTile->HasTransparentPixels) {
+							if(!noSpriteEdges && !s_noSubUnder && subSprTile->HasTransparentPixels) {
 								// S27: when a second sprite lies under this one, THAT is the
 								// ground, not the background — the Kongs one behind the other
 								// under water, which the user reported on 08 Sep as the one
@@ -1589,7 +1601,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					// sprite arrives as slot 3 and the existing blend does the rest.
 					// No BG fallback in that case on purpose: the BG is the known-wrong
 					// backdrop, and a hard edge beats showing it through a character.
-					if(!s_noSpriteEdges && hdTile->HasTransparentPixels && !hdTileBot) {
+					if(!noSpriteEdges && hdTile->HasTransparentPixels && !hdTileBot) {
 						if((pixelInfo.SpriteCount & 0x08) && !s_noSpriteUnder) {
 							SnesHdPackTileInfo* under = CachedGetMatchingTile(hdData, hdScreen->Vram,
 								tileLookupCache, pixelInfo.Sprites[3].Key);
@@ -1729,7 +1741,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			// the sub GROUND below made them report "not smoothed". Keeping code whose
 			// only evidence is that it executes is how the S23 branch survived as long as
 			// it did.
-			if(!s_noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && !spriteWon
+			if(!noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && !spriteWon
 				&& pixelInfo.Sprites[2].Key.ContentHash != 0
 				&& pixelInfo.Sprites[2].Priority > (pixelInfo.MainScreenFlags & 0x0F)) {
 				edgeTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache,
@@ -1740,7 +1752,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				} else {
 					edgeTile = nullptr;
 				}
-			} else if(!s_noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && spriteWon
+			} else if(!noSpriteEdges && (pixelInfo.SpriteCount & 0x04) && spriteWon
 				&& pixelInfo.Sprites[2].Key.ContentHash != 0
 				&& pixelInfo.Sprites[2].Priority <= (pixelInfo.MainScreenFlags & 0x0F)) {
 				// S23 diagnostic: a fringe was recorded over a winning sprite but the
@@ -2343,6 +2355,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	renderCtx.ppuWidth = ppuWidth;
 	renderCtx.isHiRes = isHiRes;
 	renderCtx.isWorldmap = isWorldmap;
+	renderCtx.smoothEdges = _emu->GetSettings()->GetSnesConfig().HdSmoothSpriteEdges;
 	renderCtx.blockBgHd = isWorldmap && !_hdData->HasFingerprints();
 	renderCtx.vramSig = vramSig;
 	renderCtx.anyPalTransform = anyPalTransform;
