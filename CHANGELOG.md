@@ -21,6 +21,30 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-23] — S52 im Feld bestaetigt, Optimierung vermessen und geparkt
+
+**Spieltest ueber viele Level, alle sehen richtig aus.** Von **16.069 Frames** liegen **2**
+ueber dem 16,7-ms-Budget (0,01 %), Median ueber alles **2,88 ms**, p99 13,11. Beide Ausreisser
+in **gfxset 37** (Krow's Nest / Mainbrace Mayhem) mit 17,20 und 17,46 ms; dort auch der
+hoechste Median (~8 ms) und p95 (~14 ms). Kontexte, die vor und nach S52 vorkommen:
+**+2,7 % bis +18,2 %**. Die 8,65 ms aus dem ersten Glimmer-Lauf waren der Lampenmoment mit
+maximal auseinanderlaufender Palette, nicht der Normalfall.
+
+**Optimierung durchgerechnet, nichts gebaut** (Wunsch des Users: erst dokumentieren):
+
+| Variante | Ersparnis | exakt? | Urteil |
+|---|---|---|---|
+| Farbcache | 4096 Eintraege bedienen nur 41–47 % | ja | untauglich — die Kunst hat 80.000–100.000 Farben je Gfxset |
+| Tabelle auf 5 Bit gerundet | Faktor 80–190 | **nein** | untauglich — 6,74 % der Texel bekommen eine andere Referenzfarbe, Abweichung Median 41, max 231 von 255 |
+| Tabelle nur fuer eindeutige Eimer | 15–33 % | ja | schwach |
+| **Nachbarpruefung** | **35–62 %** | **ja** | **die einzige brauchbare** |
+
+Die Nachbarpruefung nutzt, dass 69–79 % der Texel denselben Index haben wie ihr Nachbar: liegt
+der Abstand zum vorherigen Index unter dem halben kleinsten Palettenabstand, ist er beweisbar
+der naechste. Details und Zahlen in `OFFENE_TESTS.md`.
+
+---
+
 ## [2026-09-23] — S51: die Live-Palette ist die UMKEHRUNG der gebackenen
 
 **Der Befund, gemessen.** S51 schreibt einmal je Gfxset Referenz- und Live-Palette Eintrag fuer
