@@ -21,6 +21,106 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-23] — S51: die Live-Palette ist die UMKEHRUNG der gebackenen
+
+**Der Befund, gemessen.** S51 schreibt einmal je Gfxset Referenz- und Live-Palette Eintrag fuer
+Eintrag ins Log. Fuer Glimmer's Galleon (gfx=3):
+
+```
+Zeile 1  REF   0,0,0   1,1,0   2,1,0   3,2,1   4,2,1   5,3,1   6,3,1
+         LIVE 31,28,30 30,28,30 30,28,30 29,27,30 29,27,30 29,27,30 28,26,29
+```
+
+**Korrelation REF gegen LIVE: r = −0,995 / −0,987 / −0,988.** Die Live-Palette ist die
+Umkehrung der gebackenen, und zwar affin:
+
+```
+LIVE ≈ (31,0 | 28,4 | 30,0)  −  (0,50 | 0,75 | 0,50) × REF
+```
+
+Restfehler ueber alle Zeilen ausser Zeile 0: **0,2–0,8 von 31**.
+
+**Damit ist der Mechanismus des Levels erklaert.** Das Spiel schreibt `a − REF/2` in CGRAM, die
+PPU rechnet `main − sub`, und mit `main ≈ (24,22,24)` bleibt `≈ REF/2` uebrig — die Kunst auf
+halber Helligkeit, also das dunkle Bild. Unsere HD-Kunst traegt die NICHT invertierten
+Referenzfarben, wird ebenfalls subtrahiert, und heraus kommt das Negativ.
+
+**Warum R3 das strukturell nicht kann.** Der Transform modelliert `live = ref × gain` — rein
+multiplikativ, ohne Versatz, Faktor immer positiv und bei 4x gedeckelt. Die echte Beziehung hat
+einen grossen Versatz und eine NEGATIVE Steigung. Keine Parametrisierung kann das ausdruecken.
+Das erklaert auch den A/B-Lauf mit `SNES_HD_NO_PAL_TRANSFORM=1`: andere Farben, aber weiterhin
+ein Negativ. Der LUT war nie die Ursache, nur ein Symptom derselben Modellgrenze.
+
+**Zweiter Befund aus dem A/B:** `SNES_HD_NO_SUB_HD_OPERAND=1` nimmt in diesem Level die
+HD-Darstellung **komplett** weg. Der Main-Gewinner (BG1) liegt nicht auf dem Main-Screen, der
+normale Pfad findet nichts (`match=0`), und alles Sichtbare kommt ueber `sHd` — 53.839 Pixel je
+Frame. In Leveln dieses Typs haengt die gesamte HD-Darstellung am Farbmath-Operanden.
+
+**Zwei Wege nach vorn:**
+
+| | Ansatz | Bewertung |
+|---|---|---|
+| A | R3 affin fitten (`live = a + b·ref`, b darf negativ sein) | kleiner Eingriff, gleiche LUT-Maschinerie und Laufzeit, traefe dieses Level fast exakt — aber wieder ein Modell, das beim naechsten Palettentrick bricht |
+| **B** | **`HdSpriteRecolor` auf BG-Kacheln uebertragen** | bildet jede Referenzfarbe EINZELN auf ihre Live-Entsprechung ab, exakt statt gefittet, verkraftet Inversion wie Farbrotation. Existiert bereits und ist fuer Sprites erprobt; die BG-Seite hat es nur nie bekommen. |
+
+**S51 selbst aendert nichts am Bild** — es ist die Logzeile, die den Befund moeglich gemacht hat.
+Einmal je Gfxset, bewusst unabhaengig von `anyPalTransform`, damit der Vergleichslauf mit
+abgeschaltetem Transform dieselben Zeilen liefert.
+
+---
+
+## [2026-09-23] — S50: zwei A/B-Schalter fuer Glimmer's Galleon
+
+**Der Befund.** Glimmer's Galleon wird **mit** HD-Pack als Negativ dargestellt — flaechig
+blau-weiss, wo das Level fast schwarz sein muesste. **Ohne** HD-Pack ist es korrekt (vom User
+mit zwei Screenshots belegt). Der Fehler liegt also im Filter, nicht in der Emulation.
+
+**Die Lage im Level** (Kontext `E10E4686511EB716`, gfx=3):
+`Main=$04` (nur BG3), `Sub=$13` (BG1+BG2+OBJ), `CM=$24` (BG3+Backdrop), `AddSub=1`,
+**`SubtractMode=1`**, `FixedColor=$0000`. Das Level verdunkelt per **Subtraktion**: die Kunst
+liegt auf dem SUB-Screen, der Main-Screen ist hell (aus SPR-SAMPLE gemessen: `MainCol=0x62D8`
+= (24,22,24), `SubCol=0x2D6B` = (11,11,11)), und die PPU rechnet `main - sub`. Wird der
+Subtrahend zu klein, kommt das Bild zu hell heraus — genau das ist zu sehen.
+
+**Der Verdacht, mit Zahlen.** An **53.839 Pixeln je Frame** (`sHd`) stammt der Farbmath-Operand
+aus HD-Kunst, und die laeuft durch den R3-Palettentransform. Dessen Verstaerkung ist bei **4x
+gedeckelt** (`std::min<uint32_t>(1024, ...)`, `:2382`), und dieses Level sprengt den Deckel:
+
+| Zeile | Referenz im Pack (R/G/B) | Live, zurueckgerechnet |
+|---|---|---|
+| P1 | 75 / 45 / 19 | ≥ 300 / 180 / 76 |
+| P4 | 145 / 92 / 42 | ≥ 391 / 360 / 168 |
+| P7 | 137 / 134 / 27 | ≥ 395 / 325 / 108 |
+
+`PALDIFF` meldet **fuenf von acht Zeilen im Blaukanal am Anschlag** (`P1=1024/1024/1024`). Die
+Live-Palette liegt bei ~390 von maximal 465, also nahezu weiss; die gebackene Referenz bei
+141–214. Noetig waeren Faktoren ueber 4. **Die HD-Kunst bleibt zu dunkel, es wird zu wenig
+subtrahiert.** Dass ausgerechnet Blau am haeufigsten anschlaegt, passt zum blau gefluteten Bild.
+
+**Warum das grundsaetzlich ist.** R3 modelliert den Unterschied zwischen gebackener und
+Live-Palette als **eine Verstaerkung je Kanal**. Das traegt, solange die Live-Palette eine
+gedimmte oder aufgehellte Fassung der Referenz ist. Bei einem Level, das seine Palette
+*inhaltlich* umschreibt — Lampenschein, Blitze, Tag/Nacht — ist es das falsche Modell, und der
+Deckel verdeckt nur, wie falsch. Fuer Sprites gibt es die richtige Loesung laengst:
+`HdSpriteRecolor` bildet jede Referenzfarbe auf ihre Live-Entsprechung ab und traegt den
+Abstand des Texels mit, was beliebige Palettenwechsel verkraftet. BG-Kacheln haben das nicht.
+
+**S50 aendert noch nichts am Bild.** Es baut die beiden Schalter, die den Verdacht pruefen,
+statt ihn zu glauben:
+
+| Schalter | Wirkung | was er klaert |
+|---|---|---|
+| `SNES_HD_NO_PAL_TRANSFORM=1` | R3 ganz aus, Kunst behaelt ihre gebackenen Farben | ist der LUT die Ursache? |
+| `SNES_HD_NO_SUB_HD_OPERAND=1` | Farbmath-Operand immer nativ — exakt das, was die PPU subtrahiert | ist der Operandenpfad als Ganzes die Ursache? |
+
+Dazu `ab_no_pal_transform.bat` und `ab_no_sub_hd_operand.bat`. Beide Schalter stehen im
+Sitzungsbanner unter „A/B:“.
+
+Erwartung: mit `NO_SUB_HD_OPERAND` muss das Negativ verschwinden (der Operand ist dann
+derselbe wie ohne Pack). Bleibt es, ist der Verdacht falsch und der Fehler sitzt woanders.
+
+---
+
 ## [2026-09-23] — S49: der Prioritaets-Gleichstand bekommt die OAM-Reihenfolge
 
 **Das Problem.** Das Franse-Tor (`SnesHdVideoFilter.cpp:1823`) verwirft jede Franse, deren
