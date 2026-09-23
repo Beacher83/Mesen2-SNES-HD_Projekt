@@ -7,6 +7,7 @@
 #include "Shared/Video/BaseVideoFilter.h"
 #include "Shared/ColorUtilities.h"
 #include "Shared/MessageManager.h"
+#include "Utilities/PNGHelper.h"
 #include <unordered_set>
 #include <algorithm>
 #include <cstdlib>
@@ -19,7 +20,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S44"
+#define SNES_HD_BUILD_VERSION "S48"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -726,6 +727,49 @@ static const bool s_noSubSprUnder = getenv("SNES_HD_NO_SUB_SPRITE_UNDER") != nul
 // On by default; this turns it off for an A/B run:
 //     set SNES_HD_NO_BACKDROP_GROUND=1
 static const bool s_noBackdropGround = getenv("SNES_HD_NO_BACKDROP_GROUND") != nullptr;
+
+// S47: Ebenen-Anstrich. Jeder BG-Gewinnerpixel wird flaechig eingefaerbt --
+// BG1 rot, BG2 gruen, BG3 blau, BG4 gelb -- Sprites bleiben unberuehrt.
+//
+// Warum: am 23.09. sagte die Messung, die HD-Kunst von BG3 werde an 26.886 Pixeln
+// je Frame in den Ausgabepuffer geschrieben (47 % des Schirms), und der User sah
+// beim Entfernen derselben Kunst KEINE Aenderung -- nachweislich, mit Quittung
+// (TileByKey 56515 -> 56294, miss 0 -> 24.584, hdBG3 -> 0). Beide Messungen sind
+// sauber, beide koennen nicht stimmen. Dazwischen steht eine Frage, die kein
+// Zaehler beantwortet: WO auf dem Schirm liegen diese Pixel? Ein Bild davon
+// schlaegt jede weitere Zahl.
+//
+// Mit SNES_HD_PAINT_LAYERS=1 einschalten. Reiner Diagnosepfad.
+static const bool s_paintLayers = getenv("SNES_HD_PAINT_LAYERS") != nullptr;
+
+// S48: Framebuffer-Dump. Schreibt den fertigen Ausgabepuffer des Filters als
+// PNG -- exakt das, was auf dem Schirm landet, in voller HD-Aufloesung und mit
+// ganzzahligem Massstab.
+//
+// Warum: am 23.09. hat ein halber Tag Messarbeit nichts ergeben, weil das
+// einzige verfuegbare Bild ein FENSTERFOTO war -- 1071 px fuer 256 native
+// Pixel, Massstab 4,1836. Diese krumme Skalierung verwischt genau das native
+// Pixelraster, an dem sich nativ und HD unterscheiden lassen. Mesens eigene
+// Screenshot-Taste (F12) tut das Richtige, wird auf dem Testrechner aber von
+// etwas anderem abgefangen. Dieser Weg braucht keine Taste.
+//
+//   SNES_HD_DUMP_FRAMES=2    Anzahl Bilder (0 oder ungesetzt = aus)
+//   SNES_HD_DUMP_GFXSET=38   nur dieses Gfxset (ungesetzt = jedes)
+//   SNES_HD_DUMP_EVERY=30    Abstand in Frames (Standard 30, sonst sind
+//                            aufeinanderfolgende Bilder identisch)
+//
+// Der Dump laeuft NACH dem Rendern und NUR auf einem echten Levelbild
+// (ActiveGfxset gesetzt, genug BG-Pixel) -- sonst faengt er Uebergaenge und
+// schwarze Frames ein, von denen es beim Levelstart reichlich gibt.
+static int GetEnvInt(const char* name, int fallback)
+{
+	const char* v = getenv(name);
+	if(!v || !*v) return fallback;
+	return atoi(v);
+}
+static const int s_dumpFrames = GetEnvInt("SNES_HD_DUMP_FRAMES", 0);
+static const int s_dumpGfxset = GetEnvInt("SNES_HD_DUMP_GFXSET", -1);
+static const int s_dumpEvery  = GetEnvInt("SNES_HD_DUMP_EVERY", 30);
 // S37 A/B: do not give a sub-screen BG operand a ground, i.e. keep the behaviour up to
 // S36 where a semi-transparent texel of a BG tile mixed with that tile's own SD colour:
 //     set SNES_HD_NO_SUB_BG_UNDER=1
@@ -804,6 +848,23 @@ struct HdFilterFrameStats
 	uint32_t LayerBits[4] = {}; // per-layer: pixels where layer has content
 	uint32_t Win[4] = {};       // per-layer: pixels where layer wins compositing
 	uint32_t HdLayers[4] = {};  // per-layer: HD tile found count
+	// S45: die Luecke zwischen GEFUNDEN und GEZEICHNET.
+	//
+	// HdLayers[] steht unmittelbar hinter GetMatchingTile und zaehlt den
+	// NACHSCHLAG. Am 21.09. meldete Barrel Bayou damit 26.886 HD-Treffer je
+	// Frame auf BG3 -- und der Hintergrund war im Spiel trotzdem nativ. Der
+	// User hat es entschieden, indem er den Pack-Ordner umbenannte: das Bild
+	// blieb unveraendert. Die Kunst wird also gefunden und danach verworfen,
+	// und kein Zaehler im Log konnte in diese Luecke sehen.
+	//
+	// Diese vier zaehlen je Ebene und je NATIVEM Pixel (nicht je Subpixel),
+	// damit sie direkt gegen HdLayers[] vergleichbar sind. Ihre Summe muss
+	// HdLayers[] ergeben -- eine Abweichung waere selbst ein Befund.
+	uint32_t DrawnLayer[4] = {};   // HD-Kunst des Gewinners kam in den Ausgabepuffer
+	uint32_t SkipClip[4] = {};     // von clipMain geblockt (Fenstermaske)
+	uint32_t SkipNoSmp[4] = {};    // Kachel gefunden, aber Sampler nicht gueltig
+	uint32_t SkipAlpha0[4] = {};   // Sampler gueltig, aber jeder Texel alpha=0
+	uint32_t SkipSubOp[4] = {};    // fuenftes Tor: spriteIsSubOperand erzwingt nativ
 	uint32_t MultiLayer = 0;    // pixels where bottom HD layer also found
 	uint32_t HdmaSplit = 0;     // scanlines whose registers differ from previous line
 	uint32_t SubOpHd = 0;       // P4.0: CM operand sampled from a sub-screen HD tile
@@ -876,6 +937,11 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
 		dst.HdLayers[i] += src.HdLayers[i];
+		dst.DrawnLayer[i] += src.DrawnLayer[i];
+		dst.SkipClip[i] += src.SkipClip[i];
+		dst.SkipNoSmp[i] += src.SkipNoSmp[i];
+		dst.SkipAlpha0[i] += src.SkipAlpha0[i];
+		dst.SkipSubOp[i] += src.SkipSubOp[i];
 	}
 }
 
@@ -1765,6 +1831,8 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 			// P4.1f: when the character is the color-math operand, render the
 			// exact PPU output instead of compositing HD art over it (Issue R).
 			if((hasMainHd || hasSubHd || hasEdgeHd) && !spriteIsSubOperand) {
+				// S45: wurde die HD-Kunst des Gewinners wirklich sichtbar?
+				bool hdWritten = false;
 				SnesHdScanlineInfo& sl = hdScreen->ScanlineInfo[y];
 				uint8_t brightness = sl.ScreenBrightness;
 
@@ -1943,6 +2011,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								mha = mc >> 24;
 							}
 							if(mha == 255) {
+								hdWritten = true;   // S45
 								r = (mc >> 16) & 0xFF; g = (mc >> 8) & 0xFF; b = mc & 0xFF;
 								if(mainLut) {
 									// R3: follow live CGRAM (rgb is premultiplied; alpha unchanged)
@@ -1973,6 +2042,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 									}
 								}
 								if(mha > 0) {
+									hdWritten = true;   // S45
 									int hr = (mc >> 16) & 0xFF, hg = (mc >> 8) & 0xFF, hb = mc & 0xFF;
 									if(mainLut) {
 										hr = mainLut[0][hr]; hg = mainLut[1][hg]; hb = mainLut[2][hb];
@@ -2103,7 +2173,23 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 						outputBuffer[outIndex] = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 					}
 				}
+
+				// S45: je BG-Gewinnerpixel genau einer der vier Zaehler. Sprites
+				// sind ausgenommen -- winLayer gilt dort nicht, und die Frage
+				// stammt von der BG-Seite. Die Reihenfolge ist die der Gates im
+				// Code darueber, damit der erste greifende Grund gezaehlt wird.
+				if(!spriteWon && winLayer < 4 && hasMainHd) {
+					if(clipMain) st.SkipClip[winLayer]++;
+					else if(!mainSampler.valid) st.SkipNoSmp[winLayer]++;
+					else if(!hdWritten) st.SkipAlpha0[winLayer]++;
+					else st.DrawnLayer[winLayer]++;
+				}
 			} else {
+				// S45: das fuenfte Tor. Liegt HD-Kunst fuer den Gewinner vor und wir
+				// landen trotzdem hier, kann nur spriteIsSubOperand (:1513) es sein --
+				// der Pixel wird bewusst nativ gezeichnet. Ohne diesen Zaehler waere
+				// die Summe kleiner als hdBGn und saehe nach einem unbekannten Tor aus.
+				if(!spriteWon && winLayer < 4 && hasMainHd) st.SkipSubOp[winLayer]++;
 				// No HD replacement — use original SNES color, scaled up
 				uint32_t color = calculatedPalette[ppuOutputBuffer[ppuIndex] & 0x7FFF];
 				for(uint32_t dy = 0; dy < hdScale; dy++) {
@@ -2111,6 +2197,27 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 						uint32_t outIndex = (outY + dy) * frameWidth + (outX + dx);
 						if(outIndex < frameWidth * frameHeight) {
 							outputBuffer[outIndex] = color;
+						}
+					}
+				}
+			}
+
+			// S47: der Anstrich liegt ganz am Ende und ueberschreibt, was auch immer
+			// oben entstanden ist -- HD wie nativ. Nur so zeigt er die Ebenenaufteilung
+			// und nicht die Kunst.
+			if(s_paintLayers && !spriteWon && winLayer < 4) {
+				static const uint32_t layerColor[4] = {
+					0xFFFF0000,  // BG1 rot
+					0xFF00FF00,  // BG2 gruen
+					0xFF0080FF,  // BG3 blau
+					0xFFFFFF00   // BG4 gelb
+				};
+				const uint32_t c = layerColor[winLayer];
+				for(uint32_t dy = 0; dy < hdScale; dy++) {
+					for(uint32_t dx = 0; dx < hdScale; dx++) {
+						uint32_t outIndex = (outY + dy) * frameWidth + (outX + dx);
+						if(outIndex < frameWidth * frameHeight) {
+							outputBuffer[outIndex] = c;
 						}
 					}
 				}
@@ -2381,6 +2488,52 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		AddFilterStats(total, statsSlots[si]);
 	}
 	uint32_t frameTotalPixels = total.TotalPixels;
+
+	// =====================================================================
+	// S48: Framebuffer-Dump (siehe Kommentar an den Schaltern oben).
+	// Steht hier, weil RunFrame die Render-Threads bereits eingesammelt hat --
+	// der Ausgabepuffer ist ab dieser Zeile fertig und wird nicht mehr
+	// angefasst. Kostet ausserhalb eines Dumps genau einen Integer-Vergleich.
+	// =====================================================================
+	if(s_dumpFrames > 0) {
+		static int s_dumpDone = 0;
+		static int s_dumpWait = 0;
+		const int activeSet = _hdData ? _hdData->ActiveGfxset : -1;
+		// BgPixels als Anzeichen fuer ein echtes Levelbild: beim Levelwechsel
+		// liefert der Filter reihenweise leere Frames (bg=0), und ein schwarzes
+		// PNG beantwortet keine Frage.
+		const bool realFrame = activeSet >= 0
+			&& (s_dumpGfxset < 0 || activeSet == s_dumpGfxset)
+			&& total.BgPixels > 20000;
+		if(s_dumpDone < s_dumpFrames && realFrame) {
+			if(s_dumpWait > 0) {
+				s_dumpWait--;
+			} else {
+				const char* home = getenv("USERPROFILE");
+				if(!home) home = getenv("HOME");
+				if(home) {
+					char path[600];
+					snprintf(path, sizeof(path),
+#ifdef _WIN32
+						"%s\\Downloads\\snes_hd_frame_gfx%02d_%02d.png",
+#else
+						"%s/Downloads/snes_hd_frame_gfx%02d_%02d.png",
+#endif
+						home, activeSet, s_dumpDone);
+					bool ok = PNGHelper::WritePNG(path, outputBuffer, frameInfo.Width, frameInfo.Height);
+					char buf[720];
+					snprintf(buf, sizeof(buf),
+						"[SNES HD diag] FRAMEDUMP %s %s (%ux%u, gfxset=%d, bg=%u, hdBG3=%u)",
+						ok ? "geschrieben:" : "FEHLGESCHLAGEN:", path,
+						frameInfo.Width, frameInfo.Height, activeSet,
+						total.BgPixels, total.HdLayers[2]);
+					DiagLog(buf);
+					s_dumpDone++;
+					s_dumpWait = s_dumpEvery;
+				}
+			}
+		}
+	}
 	uint32_t frameBgPixels = total.BgPixels;
 	uint32_t frameHdMatch = total.HdMatch;
 	uint32_t frameHdMiss = total.HdMiss;
@@ -2419,10 +2572,16 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameLayerBits[4];
 	uint32_t frameWin[4];
 	uint32_t frameHdLayers[4];
+	uint32_t frameDrawn[4], frameSkipClip[4], frameSkipNoSmp[4], frameSkipA0[4], frameSkipSubOp[4];
 	for(int li = 0; li < 4; li++) {
 		frameLayerBits[li] = total.LayerBits[li];
 		frameWin[li] = total.Win[li];
 		frameHdLayers[li] = total.HdLayers[li];
+		frameDrawn[li] = total.DrawnLayer[li];
+		frameSkipClip[li] = total.SkipClip[li];
+		frameSkipNoSmp[li] = total.SkipNoSmp[li];
+		frameSkipA0[li] = total.SkipAlpha0[li];
+		frameSkipSubOp[li] = total.SkipSubOp[li];
 	}
 
 	// =====================================================================
@@ -2499,6 +2658,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
+			" drawBG1=%u drawBG2=%u drawBG3=%u drawBG4=%u"
 			" wn0=%u wn1=%u wn2=%u wn3=%u"
 			" Main=$%02X Sub=$%02X CM=$%02X"
 			" (TileByKey=%zu, sig=%016llX)",
@@ -2515,6 +2675,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			filterMs, diagMsMax,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
+			frameDrawn[0], frameDrawn[1], frameDrawn[2], frameDrawn[3],
 			frameWin[0], frameWin[1], frameWin[2], frameWin[3],
 			slCtx.MainScreenLayers, slCtx.SubScreenLayers, slCtx.ColorMathEnabled,
 			_hdData->TileByKey.size(),
@@ -3315,6 +3476,23 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				frameLayerBits[L], frameWin[L], frameHdLayers[L], matchPct,
 				onMain ? 1 : 0, onSub ? 1 : 0, cmEnabled ? 1 : 0);
 			DiagLog(layBuf);
+
+			// S45: gefunden ist nicht gezeichnet. Diese Zeile ist der eigentliche
+			// Befund -- steht hdMatch hoch und drawn bei null, nennt der Grund
+			// rechts daneben die Stelle im Code, die es verwirft.
+			if(L < 4 && frameHdLayers[L] > 0) {
+				char drawBuf[512];
+				snprintf(drawBuf, sizeof(drawBuf),
+					"       -> davon GEZEICHNET: %u (%d%%)  | verworfen: clip=%u noSampler=%u alpha0=%u subOp=%u"
+					"  [Summe=%u, muss hdMatch=%u sein]",
+					frameDrawn[L],
+					(int)(100ULL * frameDrawn[L] / frameHdLayers[L]),
+					frameSkipClip[L], frameSkipNoSmp[L], frameSkipA0[L], frameSkipSubOp[L],
+					frameDrawn[L] + frameSkipClip[L] + frameSkipNoSmp[L] + frameSkipA0[L]
+						+ frameSkipSubOp[L],
+					frameHdLayers[L]);
+				DiagLog(drawBuf);
+			}
 		}
 
 		// --- OBJ/Sprite info ---

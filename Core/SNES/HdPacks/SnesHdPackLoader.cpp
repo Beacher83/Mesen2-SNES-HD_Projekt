@@ -312,8 +312,17 @@ bool SnesHdPackLoader::ParseGfxsetDirName(const string& dirName, uint8_t& gfxset
 {
 	// Expects "gfxset_07", "gfxset_8", etc.
 	if(dirName.size() < 8 || dirName.substr(0, 7) != "gfxset_") return false;
+	// S46: the REST must be digits and nothing else. std::stoul stops at the first
+	// non-digit and, with pos = nullptr, nobody notices the tail -- so "gfxset_38_aus"
+	// parsed as 38 and loaded exactly like "gfxset_38". That cost two days: the user
+	// renamed the folder to switch a level's art OFF, twice, and both times the pack
+	// loaded unchanged (TileByKey identical to the run before), which read as "the art
+	// is found but never drawn". A suffix is how one disables a folder; silently
+	// ignoring it turns a valid experiment into a false negative.
+	const string idxPart = dirName.substr(7);
+	if(idxPart.find_first_not_of("0123456789") != string::npos) return false;
 	try {
-		unsigned long idx = std::stoul(dirName.substr(7), nullptr, 10);
+		unsigned long idx = std::stoul(idxPart, nullptr, 10);
 		if(idx > 254) return false;  // 0xFF reserved for legacy (no gfxset)
 		gfxsetIndex = (uint8_t)idx;
 		return true;

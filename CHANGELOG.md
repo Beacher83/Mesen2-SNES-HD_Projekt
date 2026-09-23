@@ -21,6 +21,161 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-23] — S48: Framebuffer-Dump, weil ein Fensterfoto kein Messmittel ist
+
+**Der Anlass.** Ein halber Tag Messarbeit am Hintergrund von Barrel Bayou hat nichts ergeben,
+weil das einzige verfügbare Bild ein **Fensterfoto** war: 1071 px für 256 native Pixel,
+Massstab 4,1836. Diese krumme Skalierung verwischt genau das native Pixelraster — und das ist
+das einzige Signal, an dem sich nativ und HD unterscheiden lassen. Ich habe darauf zwei
+Analysen aufgebaut und dem User beide Male widersprochen; die erste („Korrelation 0,997“) stand
+auf Kacheln mit einer Trennschärfe von 0,57 von 255 und war damit Rauschen.
+
+Mesens eigene Screenshot-Taste (F12) tut das Richtige — `BaseVideoFilter::TakeScreenshot`
+kopiert den Ausgabepuffer des Videofilters —, wird auf dem Testrechner aber abgefangen, bevor
+Mesen sie sieht. Die Verknüpfung selbst ist in Ordnung (Tastencode 101 = F12,
+`KeyDefinitions.h:113`); dass `Mesen2\Screenshots` nie angelegt wurde, belegt, dass sie nie
+ausgelöst hat.
+
+**S48 braucht keine Taste.** Der Dump läuft im Filter, direkt hinter `RunFrame` — dort sind
+die Render-Threads eingesammelt und der Puffer wird nicht mehr angefasst:
+
+| Umgebungsvariable | Bedeutung |
+|---|---|
+| `SNES_HD_DUMP_FRAMES` | Anzahl Bilder (0 / ungesetzt = aus) |
+| `SNES_HD_DUMP_GFXSET` | nur dieses Gfxset (ungesetzt = jedes) |
+| `SNES_HD_DUMP_EVERY` | Abstand in Frames (Standard 30) |
+
+Nur auf einem echten Levelbild (`ActiveGfxset` gesetzt, `BgPixels > 20000`) — beim Levelwechsel
+liefert der Filter reihenweise leere Frames, und ein schwarzes PNG beantwortet keine Frage.
+Ziel: `%USERPROFILE%\Downloads\snes_hd_frame_gfxNN_MM.png`, dazu eine `FRAMEDUMP`-Zeile im
+Diagnoselog mit Groesse, Gfxset, `bg` und `hdBG3`. Ausserhalb eines Dumps kostet es einen
+Integer-Vergleich je Frame.
+
+Die Videoeinstellungen des Testrechners wurden vorher geprüft (`VideoFilter=None`,
+`ScanlineIntensity=0`, keine Rotation, Farbregler 0) — es kommt wirklich der rohe Puffer
+heraus. Dazu `dump_frames.bat` im Projektwurzelverzeichnis, das die Variablen setzt und Mesen
+startet.
+
+---
+
+## [2026-09-23] — S47: Ebenen-Anstrich
+
+`SNES_HD_PAINT_LAYERS=1` färbt jeden BG-Gewinnerpixel flächig ein — BG1 rot, BG2 grün, BG3
+blau, BG4 gelb, Sprites unberührt — ganz am Ende der Pixelbehandlung, über HD wie nativ.
+Beantwortet die Frage, die kein Zähler beantwortet: **wo auf dem Schirm** liegen die Pixel, die
+eine Ebene gewinnt. Gebaut, noch nicht im Spiel getestet.
+
+---
+
+## [2026-09-23] — S46: warum sich ein Pack-Ordner nicht abschalten liess
+
+**`gfxset_38_aus` wurde als gfxset 38 geladen.** `ParseGfxsetDirName`
+(`SnesHdPackLoader.cpp:311`) rief `std::stoul(dirName.substr(7), nullptr, 10)` — `stoul`
+hält beim ersten Nicht-Ziffern-Zeichen an, und mit `pos = nullptr` sieht niemand den Rest.
+Der Ordner wurde also ganz normal eingelesen.
+
+**Der Beleg lag die ganze Zeit in der FRAME-Zeile:** `TileByKey=56515`, im Lauf mit Ordner und
+im Lauf mit umbenanntem Ordner **identisch**. Dazu `miss=0` und `hdBG3 ≈ 25.482` in allen 639
+Frames des 08:40-Laufs — nach einem Power Cycle, der Ordner nachweislich umbenannt.
+
+**Folge für die Befundlage:** beide Ausschaltversuche (21.09. und 23.09.) waren nie in Kraft.
+Die Schlussfolgerung vom 21.09. — „die Kunst wird gefunden, aber nie gezeichnet“ — hatte damit
+nie eine Grundlage, und S45b hat genau das gemessen: 100 % gezeichnet auf allen drei Ebenen.
+
+**Fix:** der Teil hinter `gfxset_` muss vollständig aus Ziffern bestehen, sonst wird der Ordner
+übergangen. Damit tut ein Suffix das, was jeder davon erwartet. Ein Ordner lässt sich ab jetzt
+auch ohne Neubau abschalten, indem man ihn NICHT mit `gfxset_` beginnen lässt.
+
+---
+
+## [2026-09-23] — S45b: Ergebnis. Die Kunst WIRD gezeichnet.
+
+Lauf 08:12, `build=S45b`, Barrel Bayou:
+
+```
+BG1: win=1348  hdMatch=1348  -> GEZEICHNET 1348 (100%)  clip=0 noSampler=0 alpha0=0 subOp=0
+BG2: win=24427 hdMatch=24427 -> GEZEICHNET 24427 (100%) clip=0 noSampler=0 alpha0=0 subOp=0
+BG3: win=26886 hdMatch=26886 -> GEZEICHNET 26886 (100%) clip=0 noSampler=0 alpha0=0 subOp=0
+```
+
+**Kein Tor verwirft irgendetwas.** Die Summe stimmt auf allen drei Ebenen exakt mit `hdMatch`
+überein; die gesuchte Lücke zwischen „gefunden“ und „gezeichnet“ existiert nicht. Über 650
+Barrel-Bayou-Frames: `miss=0` in jedem einzelnen.
+
+**Warum der Umbenenn-Test vom 21.09. dann nichts zeigte.** `SnesConsole::LoadHdPack()` hat
+genau einen Aufrufer: `LoadRom()` (`SnesConsole.cpp:122`). Das Pack wird **einmal beim
+ROM-Laden** von der Platte gelesen — einen Ordner im laufenden Emulator umzubenennen ändert
+nichts, bis das ROM neu geladen wird. Gegenprobe über das ganze Log: in **allen 2.855**
+Barrel-Bayou-Frames (2.205× S44, 650× S45b) steht `miss=0` und `hdBG3 ≈ 25.000`. Ein Lauf mit
+fehlendem `bg3/gfxset_38` ist nirgends aufgezeichnet — der Ausschaltversuch war nie in Kraft.
+Offen bleibt die saubere Wiederholung: umbenennen **und Power Cycle**.
+
+Das S45b-Instrument bleibt drin. Es hat seine Frage beantwortet und kostet nichts.
+
+---
+
+## [2026-09-23] — S45b: das fünfte Tor mitzählen, den Hauptverdacht abräumen
+
+Vor dem ersten S45-Lauf zwei Dinge nachgezogen.
+
+**Das fünfte Tor.** Der große Renderblock beginnt mit
+`if((hasMainHd || hasSubHd || hasEdgeHd) && !spriteIsSubOperand)` (`:1787`). Ist
+`spriteIsSubOperand` gesetzt (`:1513`, P4.1f — Sprite ist der Sub-Gewinner und
+Farbmath-Operand), fällt der Pixel in den nativen `else`-Zweig, **bevor** einer der vier
+S45-Zähler ihn sieht. Die Summe wäre dann kleiner als `hdBGn` und hätte nach einem
+unbekannten Tor ausgesehen, obwohl die Stelle bekannt ist. Neuer Zähler `SkipSubOp`, gesetzt
+im `else`-Zweig. Die Log-Zeile rechnet die Summe jetzt selbst aus und stellt sie neben
+`hdMatch` — eine Abweichung ist damit wirklich ein Befund und kein Buchhaltungsfehler.
+
+**Der Hauptverdacht `noSampler` ist unwahrscheinlich.** Nachgesehen statt vermutet: alle 223
+PNGs in `bg3/gfxset_38` sind **32×32**, genau wie die 993 in `bg1/gfxset_38`. Bei `hdScale=4`
+ist der schlimmste Fall `srcTX=7` → `7*4+4 = 32`, und `32 > 32` ist falsch — das Tor bei
+`:379` kann so nicht feuern. Dass BG3 in Mode 1 2bpp ist, ändert die Maße im Pack nicht.
+**`alpha0` ist als Pauschalgrund ebenfalls raus:** 52 Kacheln sind vollflächig deckend, 171
+gemischt, **keine** komplett transparent. Bleiben `clip`, `subOp` und die Möglichkeit, dass
+die Summe stimmt und wir das Bild falsch zuordnen. Der Lauf entscheidet.
+
+---
+
+## [2026-09-21] — S45: der Unterschied zwischen GEFUNDEN und GEZEICHNET
+
+**Der Anlass.** Der User meldete, der Hintergrund von Barrel Bayou sei im Spiel nativ. Die
+Logs sagten das Gegenteil: `match=52661 miss=0`, BG3 mit **26.886 HD-Treffern je Frame**. Ich
+habe ihm das dreimal entgegengehalten. Entschieden hat es ein Handgriff von ihm: Pack-Ordner
+`bg/bg3/gfxset_38` umbenannt → **Bild unverändert**. Die Kunst wird gefunden und danach
+verworfen.
+
+**Warum kein Zähler das zeigen konnte.** `HdLayers[]` steht unmittelbar hinter
+`GetMatchingTile` (`:1130`) und zählt den **Nachschlag**. Zwischen ihm und dem Ausgabepuffer
+liegen `clipMain`, `HdTileSampler::Init` und die Alphaprüfung je Texel — drei Tore, die kein
+Zähler beobachtet hat.
+
+**S45 schließt die Lücke.** Vier Zähler je Ebene, je nativem Gewinnerpixel (nicht je
+Subpixel), damit sie direkt gegen `hdBGn` vergleichbar sind:
+
+| Zähler | bedeutet |
+|---|---|
+| `DrawnLayer` | die HD-Kunst des Gewinners kam in den Ausgabepuffer |
+| `SkipClip` | von `clipMain` geblockt (Fenstermaske) |
+| `SkipNoSmp` | Kachel gefunden, aber `mainSampler.valid == false` |
+| `SkipAlpha0` | Sampler gültig, aber jeder Texel alpha=0 |
+| `SkipSubOp` | (S45b) `spriteIsSubOperand` erzwingt den nativen Pfad |
+
+Die vier schließen einander aus und werden in der Reihenfolge der Tore im Code gezählt; ihre
+Summe muss `hdBGn` ergeben — eine Abweichung wäre selbst ein Befund.
+
+Sichtbar an zwei Stellen: `drawBG1..4` in der FRAME-Zeile, und im LEVEL-ANALYSIS-Block eine
+Zeile je Ebene, die `hdMatch` gegen `gezeichnet` stellt und den Grund benennt.
+
+**Verdacht, den der Lauf prüft:** `HdTileSampler::Init` (`:379`) verwirft eine Kachel, wenn
+`srcTX * hdScale + hdScale > tile->Width`. BG3 ist in Mode 1 **2bpp** — wenn die Kunst oder
+die Offsets dort anders liegen als bei den 4bpp-Ebenen, schlägt genau diese Prüfung zu, und
+`SkipNoSmp` würde es benennen. Das ist eine Vermutung; entschieden wird sie vom Lauf.
+
+Kostet nichts außerhalb der BG-Gewinnerpixel und ändert kein Bild.
+
+---
+
 ## [2026-09-21] — S44: Kantenglättung als SNES-Einstellung, live umschaltbar
 
 S43 ist im Spiel bestätigt (Lauf 11:45, `build=S43`, A/B leer): Franse je Frame deckungsgleich
