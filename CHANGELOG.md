@@ -21,6 +21,41 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-23] — Overlay-Franse ein ZWEITES Mal gemessen und verworfen (kein Code)
+
+**Nicht wieder aufbauen.** S25 (`4482908a`) hat die Franse in Overlay-Leveln schon einmal
+gezeichnet und wurde in `18f6381f` entfernt, weil fuenf A/B-Laeufe ueber 3.634 Frames keinen
+sichtbaren Unterschied fanden. Am 23.09. wurde derselbe Fall erneut geprueft — **mit demselben
+Ergebnis**: der User war in Mainbrace Mayhem und Lockjaw's Locker und sieht keinen Unterschied
+an den Kanten der Kongs.
+
+**Was dabei richtiggestellt wurde.** Die Notiz sprach von „Overlay-Level bekommen gar keine
+Kanten, 2.225 ungeglaettete Pixel je Frame“. Das war falsch formuliert. Gemessen über 2.301
+Overlay-Frames:
+
+| | je Frame |
+|---|---|
+| `sprHdSub` — Figuren MIT HD-Kunst ueber den Operanden | **1.581** |
+| `sprEdge` — Franse | 459,8 |
+| Frames ganz ohne Franse | **810 von 2.301 (35,2 %)**, dort `sprSubHd ≈ 2.951` |
+
+Die Figuren sind dort also **HD mit harten Umrissen**, nicht nativ. Es fehlt nur der weiche
+Rand, und der ist so duenn, dass ihn niemand findet: wo Franse gezeichnet wird, liegt
+`sprEdgeBlend/sprEdge` bei 1,05 gegen 2,6 in normalen Kontexten.
+
+**Der Mechanismus ist trotzdem bestaetigt:** beide Stellen, die Slot 2 fuellen, haengen an
+`drawMain` (`SnesPpu.cpp:1276` und `:1307`), und bei `Main=$04` ist OBJ nicht auf dem
+Main-Screen. Das ist kein Fehler, es ist nur wirkungslos zu beheben.
+
+**Eine Tatsache ist neu und aendert nichts:** die damalige Begruendung nannte „der Operand wird
+addiert und oft halbiert“, ausdruecklich als Vermutung. `Halve=0` in **allen drei**
+Overlay-Kontexten (`E10E4686511EB716`, `BD2C76B73C545997`, `F4AE27740B28F473`) — die Haelfte
+der Vermutung ist widerlegt, das Ergebnis bleibt.
+
+Reines Dokument, kein Code.
+
+---
+
 ## [2026-09-23] — S52 im Feld bestaetigt, Optimierung vermessen und geparkt
 
 **Spieltest ueber viele Level, alle sehen richtig aus.** Von **16.069 Frames** liegen **2**
