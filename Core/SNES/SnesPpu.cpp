@@ -730,6 +730,7 @@ void SnesPpu::FetchSpriteData()
 
 		_spriteTileCount = 0;
 		_currentSprite.Index = 0xFF;
+		_hdSpriteSeq = 0;   // S49: fetch order restarts with every scanline
 
 		if(_spriteCount == 0) {
 			_spriteFetchingDone = true;
@@ -782,6 +783,7 @@ void SnesPpu::FetchSpritePosition(uint8_t spriteIndex)
 
 	if(spriteIndex != _currentSprite.Index) {
 		_currentSprite.Index = spriteIndex;
+		_hdSpriteSeq++;   // S49: a new sprite starts here -- later = in front
 		_currentSprite.ColumnOffset = (_currentSprite.Width / 8);
 		if(_currentSprite.X <= -8 && _currentSprite.X != -256) {
 			//Skip the first tiles of the sprite (because the tiles are hidden to the left of the screen)
@@ -929,6 +931,7 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 				cur.VMirror = _currentSprite.VerticalMirror;
 				cur.NativeOpaque = opaque;
 				cur.Priority = _currentSprite.Priority;
+				cur.OamSeq = _hdSpriteSeq;   // S49
 
 				// S23: a transparent entry is a FRINGE candidate — the sprite does not
 				// cover this pixel natively, but its 4x art may still reach into it. It
@@ -938,9 +941,14 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 				// displaced by one that arrives later (if branch). Highest sprite
 				// priority wins; the filter still decides against the pixel's real
 				// winner whether it gets drawn.
+				// S49: on equal priority the frontmost sprite is the one fetched
+				// later. Before, the first arrival simply kept the slot, so which
+				// fringe survived a tie was arbitrary -- and the filter then threw
+				// it away anyway.
 				auto keepFringe = [&](const HdSpritePixel& e) {
 					HdSpritePixel& fr = _hdSpritePixelsFringeCopy[xPos + x];
-					if(fr.ContentHash == 0 || e.Priority > fr.Priority) {
+					if(fr.ContentHash == 0 || e.Priority > fr.Priority
+						|| (e.Priority == fr.Priority && e.OamSeq > fr.OamSeq)) {
 						fr = e;
 						_hdSpriteFringeCopyDirty = true;
 					}
@@ -1218,6 +1226,7 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 		t.HorizontalMirror = sp.HMirror;
 		t.VerticalMirror = sp.VMirror;
 		t.Priority = spritePrio;
+		t.OamSeq = sp.OamSeq;   // S49
 		t.VramWordAddr = sp.TileVramAddr;
 		pi.SpriteCount |= (1 << slot);
 
@@ -1238,6 +1247,7 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 			u.HorizontalMirror = un.HMirror;
 			u.VerticalMirror = un.VMirror;
 			u.Priority = priority[un.Priority & 0x03];
+			u.OamSeq = un.OamSeq;   // S49
 			u.VramWordAddr = un.TileVramAddr;
 			pi.SpriteCount |= 0x08;
 		}

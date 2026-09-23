@@ -20,7 +20,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S48"
+#define SNES_HD_BUILD_VERSION "S49"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -255,6 +255,9 @@ static void WriteSessionBanner(FILE* f, const char* what)
 		"SNES_HD_NO_BACKDROP_GROUND",
 		"SNES_HD_NO_SUB_BG_UNDER",
 		"SNES_HD_SPRWATCH",
+		"SNES_HD_NO_OAM_TIEBREAK",   // S49
+		"SNES_HD_PAINT_LAYERS",      // S47
+		"SNES_HD_DUMP_FRAMES",       // S48
 	};
 	char active[512];
 	active[0] = 0;
@@ -742,6 +745,10 @@ static const bool s_noBackdropGround = getenv("SNES_HD_NO_BACKDROP_GROUND") != n
 // Mit SNES_HD_PAINT_LAYERS=1 einschalten. Reiner Diagnosepfad.
 static const bool s_paintLayers = getenv("SNES_HD_PAINT_LAYERS") != nullptr;
 
+// S49: force-off for the OAM tie-break below, so the old behaviour can be put
+// back in the same session without a rebuild -- the pattern S42/S44 used.
+static const bool s_noOamTiebreak = getenv("SNES_HD_NO_OAM_TIEBREAK") != nullptr;
+
 // S48: Framebuffer-Dump. Schreibt den fertigen Ausgabepuffer des Filters als
 // PNG -- exakt das, was auf dem Schirm landet, in voller HD-Aufloesung und mit
 // ganzzahligem Massstab.
@@ -879,7 +886,8 @@ struct HdFilterFrameStats
 	uint32_t SprEdge = 0;       // S21: pixels outside the native silhouette that carry sprite fringe art
 	uint32_t SprEdgeBlend = 0;  // S21: of those, sub-pixels where the fringe was actually drawn
 	uint32_t SprEdgeUnder = 0;  // S22: pixels blended against the sprite behind, not the BG
-	uint32_t SprEdgeTie = 0;    // S23: fringe present over a sprite, priority rejects it
+	uint32_t SprEdgeTie = 0;     // S23: fringe present over a sprite, priority rejects it
+	uint32_t SprEdgeTieWon = 0;  // S49: that tie resolved by OAM order -- fringe drawn after all
 	uint32_t SubSprBot = 0;     // S26: sub-screen sprite given a BG ground to blend against
 	uint32_t SubSprUnder = 0;   // S27: sub-screen sprite blended against the SPRITE behind it
 	uint32_t SubSprNoBot = 0;   // S29: gate passed, but no ground found (no sub-screen BG with HD art)
@@ -920,6 +928,7 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SprEdgeBlend += src.SprEdgeBlend;
 	dst.SprEdgeUnder += src.SprEdgeUnder;
 	dst.SprEdgeTie += src.SprEdgeTie;
+	dst.SprEdgeTieWon += src.SprEdgeTieWon;
 	dst.SubSprBot += src.SubSprBot;
 	dst.SubSprUnder += src.SubSprUnder;
 	dst.SubSprNoBot += src.SubSprNoBot;
@@ -1824,7 +1833,35 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				// S23 diagnostic: a fringe was recorded over a winning sprite but the
 				// priority test rejected it. A large number here means equal priorities
 				// are common and the tie-break has to come from OAM order after all.
-				st.SprEdgeTie++;
+				//
+				// S49 supplies it. On EQUAL priority the hardware separates the two by
+				// OAM order, and slot 2 now carries the scanline fetch sequence, where
+				// a HIGHER value means fetched later and therefore in front (see
+				// HdSpritePixel::OamSeq). Only the equal case is opened up: a fringe of
+				// LOWER priority stays rejected, exactly as before.
+				//
+				// This is deliberately the narrow version of what S23 tried. S23 dropped
+				// the !spriteWon guard outright and Dixie's hair showed through the crate
+				// she carries -- fringes were drawn over sprites really in front of them.
+				// With the sequence in hand that case is now the one being excluded.
+				const bool tieBreakable = !s_noOamTiebreak
+					&& (pixelInfo.SpriteCount & 0x01)
+					&& pixelInfo.Sprites[2].Priority == (pixelInfo.MainScreenFlags & 0x0F)
+					&& pixelInfo.Sprites[2].OamSeq > pixelInfo.Sprites[0].OamSeq;
+				if(tieBreakable) {
+					edgeTile = CachedGetMatchingTile(hdData, hdScreen->Vram, tileLookupCache,
+						pixelInfo.Sprites[2].Key);
+					if(edgeTile && !edgeTile->HdTileData.empty()) {
+						edgeTileInfo = &pixelInfo.Sprites[2];
+						st.SprEdge++;
+						st.SprEdgeTieWon++;
+					} else {
+						edgeTile = nullptr;
+						st.SprEdgeTie++;
+					}
+				} else {
+					st.SprEdgeTie++;
+				}
 			}
 			bool hasEdgeHd = edgeTile != nullptr;
 
@@ -2556,6 +2593,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	uint32_t frameSprEdgeBlend = total.SprEdgeBlend;
 	uint32_t frameSprEdgeUnder = total.SprEdgeUnder;
 	uint32_t frameSprEdgeTie = total.SprEdgeTie;
+	uint32_t frameSprEdgeTieWon = total.SprEdgeTieWon;
 	uint32_t frameSubBgBot = total.SubBgBot;
 	uint32_t frameSubBgBotRetry = total.SubBgBotRetry;
 	uint32_t frameSubBgNoBot = total.SubBgNoBot;
@@ -2653,7 +2691,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
 			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
-			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u subBot=%u subSprUnder=%u subNoBot=%u sprHoleHd=%u subNoRef=%u subOpaque=%u nbEmpty=%u nbNoHd=%u subBotRetry=%u"
+			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u sprFrTieWon=%u subBot=%u subSprUnder=%u subNoBot=%u sprHoleHd=%u subNoRef=%u subOpaque=%u nbEmpty=%u nbNoHd=%u subBotRetry=%u"
 			" bgBot=%u bgBotRetry=%u bgNoBot=%u bgOpaque=%u"
 			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
@@ -2668,7 +2706,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameSprSubHd,
 			frameSprRecolor, frameSprRecolorNoRef,
 			frameSprEdge, frameSprEdgeBlend, frameSprEdgeUnder,
-			frameSprEdgeTie, frameSubSprBot,
+			frameSprEdgeTie, frameSprEdgeTieWon, frameSubSprBot,
 			frameSubSprUnder, frameSubSprNoBot, frameSprHoleHd, frameSubGateNoRef, frameSubGateOpaque, frameSubNoBotEmpty, frameSubNoBotNoHd, frameSubBotRetry,
 			frameSubBgBot, frameSubBgBotRetry, frameSubBgNoBot, frameSubBgOpaque,
 			frameMaskZero, frameHdmaSplit,

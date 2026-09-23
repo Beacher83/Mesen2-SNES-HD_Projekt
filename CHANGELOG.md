@@ -21,6 +21,55 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-23] — S49: der Prioritaets-Gleichstand bekommt die OAM-Reihenfolge
+
+**Das Problem.** Das Franse-Tor (`SnesHdVideoFilter.cpp:1823`) verwirft jede Franse, deren
+Sprite dieselbe OBJ-Prioritaet hat wie das Sprite, das den Pixel gewonnen hat. Gemessen am
+21.09.: **14,3 % aller Fransenkandidaten**, im Kleever-Kampf **19,0 %**. Der S23-Kommentar
+sagt es seit Wochen voraus: *„A large number here means equal priorities are common and the
+tie-break has to come from OAM order after all.“* Die Zahl ist gross geworden.
+
+**Die Reihenfolge war da und wurde weggeworfen.** `SnesPpu.cpp:903` sagt selbst „sprites are
+fetched in OAM order“, und `SpriteInfo.Index` liegt genau an der Aufzeichnungsstelle. Verworfen
+wurde sie zweimal: die Zeilenpuffer verdichten auf einen Eintrag je Pixel, und `keepFringe`
+entschied nur nach Prioritaet — bei Gleichstand gewann willkuerlich der erste.
+
+**Was S49 mitfuehrt, ist die FETCH-Reihenfolge, nicht der rohe OAM-Index.** Genau die benutzt
+Mesen selbst: der Fetch laeuft rueckwaerts durch `_spriteIndexes` (`_spriteCount--` in
+`FetchSpritePosition`), also ist das ZULETZT geholte Sprite das zuerst ausgewertete und damit
+das vordere — derselbe Grund, aus dem der native Farbpuffer spaetere Fetches fruehere
+ueberschreiben laesst. **Hoeherer `OamSeq` = weiter vorne.** Ueber den rohen Index zu gehen
+hiesse, die OAM-Prioritaetsrotation hier noch einmal nachzubauen.
+
+`_hdSpriteSeq` zaehlt je Scanline hoch, sobald in `FetchSpritePosition` ein neues Sprite
+beginnt. Das Feld reist durch `HdSpritePixel` und `SnesHdPpuTileInfo` bis in die Slots 0–3.
+
+**Speicherkosten: null, gemessen statt geschaetzt.** `sizeof(SnesHdPpuTileInfo)` ist mit und
+ohne das Feld **32 Byte** — es faellt in vorhandene Polsterung, der 14,94-MB-Schirmpuffer
+waechst nicht.
+
+**Nur der Gleichstand wird geoeffnet.** Eine Franse niedrigerer Prioritaet bleibt abgelehnt.
+Das ist bewusst die enge Fassung dessen, was S23 versucht hat: S23 liess die `!spriteWon`-Sperre
+ganz fallen, und Dixies Haar schien durch die Kiste, die sie ueber dem Kopf traegt — Fransen
+wurden ueber Sprites gezeichnet, die wirklich davor lagen. Mit der Reihenfolge in der Hand ist
+genau dieser Fall jetzt der ausgeschlossene.
+
+**Neuer Zaehler `sprFrTieWon`** in der FRAME-Zeile neben `sprFrTie`: gewonnene gegen weiterhin
+verworfene Gleichstaende. Zusammen muessen sie die alte `sprFrTie` ergeben.
+
+**Rueckfall ohne Neubau:** `SNES_HD_NO_OAM_TIEBREAK=1` stellt das alte Verhalten her,
+`ab_no_oam_tiebreak.bat` setzt es und startet Mesen. Der Schalter steht im Sitzungsbanner
+unter „A/B:“ — zusammen mit `SNES_HD_PAINT_LAYERS` und `SNES_HD_DUMP_FRAMES`, die dort
+seit S47/S48 fehlten.
+
+**Noch nicht im Spiel getestet.** Erwartung: `sprFrTie` faellt deutlich, `sprFrTieWon` steigt
+entsprechend, `sprEdge` steigt um denselben Betrag. Bildtest sind Kleevers zerfallendes
+Schwert und Dixie mit der Kiste — dort ueberlappen gleichrangige Sprites.
+
+Beruehrt `SnesPpu.cpp/h`, also mehr als den Filter — Core neu bauen.
+
+---
+
 ## [2026-09-23] — S48: Framebuffer-Dump, weil ein Fensterfoto kein Messmittel ist
 
 **Der Anlass.** Ein halber Tag Messarbeit am Hintergrund von Barrel Bayou hat nichts ergeben,

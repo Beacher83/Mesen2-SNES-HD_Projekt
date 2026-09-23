@@ -145,7 +145,22 @@ private:
 		bool NativeOpaque = false;
 		uint8_t Priority = 0;
 
+		// S49: fetch order within the scanline, so the filter can break a PRIORITY
+		// TIE. Two sprites of equal OBJ priority are separated on hardware by OAM
+		// order, and the per-pixel model never had it: the filter's fringe gate
+		// rejected every tie, measured at 14.3% of all fringe candidates run-wide
+		// and 19.0% in Kleever's fight. The S23 comment predicted exactly this.
+		//
+		// This is the FETCH sequence, not the raw OAM index, because that is what
+		// Mesen's own ordering uses: sprites are fetched backwards through
+		// _spriteIndexes (see the _spriteCount-- in FetchSpritePosition), so the
+		// LAST sprite fetched is the first evaluated and therefore the one in
+		// front -- the same reason the native colour buffer lets later fetches
+		// overwrite earlier ones. HIGHER OamSeq = IN FRONT. Reading it off the raw
+		// index instead would mean re-deriving the OAM priority rotation here.
+		uint8_t OamSeq = 0;
 	};
+	uint8_t _hdSpriteSeq = 0;              // S49: per-scanline fetch counter, see HdSpritePixel::OamSeq
 	HdSpritePixel _hdSpritePixels[256] = {};
 	HdSpritePixel _hdSpritePixelsCopy[256] = {};
 

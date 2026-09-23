@@ -135,6 +135,10 @@ struct SnesHdPpuTileInfo
 	bool HorizontalMirror = false;
 	bool VerticalMirror = false;
 	uint8_t Priority = 0;       // SNES tile priority (from tilemap bit 13)
+	uint8_t OamSeq = 0;         // S49: sprite fetch order in the scanline; HIGHER = in front.
+	                            // Only meaningful for sprite slots (LayerIndex 4). Measured:
+	                            // adding it leaves sizeof() at 32 bytes, so the 14.94 MB
+	                            // screen buffer does not grow -- it fits existing padding.
 
 	uint16_t TilemapData = 0;   // Raw 16-bit tilemap word (for conditions/debugging)
 	uint16_t VramWordAddr = 0;  // VRAM word address used for content hash (diagnostic: detect DMA range)
