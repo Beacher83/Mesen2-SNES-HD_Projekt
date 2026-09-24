@@ -20,7 +20,7 @@
 #include <thread>
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S52"
+#define SNES_HD_BUILD_VERSION "S53"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -413,17 +413,21 @@ struct HdTileSampler
 struct HdSpriteRecolor
 {
 	bool valid = false;
+	// S53: wie viele Farben die Palette hat -- 16 bei 4bpp und Sprites, 4 bei
+	// 2bpp. Apply() sucht nur ueber Eintraege, die die Kachel wirklich haben kann.
+	uint8_t count = 16;
 	uint8_t refR[16] = {}, refG[16] = {}, refB[16] = {};
 	int16_t dR[16] = {}, dG[16] = {}, dB[16] = {};
 
-	void Init(const uint16_t* refPal, const uint16_t* liveRow)
+	void Init(const uint16_t* refPal, const uint16_t* liveRow, int n = 16)
 	{
 		valid = false;
+		count = (uint8_t)n;
 		if(!refPal || !liveRow) {
 			return;
 		}
 		bool anyDelta = false;
-		for(int i = 0; i < 16; i++) {
+		for(int i = 0; i < n; i++) {
 			uint16_t rc = refPal[i] & 0x7FFF;
 			uint16_t lc = liveRow[i] & 0x7FFF;
 			refR[i] = ColorUtilities::Convert5BitTo8Bit(rc & 0x1F);
@@ -456,7 +460,7 @@ struct HdSpriteRecolor
 			b = std::min(255, b * 255 / (int)a);
 		}
 		int best = 1, bestD = 0x7FFFFFFF;
-		for(int i = 1; i < 16; i++) {
+		for(int i = 1; i < count; i++) {
 			int er = r - (int)refR[i], eg = g - (int)refG[i], eb = b - (int)refB[i];
 			int d = er * er + eg * eg + eb * eb;
 			if(d < bestD) {
@@ -699,11 +703,12 @@ struct HdFilterFrameCtx
 	bool blockBgHd = false;
 	uint64_t vramSig = 0;
 	bool anyPalTransform = false;
-	const bool* palRowActive = nullptr;        // [8]
-	const uint8_t (*palLut)[3][256] = nullptr; // [8][3][256]
-	// S52: je BG-Palettenzeile einmal vorberechnet; nullptr = nicht aktiv.
-	const void* bgRecolor = nullptr;            // HdSpriteRecolor[8]
-	const bool* bgRecolorActive = nullptr;      // [8]
+	// S53: indiziert ueber BgPalBlock(), nicht mehr ueber die Palettennummer.
+	const bool* palRowActive = nullptr;        // [BgPalBlockCount]
+	const uint8_t (*palLut)[3][256] = nullptr; // [BgPalBlockCount][3][256]
+	// S52: je BG-Palettenblock einmal vorberechnet; nullptr = nicht aktiv.
+	const void* bgRecolor = nullptr;            // HdSpriteRecolor[BgPalBlockCount]
+	const bool* bgRecolorActive = nullptr;      // [BgPalBlockCount]
 };
 
 // Per-thread frame counters, summed after all threads joined.
@@ -798,23 +803,52 @@ static const bool s_noSubHdOperand = getenv("SNES_HD_NO_SUB_HD_OPERAND") != null
 // Fuer Sprites laeuft es seit S19; die BG-Seite hat es nie bekommen.
 //
 // Kosten: Init() ist teuer (16 Farben), deshalb wird es EINMAL JE FRAME fuer
-// die acht BG-Zeilen vorberechnet, genau wie palLut -- im Pixel steht dann nur
+// die BG-Palettenbloecke vorberechnet, genau wie palLut -- im Pixel steht dann nur
 // ein Zeiger. Apply() kostet je Texel bis zu 15 Vergleiche statt drei
 // Tabellenzugriffen, mit Frueh-Ausstieg bei exaktem Treffer, der bei
 // Palettenfarben fast immer greift. Frame-Zeit steht als ms=cur/max im Log.
 //
-// BEKANNTE GRENZE: Apply() sucht die naechste Referenzfarbe ueber die Eintraege
-// 1-15. Eine 2bpp-Ebene (BG3/BG4 in Mode 1) kann nur 1-3 benutzen; die uebrigen
-// zwoelf gehoeren den 4bpp-Ebenen, die sich dieselbe CGRAM-Zeile teilen. Ein
-// BG3-Texel koennte also auf einen Eintrag treffen, den es gar nicht haben kann.
-// Entschaerft, aber nicht geloest: der Umfaerber ist nur aktiv, wenn sich
-// Referenz und Live in dieser Zeile ueberhaupt unterscheiden (Init setzt valid
-// nur dann) -- in Barrel Bayou etwa sind sie identisch, dort passiert nichts.
-// Derselbe Zaehlfehler steckt schon im R3-LUT (Verhaeltnis ueber 1-15 statt 1-3),
-// dort seit jeher. Wer das aufraeumt, raeumt beide auf einmal auf.
-//
 // SNES_HD_NO_BG_RECOLOR=1 faellt auf den alten R3-LUT zurueck.
 static const bool s_noBgRecolor = getenv("SNES_HD_NO_BG_RECOLOR") != nullptr;
+
+// S53: welche CGRAM-Farben eine BG-Kachel ueberhaupt hat.
+//
+// Bis S52 haben R3-LUT und Umfaerber jede BG-Kachel ueber `PaletteIndex & 7` an
+// die 4bpp-Zeile CGRAM[pal*16 .. pal*16+15] gehaengt. Die Hardware adressiert
+// aber `basis + pal * 2^bpp + farbe` (SnesPpu::GetRgbColor): eine 2bpp-Kachel
+// mit Palette 3 hat die Farben CGRAM[12..15], nicht [48..63]. Nur Palette 0
+// traf ueberhaupt die richtigen drei Farben, und selbst dort suchte Apply() ueber
+// zwoelf fremde mit. Belegt in bgcap: BG3 in gfxset 37 laeuft zu 95 % auf P1,
+// gfxset 38 auf P0-P6 -- also bekam BG3 dort die Farbkorrektur von BG1/BG2.
+//
+// Die Bloecke 0-7 sind die 4bpp-Zeilen (16 Farben ab pal*16), die Bloecke
+// 8-39 die 2bpp-Viertelzeilen (4 Farben ab (b-8)*4). Mode 0 legt die vier
+// Ebenen je 32 Farben auseinander, alle anderen Modi beginnen bei 0 -- genau die
+// basePaletteOffset-Werte der RenderTilemap-Aufrufe in SnesPpu.cpp.
+// 8bpp (Mode 3/4 BG1, Mode 7) ignoriert die Palettenbits und haette 255 Farben;
+// dafuer gibt es keinen Block, diese Kacheln bleiben unveraendert.
+static constexpr int BgPalBlockCount = 8 + 32;
+
+static inline int BgPalBlock(uint8_t bgMode, uint8_t layer, uint8_t pal)
+{
+	if(layer > 3) {
+		return -1;
+	}
+	pal &= 7;
+	switch(bgMode & 7) {
+		case 0: return 8 + layer * 8 + pal;
+		case 1: return layer <= 1 ? pal : (layer == 2 ? 8 + pal : -1);
+		case 2: return layer <= 1 ? pal : -1;
+		case 3: return layer == 1 ? pal : -1;
+		case 4: return layer == 1 ? 8 + pal : -1;
+		case 5: return layer == 0 ? pal : (layer == 1 ? 8 + pal : -1);
+		case 6: return layer == 0 ? pal : -1;
+		default: return -1;
+	}
+}
+
+static inline int BgPalBlockStart(int block) { return block < 8 ? block * 16 : (block - 8) * 4; }
+static inline int BgPalBlockSize(int block) { return block < 8 ? 16 : 4; }
 
 // S48: Framebuffer-Dump. Schreibt den fertigen Ausgabepuffer des Filters als
 // PNG -- exakt das, was auf dem Schirm landet, in voller HD-Aufloesung und mit
@@ -1977,31 +2011,37 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				// R3.1: pointer to the row's 3×256 LUT — one load per channel per sample.
 				typedef const uint8_t (*PalLutRow)[256];
 				PalLutRow botLut = nullptr, mainLut = nullptr, subLut = nullptr, subBotLut = nullptr;
+				// S53: der CGRAM-Block je Kachel, nach Modus, Ebene und Palette --
+				// siehe BgPalBlock(). -1 = Sprite, 8bpp oder kein Sampler.
+				const int botBlk = botSampler.valid && hdTileInfoBot->Key.LayerIndex != 4
+					? BgPalBlock(sl.BgMode, hdTileInfoBot->Key.LayerIndex, hdTileInfoBot->Key.PaletteIndex) : -1;
+				const int mainBlk = mainSampler.valid && hdTileInfo->Key.LayerIndex != 4
+					? BgPalBlock(sl.BgMode, hdTileInfo->Key.LayerIndex, hdTileInfo->Key.PaletteIndex) : -1;
+				const int subBlk = subSampler.valid && subTileInfo->Key.LayerIndex != 4
+					? BgPalBlock(sl.BgMode, subTileInfo->Key.LayerIndex, subTileInfo->Key.PaletteIndex) : -1;
+				const int subBotBlk = subBotSampler.valid && subTileInfoBot->Key.LayerIndex != 4
+					? BgPalBlock(sl.BgMode, subTileInfoBot->Key.LayerIndex, subTileInfoBot->Key.PaletteIndex) : -1;
 				if(anyPalTransform) {
 					// S22: the bottom tile can now be a SPRITE (slot 3). Same OBJ-palette
 					// exemption as main/sub below — the R3 LUT covers BG CGRAM rows 0-7
 					// only, and running a sprite through it would tint it with a BG row.
-					if(botSampler.valid && hdTileInfoBot->Key.LayerIndex != 4
-						&& palRowActive[hdTileInfoBot->Key.PaletteIndex & 7]) {
-						botLut = palLut[hdTileInfoBot->Key.PaletteIndex & 7];
+					if(botBlk >= 0 && palRowActive[botBlk]) {
+						botLut = palLut[botBlk];
 					}
 					// S4: no LUT for sprites — the R3 transform covers BG CGRAM rows
 					// 0-7 (entries 0-127) only; OBJ palettes live at CGRAM 128-255.
-					if(mainSampler.valid && hdTileInfo->Key.LayerIndex != 4
-						&& palRowActive[hdTileInfo->Key.PaletteIndex & 7]) {
-						mainLut = palLut[hdTileInfo->Key.PaletteIndex & 7];
+					if(mainBlk >= 0 && palRowActive[mainBlk]) {
+						mainLut = palLut[mainBlk];
 					}
 					// S7: sub operand may now be a sprite (LayerIndex 4) — same OBJ-palette
 					// exemption as the main sprite path above.
-					if(subSampler.valid && subTileInfo->Key.LayerIndex != 4
-						&& palRowActive[subTileInfo->Key.PaletteIndex & 7]) {
-						subLut = palLut[subTileInfo->Key.PaletteIndex & 7];
+					if(subBlk >= 0 && palRowActive[subBlk]) {
+						subLut = palLut[subBlk];
 					}
 					// S26: the ground under a sub-screen sprite is a BG tile, so unlike
 					// the sprite above it this one DOES belong under the R3 row LUT.
-					if(subBotSampler.valid && subTileInfoBot->Key.LayerIndex != 4
-						&& palRowActive[subTileInfoBot->Key.PaletteIndex & 7]) {
-						subBotLut = palLut[subTileInfoBot->Key.PaletteIndex & 7];
+					if(subBotBlk >= 0 && palRowActive[subBotBlk]) {
+						subBotLut = palLut[subBotBlk];
 					}
 				}
 
@@ -2021,14 +2061,12 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				HdSpriteRecolor mainRecolorObj, subRecolorObj;
 				const HdSpriteRecolor* mainRecolor = nullptr;
 				const HdSpriteRecolor* subRecolor = nullptr;
-				if(bgRecolor && mainSampler.valid && hdTileInfo->Key.LayerIndex != 4
-					&& bgRecolorActive[hdTileInfo->Key.PaletteIndex & 7]) {
-					mainRecolor = &bgRecolor[hdTileInfo->Key.PaletteIndex & 7];
+				if(bgRecolor && mainBlk >= 0 && bgRecolorActive[mainBlk]) {
+					mainRecolor = &bgRecolor[mainBlk];
 					mainLut = nullptr;   // beides waere doppelt gemoppelt
 				}
-				if(bgRecolor && subSampler.valid && subTileInfo->Key.LayerIndex != 4
-					&& bgRecolorActive[subTileInfo->Key.PaletteIndex & 7]) {
-					subRecolor = &bgRecolor[subTileInfo->Key.PaletteIndex & 7];
+				if(bgRecolor && subBlk >= 0 && bgRecolorActive[subBlk]) {
+					subRecolor = &bgRecolor[subBlk];
 					subLut = nullptr;
 				}
 				if(!s_noRecolor && mainSampler.valid && hdTileInfo->Key.LayerIndex == 4) {
@@ -2058,9 +2096,8 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				// baked colors while the one in front follows the level's tint.
 				HdSpriteRecolor botRecolorObj;
 				const HdSpriteRecolor* botRecolor = nullptr;
-				if(bgRecolor && botSampler.valid && hdTileInfoBot->Key.LayerIndex != 4
-					&& bgRecolorActive[hdTileInfoBot->Key.PaletteIndex & 7]) {
-					botRecolor = &bgRecolor[hdTileInfoBot->Key.PaletteIndex & 7];
+				if(bgRecolor && botBlk >= 0 && bgRecolorActive[botBlk]) {
+					botRecolor = &bgRecolor[botBlk];
 					botLut = nullptr;
 				}
 				if(!s_noRecolor && botSampler.valid && hdTileInfoBot->Key.LayerIndex == 4) {
@@ -2075,9 +2112,8 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 				// in front follows the level's live OBJ palette.
 				HdSpriteRecolor subBotRecolorObj;
 				const HdSpriteRecolor* subBotRecolor = nullptr;
-				if(bgRecolor && subBotSampler.valid && subTileInfoBot->Key.LayerIndex != 4
-					&& bgRecolorActive[subTileInfoBot->Key.PaletteIndex & 7]) {
-					subBotRecolor = &bgRecolor[subTileInfoBot->Key.PaletteIndex & 7];
+				if(bgRecolor && subBotBlk >= 0 && bgRecolorActive[subBotBlk]) {
+					subBotRecolor = &bgRecolor[subBotBlk];
 					subBotLut = nullptr;
 				}
 				if(!s_noRecolor && subBotSampler.valid && subTileInfoBot->Key.LayerIndex == 4) {
@@ -2451,8 +2487,9 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// reference exactly are skipped, so levels without CGRAM effects (and
 	// packs without palettes.bin) are completely unaffected.
 	// =====================================================================
-	uint16_t palRatio[8][3];
-	bool palRowActive[8] = {};
+	// S53: je CGRAM-Block statt je Palettennummer, siehe BgPalBlock().
+	uint16_t palRatio[BgPalBlockCount][3];
+	bool palRowActive[BgPalBlockCount] = {};
 	bool anyPalTransform = false;
 	// S50: R3 ganz abschaltbar, siehe Schalter oben.
 	const bool palTransformEnabled = !s_noPalTransform;
@@ -2462,17 +2499,18 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	// visually). That defeats the "identical row → skip" fast path, so the
 	// per-sample cost matters: precomputed 8×3×256 LUTs (6 KB, L1-resident)
 	// replace per-sample multiply/shift/clamp with one table load per channel.
-	uint8_t palLut[8][3][256];
+	uint8_t palLut[BgPalBlockCount][3][256];
 	// S52: je BG-Palettenzeile ein Umfaerber, EINMAL je Frame gebaut. Init() ist
 	// zu teuer fuer den Pixel (16 Farben), Apply() dagegen billig genug.
-	HdSpriteRecolor bgRecolor[8];
-	bool bgRecolorActive[8] = {};
+	HdSpriteRecolor bgRecolor[BgPalBlockCount];
+	bool bgRecolorActive[BgPalBlockCount] = {};
 	bool anyBgRecolor = false;
 	if(!s_noBgRecolor && _hdData->ActiveGfxset >= 0 && !_hdData->GfxsetPalettes.empty()) {
 		auto it = _hdData->GfxsetPalettes.find((uint8_t)_hdData->ActiveGfxset);
 		if(it != _hdData->GfxsetPalettes.end() && it->second.size() >= 128) {
-			for(int row = 0; row < 8; row++) {
-				bgRecolor[row].Init(it->second.data() + row * 16, hdScreen->Cgram + row * 16);
+			for(int row = 0; row < BgPalBlockCount; row++) {
+				const int start = BgPalBlockStart(row);
+				bgRecolor[row].Init(it->second.data() + start, hdScreen->Cgram + start, BgPalBlockSize(row));
 				// Init setzt valid nur, wenn sich ueberhaupt etwas unterscheidet --
 				// bei ref == live ist Apply() die exakte Identitaet und der Umweg
 				// waere reine Rechenzeit.
@@ -2485,14 +2523,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		auto palIt = _hdData->GfxsetPalettes.find((uint8_t)_hdData->ActiveGfxset);
 		if(palIt != _hdData->GfxsetPalettes.end() && palIt->second.size() >= 128) {
 			const uint16_t* ref = palIt->second.data();
-			for(int row = 0; row < 8; row++) {
-				const uint16_t* refRow = ref + row * 16;
-				const uint16_t* liveRow = hdScreen->Cgram + row * 16;
+			for(int row = 0; row < BgPalBlockCount; row++) {
+				const uint16_t* refRow = ref + BgPalBlockStart(row);
+				const uint16_t* liveRow = hdScreen->Cgram + BgPalBlockStart(row);
+				const int rowSize = BgPalBlockSize(row);
 				// Index 0 of each row is the transparent color — not part of
 				// any visible tile pixel, so it is excluded from comparison.
 				uint32_t refSum[3] = {}, liveSum[3] = {};
 				bool differs = false;
-				for(int i = 1; i < 16; i++) {
+				for(int i = 1; i < rowSize; i++) {
 					uint16_t rc = refRow[i] & 0x7FFF;
 					uint16_t lc = liveRow[i] & 0x7FFF;
 					if(rc != lc) differs = true;
@@ -2854,13 +2893,15 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 
 		// R3: log the active CGRAM-diff transform (first few frames per context)
 		if(anyPalTransform && diagPalLogCount < 5) {
-			char palBuf[512];
+			char palBuf[1024];
 			int off = snprintf(palBuf, sizeof(palBuf),
 				"[SNES HD diag] PALDIFF gfx=%d rows:", (int)_hdData->ActiveGfxset);
-			for(int row = 0; row < 8 && off < (int)sizeof(palBuf) - 48; row++) {
+			// S53: P = 4bpp-Zeile, Q = 2bpp-Block (Nummer = CGRAM-Start / 4).
+			for(int row = 0; row < BgPalBlockCount && off < (int)sizeof(palBuf) - 48; row++) {
 				if(!palRowActive[row]) continue;
 				off += snprintf(palBuf + off, sizeof(palBuf) - off,
-					" P%d=%u/%u/%u", row, palRatio[row][0], palRatio[row][1], palRatio[row][2]);
+					row < 8 ? " P%d=%u/%u/%u" : " Q%d=%u/%u/%u", row < 8 ? row : row - 8,
+					palRatio[row][0], palRatio[row][1], palRatio[row][2]);
 			}
 			DiagLog(palBuf);
 
