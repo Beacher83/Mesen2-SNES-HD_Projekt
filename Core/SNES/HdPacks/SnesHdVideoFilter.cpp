@@ -18,9 +18,14 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <vector>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S53"
+#define SNES_HD_BUILD_VERSION "S54"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -259,6 +264,8 @@ static void WriteSessionBanner(FILE* f, const char* what)
 		"SNES_HD_NO_PAL_TRANSFORM",  // S50
 		"SNES_HD_NO_SUB_HD_OPERAND", // S50
 		"SNES_HD_NO_BG_RECOLOR",     // S52
+		"SNES_HD_OLD_BG_PAL_ROWS",   // S53b
+		"SNES_HD_NO_RECOLOR_GRID",   // S54
 		"SNES_HD_PAINT_LAYERS",      // S47
 		"SNES_HD_DUMP_FRAMES",       // S48
 	};
@@ -410,6 +417,18 @@ struct HdTileSampler
 // and keeping the offset preserves that gradient instead of snapping it to one
 // side. When live == reference every delta is zero and Apply() is the exact
 // identity -- a level whose sprites already look right cannot change.
+// S54: Index des niedrigsten gesetzten Bits (mask != 0).
+static inline int BitScanLowest(uint32_t mask)
+{
+#ifdef _MSC_VER
+	unsigned long i;
+	_BitScanForward(&i, mask);
+	return (int)i;
+#else
+	return __builtin_ctz(mask);
+#endif
+}
+
 struct HdSpriteRecolor
 {
 	bool valid = false;
@@ -418,6 +437,8 @@ struct HdSpriteRecolor
 	uint8_t count = 16;
 	uint8_t refR[16] = {}, refG[16] = {}, refB[16] = {};
 	int16_t dR[16] = {}, dG[16] = {}, dB[16] = {};
+	// S54: optionales Kandidatengitter, siehe BuildRecolorGrid(). nullptr = volle Suche.
+	const uint16_t* grid = nullptr;
 
 	void Init(const uint16_t* refPal, const uint16_t* liveRow, int n = 16)
 	{
@@ -460,14 +481,38 @@ struct HdSpriteRecolor
 			b = std::min(255, b * 255 / (int)a);
 		}
 		int best = 1, bestD = 0x7FFFFFFF;
-		for(int i = 1; i < count; i++) {
-			int er = r - (int)refR[i], eg = g - (int)refG[i], eb = b - (int)refB[i];
-			int d = er * er + eg * eg + eb * eb;
-			if(d < bestD) {
-				bestD = d;
-				best = i;
-				if(d == 0) {
-					break;
+		if(grid) {
+			// S54: nur die Eintraege, die in diesem 4x4x4-Wuerfel ueberhaupt die
+			// naechsten sein koennen, in aufsteigender Reihenfolge -- dasselbe
+			// Ergebnis wie die volle Suche, auch bei Gleichstand.
+			uint32_t mask = grid[((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2)];
+			if((mask & (mask - 1)) == 0) {
+				best = BitScanLowest(mask);
+			} else {
+				while(mask) {
+					const int i = BitScanLowest(mask);
+					mask &= mask - 1;
+					int er = r - (int)refR[i], eg = g - (int)refG[i], eb = b - (int)refB[i];
+					int d = er * er + eg * eg + eb * eb;
+					if(d < bestD) {
+						bestD = d;
+						best = i;
+						if(d == 0) {
+							break;
+						}
+					}
+				}
+			}
+		} else {
+			for(int i = 1; i < count; i++) {
+				int er = r - (int)refR[i], eg = g - (int)refG[i], eb = b - (int)refB[i];
+				int d = er * er + eg * eg + eb * eb;
+				if(d < bestD) {
+					bestD = d;
+					best = i;
+					if(d == 0) {
+						break;
+					}
 				}
 			}
 		}
@@ -482,6 +527,159 @@ struct HdSpriteRecolor
 		return (a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 	}
 };
+
+// S54: Kandidatengitter fuer HdSpriteRecolor::Apply.
+//
+// Apply() sucht je Texel die naechste von 15 Referenzfarben. In Glimmer's Galleon,
+// wo die Live-Palette die Umkehrung der Referenz ist und jede Zeile umgefaerbt
+// wird, kostete das den Filter 16,7 ms Median je Frame -- das ganze Budget (Log
+// 25.09., Kontext E10E4686, Main=$04). Mit SNES_HD_NO_BG_RECOLOR lief es fluessig.
+//
+// Das Gitter teilt den RGB-Raum in 64x64x64 Wuerfel zu 4x4x4 Werten und merkt sich
+// je Wuerfel als Bitmaske, welche Eintraege dort UEBERHAUPT die naechsten sein
+// koennen: Eintrag i fliegt nur raus, wenn sein kleinster Abstand zum Wuerfel
+// groesser ist als der groesste Abstand irgendeines anderen Eintrags. Damit ist
+// das Ergebnis EXAKT das der vollen Suche, auch bei Gleichstand, weil die Maske
+// in aufsteigender Reihenfolge durchlaufen wird. (Die 2026-09-23 verworfene
+// 5-Bit-Tabelle hat dagegen gerundet -- 6,74 % falsche Texel.)
+//
+// Gemessen an der Pack-Kunst (BG1/BG2), Kandidaten je Texel im Mittel:
+// gfxset 3 -> 1,89 (38,9 % sofort eindeutig), 7 -> 1,21, 37 -> 1,22, 38 -> 1,35.
+// Statt 14-15 Vergleichen also ein bis zwei.
+//
+// Das Gitter haengt nur an der REFERENZ (palettes.bin), nicht an der Live-Palette,
+// und wird deshalb einmal je gfxset und 4bpp-Zeile gebaut (512 KB, ~10 ms) und
+// gemerkt. 2bpp-Bloecke (3 Farben) brauchen keins. Beim Bau rechnet eine
+// Stichprobe gegen die volle Suche und schreibt das Ergebnis ins Diagnose-Log.
+//
+// SNES_HD_NO_RECOLOR_GRID=1 schaltet zurueck auf die volle Suche (A/B).
+static const bool s_noRecolorGrid = getenv("SNES_HD_NO_RECOLOR_GRID") != nullptr;
+static constexpr int kRecolorGridSide = 64;
+
+static int RecolorNearestFull(const HdSpriteRecolor& rc, int r, int g, int b)
+{
+	int best = 1, bestD = 0x7FFFFFFF;
+	for(int i = 1; i < rc.count; i++) {
+		int er = r - (int)rc.refR[i], eg = g - (int)rc.refG[i], eb = b - (int)rc.refB[i];
+		int d = er * er + eg * eg + eb * eb;
+		if(d < bestD) {
+			bestD = d;
+			best = i;
+			if(d == 0) {
+				break;
+			}
+		}
+	}
+	return best;
+}
+
+static void BuildRecolorGrid(const HdSpriteRecolor& rc, std::vector<uint16_t>& grid)
+{
+	const int n = kRecolorGridSide;
+	const int cnt = rc.count;
+	// Je Kanal, Eintrag und Wuerfelzeile: kleinster und groesster quadrierter Abstand.
+	static int mn[3][16][kRecolorGridSide], mx[3][16][kRecolorGridSide];
+	const uint8_t* ref[3] = { rc.refR, rc.refG, rc.refB };
+	for(int ch = 0; ch < 3; ch++) {
+		for(int i = 1; i < cnt; i++) {
+			const int v = ref[ch][i];
+			for(int c = 0; c < n; c++) {
+				const int lo = c * 4, hi = lo + 3;
+				const int dmin = v < lo ? lo - v : (v > hi ? v - hi : 0);
+				const int dmax = std::max(std::abs(v - lo), std::abs(v - hi));
+				mn[ch][i][c] = dmin * dmin;
+				mx[ch][i][c] = dmax * dmax;
+			}
+		}
+	}
+	grid.assign((size_t)n * n * n, 0);
+	for(int cr = 0; cr < n; cr++) {
+		for(int cg = 0; cg < n; cg++) {
+			uint16_t* out = grid.data() + (((size_t)cr << 12) | ((size_t)cg << 6));
+			for(int cb = 0; cb < n; cb++) {
+				int bound = 0x7FFFFFFF;
+				for(int i = 1; i < cnt; i++) {
+					bound = std::min(bound, mx[0][i][cr] + mx[1][i][cg] + mx[2][i][cb]);
+				}
+				uint16_t mask = 0;
+				for(int i = 1; i < cnt; i++) {
+					if(mn[0][i][cr] + mn[1][i][cg] + mn[2][i][cb] <= bound) {
+						mask |= (uint16_t)(1u << i);
+					}
+				}
+				out[cb] = mask;
+			}
+		}
+	}
+}
+
+struct RecolorGridEntry
+{
+	uint8_t refR[16], refG[16], refB[16];
+	std::vector<uint16_t> grid;
+};
+static std::unordered_map<uint32_t, RecolorGridEntry> s_recolorGrids;
+
+// Nur aus ApplyFilter() vor dem Start der Render-Threads aufrufen; danach wird
+// das Gitter nur noch gelesen.
+static const uint16_t* GetRecolorGrid(int gfxset, int block, const HdSpriteRecolor& rc)
+{
+	const uint32_t key = ((uint32_t)(gfxset & 0xFF) << 8) | (uint32_t)block;
+	auto it = s_recolorGrids.find(key);
+	if(it != s_recolorGrids.end()) {
+		const RecolorGridEntry& e = it->second;
+		// Ein neu geladenes Pack kann andere Referenzfarben bringen.
+		if(!memcmp(e.refR, rc.refR, 16) && !memcmp(e.refG, rc.refG, 16) && !memcmp(e.refB, rc.refB, 16)) {
+			return e.grid.data();
+		}
+	}
+	if(s_recolorGrids.size() >= 64) {
+		s_recolorGrids.clear();   // 32 MB Obergrenze; ein Level braucht selten mehr als 8
+	}
+	auto t0 = std::chrono::high_resolution_clock::now();
+	RecolorGridEntry& e = s_recolorGrids[key];
+	memcpy(e.refR, rc.refR, 16);
+	memcpy(e.refG, rc.refG, 16);
+	memcpy(e.refB, rc.refB, 16);
+	BuildRecolorGrid(rc, e.grid);
+	double ms = std::chrono::duration<double, std::milli>(
+		std::chrono::high_resolution_clock::now() - t0).count();
+
+	// Selbstpruefung: Stichprobe gegen die volle Suche.
+	HdSpriteRecolor probe = rc;
+	probe.grid = nullptr;
+	uint32_t seed = 0x9E3779B9u ^ key;
+	int mismatches = 0;
+	uint64_t candSum = 0;
+	const int samples = 8192;
+	for(int k = 0; k < samples; k++) {
+		seed = seed * 1664525u + 1013904223u;
+		const int r = (seed >> 8) & 0xFF, g = (seed >> 16) & 0xFF, b = (seed >> 24) & 0xFF;
+		const uint16_t mask = e.grid[((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2)];
+		int best = 1, bestD = 0x7FFFFFFF;
+		for(uint32_t m = mask; m; m &= m - 1) {
+			const int i = BitScanLowest(m);
+			int er = r - (int)rc.refR[i], eg = g - (int)rc.refG[i], eb = b - (int)rc.refB[i];
+			int d = er * er + eg * eg + eb * eb;
+			if(d < bestD) {
+				bestD = d;
+				best = i;
+				if(d == 0) break;
+			}
+			candSum++;
+		}
+		if(best != RecolorNearestFull(probe, r, g, b)) {
+			mismatches++;
+		}
+	}
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+		"[SNES HD diag] RECOLOR-GRID gfx=%d P%d gebaut in %.1f ms, Stichprobe %d: %d Abweichungen, "
+		"Kandidaten im Mittel %.2f (volle Suche %d)",
+		gfxset, block, ms, samples, mismatches, (double)candSum / samples, rc.count - 1);
+	DiagLog(buf);
+	return e.grid.data();
+}
 
 // P4.1c perf: memoized tile lookup.
 //
@@ -829,12 +1027,20 @@ static const bool s_noBgRecolor = getenv("SNES_HD_NO_BG_RECOLOR") != nullptr;
 // dafuer gibt es keinen Block, diese Kacheln bleiben unveraendert.
 static constexpr int BgPalBlockCount = 8 + 32;
 
+// S53b A/B: SNES_HD_OLD_BG_PAL_ROWS=1 stellt das Verhalten bis S52 wieder her --
+// jede BG-Kachel haengt an der 4bpp-Zeile pal*16, auch 2bpp und 8bpp. Klaert,
+// ob S53 hinter den Farbfehlern vom 25.09. steckt (Red Hot Ride, Rickety Race).
+static const bool s_oldBgPalRows = getenv("SNES_HD_OLD_BG_PAL_ROWS") != nullptr;
+
 static inline int BgPalBlock(uint8_t bgMode, uint8_t layer, uint8_t pal)
 {
 	if(layer > 3) {
 		return -1;
 	}
 	pal &= 7;
+	if(s_oldBgPalRows) {
+		return pal;
+	}
 	switch(bgMode & 7) {
 		case 0: return 8 + layer * 8 + pal;
 		case 1: return layer <= 1 ? pal : (layer == 2 ? 8 + pal : -1);
@@ -2516,6 +2722,10 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 				// waere reine Rechenzeit.
 				bgRecolorActive[row] = bgRecolor[row].valid;
 				anyBgRecolor |= bgRecolorActive[row];
+				// S54: nur 4bpp-Zeilen -- bei 3 Farben lohnt kein Gitter.
+				if(bgRecolorActive[row] && !s_noRecolorGrid && BgPalBlockSize(row) == 16) {
+					bgRecolor[row].grid = GetRecolorGrid(_hdData->ActiveGfxset, row, bgRecolor[row]);
+				}
 			}
 		}
 	}

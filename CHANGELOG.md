@@ -21,6 +21,39 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-25] — S54: Kandidatengitter fuer den BG-Umfaerber (Glimmer 16,7 -> 6,3 ms)
+
+**Problem:** Glimmer's Galleon ruckelte, der Ton setzte aus. Im Kontext `E10E4686` mit
+`Main=$04 Sub=$13 CM=$24` brauchte der Filter **16,7 ms Median, p95 19,3** -- das ganze
+Frame-Budget. Mit `SNES_HD_NO_BG_RECOLOR=1` lief es fluessig, also war es S52:
+`HdSpriteRecolor::Apply` sucht je Texel die naechste von 15 Referenzfarben, und in Glimmer
+(Live-Palette = Umkehrung der Referenz) laeuft das fuer jede Zeile.
+
+**Loesung:** Je gfxset und 4bpp-Zeile ein 64x64x64-Gitter ueber den RGB-Raum. Jeder Wuerfel
+(4x4x4 Werte) traegt als Bitmaske die Eintraege, die dort ueberhaupt die naechsten sein
+koennen -- Eintrag i fliegt nur raus, wenn sein kleinster Abstand zum Wuerfel groesser ist als
+der groesste Abstand eines anderen. Die Maske wird aufsteigend durchlaufen, damit ist das
+Ergebnis **exakt** das der vollen Suche, auch bei Gleichstand. Das Gitter haengt nur an der
+Referenz (palettes.bin), wird einmal gebaut (~6 ms, 512 KB) und gemerkt. 2bpp-Bloecke
+(3 Farben) bekommen keins.
+
+**Vorab gemessen** (die 2026-09-23 verworfenen Varianten waren gerundet bzw. nur „eindeutige
+Eimer“; Kandidatenlisten waren nie gemessen): Kandidaten je Texel an der Pack-Kunst
+gfxset 3 -> 1,89, 7 -> 1,21, 37 -> 1,22, 38 -> 1,35 statt 15. Offline 3,2 Mio Stichproben,
+0 Abweichungen. Im Spiel prueft jeder Bau 8.192 Stichproben (`RECOLOR-GRID` im Diag-Log):
+alle acht Zeilen von gfxset 3 mit **0 Abweichungen**.
+
+**Ergebnis (User-Test 25.09.):** Glimmer `Main=$04` **Median 6,29 ms, p95 6,87, max 9,19**
+(vorher 16,70 / 19,34). Bild unveraendert.
+
+A/B: `SNES_HD_NO_RECOLOR_GRID=1` / `ab_no_recolor_grid.bat`.
+
+**Ebenfalls drin (S53b):** `SNES_HD_OLD_BG_PAL_ROWS=1` / `ab_old_bg_pal_rows.bat` stellt die
+Palettenzeilen vor S53 wieder her. Damit belegt: Luftstrom in Red Hot Ride und Zielflagge in
+Rickety Race sind NICHT S53 -- die Flagge war eine falsche Referenzpalette aus dem Viewer-Export.
+
+---
+
 ## [2026-09-23] — Overlay-Franse ein ZWEITES Mal gemessen und verworfen (kein Code)
 
 **Nicht wieder aufbauen.** S25 (`4482908a`) hat die Franse in Overlay-Leveln schon einmal
