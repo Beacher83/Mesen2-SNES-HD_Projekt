@@ -25,7 +25,7 @@
 #endif
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S54"
+#define SNES_HD_BUILD_VERSION "S55"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -266,6 +266,7 @@ static void WriteSessionBanner(FILE* f, const char* what)
 		"SNES_HD_NO_BG_RECOLOR",     // S52
 		"SNES_HD_OLD_BG_PAL_ROWS",   // S53b
 		"SNES_HD_NO_RECOLOR_GRID",   // S54
+		"SNES_HD_OLD_CM_CLAMP",      // S55
 		"SNES_HD_PAINT_LAYERS",      // S47
 		"SNES_HD_DUMP_FRAMES",       // S48
 	};
@@ -1008,6 +1009,18 @@ static const bool s_noSubHdOperand = getenv("SNES_HD_NO_SUB_HD_OPERAND") != null
 //
 // SNES_HD_NO_BG_RECOLOR=1 faellt auf den alten R3-LUT zurueck.
 static const bool s_noBgRecolor = getenv("SNES_HD_NO_BG_RECOLOR") != nullptr;
+
+// S55: Addition mit Halbierung wurde erst gekappt, dann halbiert:
+// min(255, a+b) >> 1. Die PPU halbiert zuerst: min((a+b) >> 1, 31). Solange
+// die Summe unter 255 bleibt, ist das dasselbe; laeuft sie ueber, kommt in
+// jedem Kanal 127 heraus -- flaches Grau. So sah der Dampf in Red Hot Ride aus
+// (User 25.09.): BG3 nur auf dem Sub-Screen, per Fenster auf die helle Lava
+// addiert und halbiert (AddSub=1, Halve=1, PreventMode=1), statt halbtransparent
+// weiss eine deckende graue Saeule. Belegt: bg3/gfxset_32 aus dem Pack entfernt
+// (TileByKey 67044 -> 66920) -> Bild unveraendert; sHd=0 in allen Frames, der
+// Operand war also nativ -- falsch war nur die Arithmetik.
+// SNES_HD_OLD_CM_CLAMP=1 stellt die alte Reihenfolge her (A/B).
+static const bool s_oldCmClamp = getenv("SNES_HD_OLD_CM_CLAMP") != nullptr;
 
 // S53: welche CGRAM-Farben eine BG-Kachel ueberhaupt hat.
 //
@@ -2459,7 +2472,7 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 							}
 						}
 
-						// --- Color math: exact port of SnesPpu::ApplyColorMathToPixel ---
+						// --- Color math: port of SnesPpu::ApplyColorMathToPixel (S55: add+halve order fixed) ---
 						if(doMath) {
 							// 3. Second operand
 							int oR, oG, oB;
@@ -2538,6 +2551,12 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								r = std::max(0, r - oR) >> halfShift;
 								g = std::max(0, g - oG) >> halfShift;
 								b = std::max(0, b - oB) >> halfShift;
+							} else if(!s_oldCmClamp) {
+								// S55: erst halbieren, DANN kappen -- wie die PPU
+								// (SnesPpu::ApplyColorMathToPixel: min((a+b)>>half, 31)).
+								r = std::min(255, (r + oR) >> halfShift);
+								g = std::min(255, (g + oG) >> halfShift);
+								b = std::min(255, (b + oB) >> halfShift);
 							} else {
 								r = std::min(255, r + oR) >> halfShift;
 								g = std::min(255, g + oG) >> halfShift;

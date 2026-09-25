@@ -21,6 +21,26 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-09-25] — S55: Farbmathematik halbiert vor dem Kappen (Dampf in Red Hot Ride)
+
+**Symptom:** Der Dampf aus der Lava in Red Hot Ride war mit HD-Pack eine deckende graue Saeule,
+ohne Pack halbtransparent weisslich.
+
+**Eingegrenzt:** Ebenen-Anstrich (`SNES_HD_PAINT_LAYERS`, neu `test_ebenen_anstrich.bat`): der
+Dampf verschwindet -> kein Sprite. Register: BG3 nur auf dem Sub-Screen, per Fenster (HDMA) auf
+BG1/BG2 addiert und halbiert (`AddSub=1 Halve=1 PreventMode=1`). `bg3/gfxset_32` aus dem Pack
+genommen (Quittung TileByKey 67044 -> 66920): Bild unveraendert, und `sHd=0` in allen Frames --
+der Operand war nativ, die Kunst unschuldig.
+
+**Ursache:** Der HD-Pfad rechnete `min(255, a + b) >> half`, die PPU
+(`SnesPpu::ApplyColorMathToPixel`) `min((a + b) >> half, 31)`. Unter 255 identisch; bei heller
+Lava plus hellem Dampf laeuft die Summe ueber und jeder Kanal landet bei 127 -- flaches Grau.
+
+**Fix:** erst halbieren, dann kappen. Betrifft nur Addition mit Halbierung bei hellen Farben.
+Im Spiel bestaetigt (User 25.09.). A/B: `SNES_HD_OLD_CM_CLAMP=1` / `ab_old_cm_clamp.bat`.
+
+---
+
 ## [2026-09-25] — S54: Kandidatengitter fuer den BG-Umfaerber (Glimmer 16,7 -> 6,3 ms)
 
 **Problem:** Glimmer's Galleon ruckelte, der Ton setzte aus. Im Kontext `E10E4686` mit
