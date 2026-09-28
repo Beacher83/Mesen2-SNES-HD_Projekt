@@ -672,6 +672,9 @@ bool SnesHdPackLoader::LoadFingerprints()
 		}
 
 		if(!entries.empty()) {
+			if(_data->GfxsetFingerprints.find(gfxsetIdx) == _data->GfxsetFingerprints.end()) {
+				_data->GfxsetFingerprintOrder.push_back(gfxsetIdx);   // S56: file order = check order
+			}
 			_data->GfxsetFingerprints[gfxsetIdx] = std::move(entries);
 		}
 	}

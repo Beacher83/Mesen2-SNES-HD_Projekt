@@ -404,6 +404,11 @@ public:
 	// Key: gfxsetIndex, Value: reference tiles whose content identifies that gfxset.
 	// Populated from fingerprints.bin. Empty = no scoping (all tiles match any context).
 	unordered_map<uint8_t, vector<GfxsetFingerprintEntry>> GfxsetFingerprints;
+	// S56: detection order = order in fingerprints.bin. A gfxset serves several
+	// levels, and what they all share can sit in another gfxset too: fp34 (track
+	// tiles of Rickety Race / Target Terror) also matches Haunted Hall (44). The
+	// viewer writes the more specific set first; the unordered_map lost that order.
+	vector<uint8_t> GfxsetFingerprintOrder;
 
 	// R3: reference BG palettes per gfxset (palettes.bin) — the CGRAM state the
 	// HD tiles were exported under. 128 entries = 8 BG palette rows × 16 colors
@@ -477,7 +482,8 @@ public:
 			return;
 		}
 
-		for(const auto& [gfxsetIdx, entries] : GfxsetFingerprints) {
+		for(uint8_t gfxsetIdx : GfxsetFingerprintOrder) {
+			const vector<GfxsetFingerprintEntry>& entries = GfxsetFingerprints[gfxsetIdx];
 			bool allMatch = true;
 			for(const auto& entry : entries) {
 				uint64_t liveHash = ComputeTileContentHash(vram, entry.VramWordAddr);

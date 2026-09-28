@@ -25,7 +25,7 @@
 #endif
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S55"
+#define SNES_HD_BUILD_VERSION "S56"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
