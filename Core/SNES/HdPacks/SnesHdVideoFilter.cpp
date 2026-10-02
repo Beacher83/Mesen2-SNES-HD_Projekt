@@ -25,7 +25,7 @@
 #endif
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S56"
+#define SNES_HD_BUILD_VERSION "S57"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -267,6 +267,7 @@ static void WriteSessionBanner(FILE* f, const char* what)
 		"SNES_HD_OLD_BG_PAL_ROWS",   // S53b
 		"SNES_HD_NO_RECOLOR_GRID",   // S54
 		"SNES_HD_OLD_CM_CLAMP",      // S55
+		"SNES_HD_NO_RECOLOR_CACHE",  // S57
 		"SNES_HD_PAINT_LAYERS",      // S47
 		"SNES_HD_DUMP_FRAMES",       // S48
 	};
@@ -377,9 +378,17 @@ static void ContextLog(const char* msg)
 struct HdTileSampler
 {
 	const uint32_t* base = nullptr;
+	uint32_t off = 0;   // S57: Startpunkt relativ zum Kachelanfang, fuer Rebase()
 	int rowStep = 0;
 	int colStep = 0;
 	bool valid = false;
+
+	// S57: dieselbe Abtastung auf einer gleich grossen Kopie der Kachel -- der
+	// umgefaerbten aus dem Kachel-Cache.
+	inline void Rebase(const uint32_t* tileData)
+	{
+		base = tileData + off;
+	}
 
 	inline void Init(const SnesHdPackTileInfo* tile, const SnesHdPpuTileInfo* info, uint32_t hdScale)
 	{
@@ -396,7 +405,8 @@ struct HdTileSampler
 		}
 		uint32_t px0 = srcTX * hdScale + (info->HorizontalMirror ? (hdScale - 1) : 0);
 		uint32_t py0 = srcTY * hdScale + (info->VerticalMirror ? (hdScale - 1) : 0);
-		base = tile->HdTileData.data() + py0 * tile->Width + px0;
+		off = py0 * tile->Width + px0;
+		base = tile->HdTileData.data() + off;
 		rowStep = info->VerticalMirror ? -(int)tile->Width : (int)tile->Width;
 		colStep = info->HorizontalMirror ? -1 : 1;
 		valid = true;
@@ -440,6 +450,11 @@ struct HdSpriteRecolor
 	int16_t dR[16] = {}, dG[16] = {}, dB[16] = {};
 	// S54: optionales Kandidatengitter, siehe BuildRecolorGrid(). nullptr = volle Suche.
 	const uint16_t* grid = nullptr;
+	// S57: Fingerabdruck von allem, wovon Apply() abhaengt (Anzahl, Referenzfarben,
+	// Deltas). Gleicher Fingerabdruck = gleiches Ergebnis fuer jeden Texel; der
+	// Kachel-Cache (RecoloredTileData) haengt daran. Das Gitter gehoert nicht dazu:
+	// es aendert nur den Weg, nie das Ergebnis.
+	uint64_t sig = 0;
 
 	void Init(const uint16_t* refPal, const uint16_t* liveRow, int n = 16)
 	{
@@ -465,6 +480,16 @@ struct HdSpriteRecolor
 			}
 		}
 		valid = anyDelta;
+		if(valid) {
+			uint64_t h = 0xCBF29CE484222325ULL ^ (uint64_t)n;
+			for(int i = 0; i < n; i++) {
+				const uint64_t v = (uint64_t)refR[i] | ((uint64_t)refG[i] << 8) | ((uint64_t)refB[i] << 16)
+					| ((uint64_t)(uint16_t)dR[i] << 24) | ((uint64_t)(uint16_t)dG[i] << 40);
+				h = (h ^ v) * 0x100000001B3ULL;
+				h = (h ^ (uint64_t)(uint16_t)dB[i]) * 0x100000001B3ULL;
+			}
+			sig = h;
+		}
 	}
 
 	inline uint32_t Apply(uint32_t c) const
@@ -556,6 +581,12 @@ struct HdSpriteRecolor
 // SNES_HD_NO_RECOLOR_GRID=1 schaltet zurueck auf die volle Suche (A/B).
 static const bool s_noRecolorGrid = getenv("SNES_HD_NO_RECOLOR_GRID") != nullptr;
 static constexpr int kRecolorGridSide = 64;
+
+// S57, Kachel-Cache (siehe RecoloredTileData): neues Pack -> neuer Filter -> neue
+// Epoche; die Thread-Caches verwerfen dann alles, weil Kachelzeiger eines alten
+// Packs wiederverwendet sein koennen. Der Frame-Zaehler steuert das Leeren.
+static std::atomic<uint32_t> s_recolorCacheEpoch{ 1 };
+static std::atomic<uint32_t> s_recolorFrameSerial{ 0 };
 
 static int RecolorNearestFull(const HdSpriteRecolor& rc, int r, int g, int b)
 {
@@ -767,6 +798,8 @@ SnesHdVideoFilter::SnesHdVideoFilter(Emulator* emu, SnesConsole* console, SnesHd
 	_console = console;
 	_hdScale = hdData->Scale;
 	InitLookupTable();
+	// S57: neues Pack, neue Kachelzeiger -- die Umfaerbe-Caches der Threads verfallen.
+	s_recolorCacheEpoch.fetch_add(1);
 }
 
 void SnesHdVideoFilter::InitLookupTable()
@@ -908,6 +941,9 @@ struct HdFilterFrameCtx
 	// S52: je BG-Palettenblock einmal vorberechnet; nullptr = nicht aktiv.
 	const void* bgRecolor = nullptr;            // HdSpriteRecolor[BgPalBlockCount]
 	const bool* bgRecolorActive = nullptr;      // [BgPalBlockCount]
+	// S57: Kachel-Cache des Umfaerbens, siehe RecoloredTileData().
+	uint32_t recolorEpoch = 0;
+	uint32_t recolorFrame = 0;
 };
 
 // Per-thread frame counters, summed after all threads joined.
@@ -1221,6 +1257,8 @@ struct HdFilterFrameStats
 	uint32_t SubBgBotRetry = 0; // S37: of those, found only via the BG1<->BG2 retry
 	uint32_t SubBgNoBot = 0;    // S37: transparent BG operand, no ground found on the sub screen
 	uint32_t SubBgOpaque = 0;   // S37: BG operand tile is fully opaque -- it has no edge to soften
+	uint32_t RecolorCacheHit = 0;   // S57: umgefaerbte Kachel aus dem Cache genommen (je Sampler und Pixel)
+	uint32_t RecolorCacheMiss = 0;  // S57: Kachel erst umgefaerbt und abgelegt
 };
 
 static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& src)
@@ -1262,6 +1300,8 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SubBgBotRetry += src.SubBgBotRetry;
 	dst.SubBgNoBot += src.SubBgNoBot;
 	dst.SubBgOpaque += src.SubBgOpaque;
+	dst.RecolorCacheHit += src.RecolorCacheHit;
+	dst.RecolorCacheMiss += src.RecolorCacheMiss;
 	for(int i = 0; i < 4; i++) {
 		dst.LayerBits[i] += src.LayerBits[i];
 		dst.Win[i] += src.Win[i];
@@ -1386,9 +1426,134 @@ static HdFilterWorkPool& GetHdFilterPool()
 	return *pool;
 }
 
+// =============================================================================
+// S57: Kachel-Cache fuer das Umfaerben.
+//
+// HdSpriteRecolor::Apply() faerbt einen Texel von der Referenzpalette, mit der die
+// HD-Kunst gebacken wurde, auf die Live-Palette um. Bisher geschah das fuer JEDEN
+// Texel in JEDEM Frame. In Screech's Sprint (gfxset 39 dient Bramble Blast, Bramble
+// Scramble und Screech's Sprint; die Referenz stammt aus Bramble Blast) weicht jede
+// BG-Zeile ab: Filter 12,4 ms im Mittel, Spitze 17,3 ms (Log 02.10. 14:21), gegen
+// 3-5 ms in den anderen Leveln -- Ruckler.
+//
+// Das Ergebnis haengt nur am Texel und an der Umfaerbung (HdSpriteRecolor::sig).
+// Darum wird eine Kachel einmal ganz umgefaerbt und die Kopie gemerkt, Schluessel
+// (Kachel, sig). Jeder weitere Frame liest nur noch. Dieselbe Logik wie die drei
+// Ballonfarben: eine HD-Kunst, je Live-Palette eine eigene Kopie, jetzt fuer alles,
+// was umgefaerbt wird -- BG-Kacheln und Sprites, ganze Level.
+//
+// EXAKT: die Kopie entsteht mit derselben Apply() auf denselben Texeln; die
+// Abtastung (Spiegelung, Startpunkt) bleibt die des Samplers, nur sein Zeiger zeigt
+// auf die Kopie. Ohne Gitter, mit Gitter, mit Cache: Bit fuer Bit dasselbe Bild.
+//
+// SKALIERUNG: Speicher waechst mit den Kacheln, die tatsaechlich unter einer
+// abweichenden Palette zu sehen sind, nicht mit dem Pack. 4x-Kachel = 4 KB. Je Thread
+// hoechstens kRecolorCacheMaxTexels (16 MB); darueber wird beim naechsten
+// Frame-Beginn geleert -- nie mitten im Frame, weil Sampler desselben Pixels noch
+// auf Kopien zeigen koennen. Wechselt die Live-Palette (Ueberblendung, Blinken),
+// entsteht eine neue sig und damit ein Fehltreffer: das kostet dann einmal das, was
+// vorher jeder Frame kostete.
+//
+// Je Thread ein eigener Cache: kein Lock im Pixelpfad. Davor ein kleiner
+// direktabgebildeter Speicher (256 Plaetze), weil benachbarte Pixel fast immer
+// dieselbe Kachel treffen.
+//
+// SNES_HD_NO_RECOLOR_CACHE=1 schaltet zurueck auf Apply je Texel (A/B).
+// =============================================================================
+static const bool s_noRecolorCache = getenv("SNES_HD_NO_RECOLOR_CACHE") != nullptr;
+static constexpr size_t kRecolorCacheMaxTexels = (size_t)4 << 20;
+// s_recolorCacheEpoch / s_recolorFrameSerial stehen oben bei BuildRecolorGrid.
+
+struct RecolorTileKey
+{
+	const SnesHdPackTileInfo* tile;
+	uint64_t sig;
+	bool operator==(const RecolorTileKey& o) const { return tile == o.tile && sig == o.sig; }
+};
+struct RecolorTileKeyHash
+{
+	size_t operator()(const RecolorTileKey& k) const
+	{
+		return (size_t)(((uint64_t)(uintptr_t)k.tile * 0x9E3779B97F4A7C15ULL) ^ k.sig);
+	}
+};
+struct RecolorTileCache
+{
+	struct Memo
+	{
+		const SnesHdPackTileInfo* tile = nullptr;
+		uint64_t sig = 0;
+		const uint32_t* data = nullptr;
+	};
+	uint32_t epoch = 0;
+	uint32_t frame = 0;
+	size_t texels = 0;
+	std::unordered_map<RecolorTileKey, std::vector<uint32_t>, RecolorTileKeyHash> map;
+	Memo memo[256];
+
+	void Clear()
+	{
+		map.clear();
+		texels = 0;
+		for(Memo& m : memo) {
+			m = Memo();
+		}
+	}
+};
+static thread_local RecolorTileCache t_recolorCache;
+
+// Einmal je Thread und Zeilenblock: Epoche und Groesse pruefen. Nur hier wird
+// geleert, also nie, waehrend ein Pixel noch auf eine Kopie zeigt.
+static void RecolorCacheBeginRows(uint32_t epoch, uint32_t frame)
+{
+	RecolorTileCache& c = t_recolorCache;
+	if(c.epoch != epoch) {
+		c.Clear();
+		c.epoch = epoch;
+	} else if(c.frame != frame && c.texels > kRecolorCacheMaxTexels) {
+		c.Clear();
+	}
+	c.frame = frame;
+}
+
+static const uint32_t* RecoloredTileData(const SnesHdPackTileInfo* tile, const HdSpriteRecolor& rc,
+	HdFilterFrameStats& st)
+{
+	RecolorTileCache& c = t_recolorCache;
+	const uint32_t slot = (uint32_t)((((uintptr_t)tile >> 4) ^ rc.sig ^ (rc.sig >> 29)) & 255);
+	RecolorTileCache::Memo& m = c.memo[slot];
+	if(m.tile == tile && m.sig == rc.sig) {
+		st.RecolorCacheHit++;
+		return m.data;
+	}
+	const RecolorTileKey key{ tile, rc.sig };
+	auto it = c.map.find(key);
+	if(it == c.map.end()) {
+		const std::vector<uint32_t>& src = tile->HdTileData;
+		std::vector<uint32_t> out(src.size());
+		for(size_t i = 0; i < src.size(); i++) {
+			out[i] = rc.Apply(src[i]);
+		}
+		c.texels += out.size();
+		// unordered_map haelt seine Knoten fest: die Daten der anderen Eintraege
+		// bleiben beim Einfuegen, wo sie sind.
+		it = c.map.emplace(key, std::move(out)).first;
+		st.RecolorCacheMiss++;
+	} else {
+		st.RecolorCacheHit++;
+	}
+	m.tile = tile;
+	m.sig = rc.sig;
+	m.data = it->second.data();
+	return m.data;
+}
+
 static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t yEnd,
 	HdFilterFrameStats& st, TileLookupEntry* tileLookupCache)
 {
+	if(!s_noRecolorCache) {
+		RecolorCacheBeginRows(ctx.recolorEpoch, ctx.recolorFrame);
+	}
 	SnesHdScreenInfo* hdScreen = ctx.hdScreen;
 	SnesHdPackData* hdData = ctx.hdData;
 	uint32_t* outputBuffer = ctx.outputBuffer;
@@ -2349,6 +2514,22 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 					if(edgeRecolorObj.valid) edgeRecolor = &edgeRecolorObj;
 				}
 
+				// S57: wo umgefaerbt wird, tastet der Sampler die umgefaerbte Kopie aus
+				// dem Kachel-Cache ab und das Apply je Texel entfaellt -- dasselbe Bild.
+				if(!s_noRecolorCache) {
+					auto useCached = [&st](HdTileSampler& s, const SnesHdPackTileInfo* tile, const HdSpriteRecolor*& rc) {
+						if(rc && s.valid && tile) {
+							s.Rebase(RecoloredTileData(tile, *rc, st));
+							rc = nullptr;
+						}
+					};
+					useCached(mainSampler, hdTile, mainRecolor);
+					useCached(botSampler, hdTileBot, botRecolor);
+					useCached(edgeSampler, edgeTile, edgeRecolor);
+					useCached(subSampler, subTile, subRecolor);
+					useCached(subBotSampler, subTileBot, subBotRecolor);
+				}
+
 				// 1. Clip main color to black (runs even without AllowColorMath;
 				//    Always mode does NOT reset halfShift — matches PPU)
 				int halfShift = sl.ColorMathHalveResult ? 1 : 0;
@@ -2897,6 +3078,8 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 	renderCtx.anyPalTransform = anyPalTransform;
 	renderCtx.palRowActive = palRowActive;
 	renderCtx.palLut = palLut;
+	renderCtx.recolorEpoch = s_recolorCacheEpoch.load();
+	renderCtx.recolorFrame = s_recolorFrameSerial.fetch_add(1) + 1;
 	// S52: nur anbinden, wenn wirklich eine Zeile abweicht -- sonst bleibt der
 	// Zeiger null und der Pixelpfad nimmt unveraendert den alten Weg.
 	renderCtx.bgRecolor = anyBgRecolor ? (const void*)bgRecolor : nullptr;
@@ -3082,14 +3265,14 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 		(diagFrameCount < 10 || (frameBgPixels > 0 && diagBgFrameCount < s_diagFrames));
 	if(logThisFrame) {
 		const char* ctxLabel = isWorldmap ? "WORLDMAP" : (isLevel2 ? "LEVEL2" : "other");
-		char buf[1024];
+		char buf[1280];
 		snprintf(buf, sizeof(buf),
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
 			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
 			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u sprFrTieWon=%u subBot=%u subSprUnder=%u subNoBot=%u sprHoleHd=%u subNoRef=%u subOpaque=%u nbEmpty=%u nbNoHd=%u subBotRetry=%u"
 			" bgBot=%u bgBotRetry=%u bgNoBot=%u bgOpaque=%u"
-			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f"
+			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f rcHit=%u rcMiss=%u"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
 			" hdBG1=%u hdBG2=%u hdBG3=%u hdBG4=%u"
 			" drawBG1=%u drawBG2=%u drawBG3=%u drawBG4=%u"
@@ -3106,7 +3289,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameSubSprUnder, frameSubSprNoBot, frameSprHoleHd, frameSubGateNoRef, frameSubGateOpaque, frameSubNoBotEmpty, frameSubNoBotNoHd, frameSubBotRetry,
 			frameSubBgBot, frameSubBgBotRetry, frameSubBgNoBot, frameSubBgOpaque,
 			frameMaskZero, frameHdmaSplit,
-			filterMs, diagMsMax,
+			filterMs, diagMsMax, total.RecolorCacheHit, total.RecolorCacheMiss,
 			frameLayerBits[0], frameLayerBits[1], frameLayerBits[2], frameLayerBits[3],
 			frameHdLayers[0], frameHdLayers[1], frameHdLayers[2], frameHdLayers[3],
 			frameDrawn[0], frameDrawn[1], frameDrawn[2], frameDrawn[3],

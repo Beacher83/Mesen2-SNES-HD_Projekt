@@ -21,6 +21,41 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-10-02] — S57: Kachel-Cache für das Umfärben (Ruckler in Screech's Sprint)
+
+**Symptom:** Einbrüche in Screech's Sprint. Log 02.10. 14:21, Kontext `gfx=39`: Filter 12,4 ms im Mittel,
+Spitze 17,3 ms. Die übrigen Level desselben Laufs (Windy Well 51, K. Rools Kabine 46 u. a.) liegen bei 3–5 ms.
+
+**Ursache:** gfxset 39 dient drei Leveln (Bramble Blast, Bramble Scramble, Screech's Sprint), die Referenzpaletten
+im Pack stammen aus Bramble Blast. In Screech's Sprint weicht fast jede BG-Zeile maximal ab (`PALDIFF … P0=1024`),
+also färbt S52 jedes BG-Pixel um, und zwar je Texel in jedem Frame. Das S54-Gitter macht die Suche billig,
+das Aufheben und Wiederherstellen der Vormultiplikation sowie das Übertragen des Abstands bleiben.
+
+**Lösung:** Das Ergebnis von `HdSpriteRecolor::Apply()` hängt nur am Texel und an der Umfärbung. Neu ist der
+Fingerabdruck `sig` (Anzahl, Referenzfarben, Deltas). Eine Kachel wird beim ersten Treffer ganz umgefärbt und als
+Kopie gemerkt, Schlüssel (Kachel, `sig`). Danach liest der Sampler nur noch die Kopie (`HdTileSampler::Rebase`,
+gleiche Spiegelung und gleicher Startpunkt). Gilt für alle fünf Umfärbe-Stellen (main, bottom, Franse, sub,
+sub-bottom), also BG und Sprites. Dieselbe Logik wie die drei Ballonfarben, nur für ganze Level.
+
+- **Exakt:** Die Kopie entsteht mit derselben `Apply()` auf denselben Texeln. Bit für Bit dasselbe Bild wie ohne
+  Cache.
+- **Speicher:** wächst mit den Kacheln, die unter abweichender Palette sichtbar sind (4x-Kachel = 4 KB), nicht mit
+  dem Pack. Je Thread höchstens 16 MB, darüber wird zu Beginn des nächsten Frames geleert, nie mitten im Frame.
+- **Threads:** ein Cache je Thread (`thread_local`), kein Lock im Pixelpfad. Davor liegt ein direktabgebildeter
+  Speicher mit 256 Plätzen, weil Nachbarpixel fast immer dieselbe Kachel treffen.
+- **Neues Pack:** Der Konstruktor erhöht eine Epoche, und die Thread-Caches verwerfen alles. Kachelzeiger eines
+  alten Packs können wiederverwendet sein.
+- **Palettenwechsel** (Überblenden, Blinken): neue `sig`, also einmal ein Fehltreffer. Kostet einmal das, was
+  vorher jeder Frame kostete.
+
+**Messen:** Die FRAME-Zeile hat neu `rcHit=`/`rcMiss=`. Erwartung in Screech's Sprint: `ms` deutlich unter den
+12,4 ms, `rcMiss` nach den ersten Frames nahe 0. A/B mit `ab_no_recolor_cache.bat` (`SNES_HD_NO_RECOLOR_CACHE=1`),
+das Bild muss identisch sein.
+
+**Stand:** gebaut (Release x64), im Spiel noch NICHT gemessen.
+
+---
+
 ## [2026-09-25] — S55: Farbmathematik halbiert vor dem Kappen (Dampf in Red Hot Ride)
 
 **Symptom:** Der Dampf aus der Lava in Red Hot Ride war mit HD-Pack eine deckende graue Saeule,
