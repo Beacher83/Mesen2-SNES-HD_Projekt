@@ -52,7 +52,14 @@ sub-bottom), also BG und Sprites. Dieselbe Logik wie die drei Ballonfarben, nur 
 12,4 ms, `rcMiss` nach den ersten Frames nahe 0. A/B mit `ab_no_recolor_cache.bat` (`SNES_HD_NO_RECOLOR_CACHE=1`),
 das Bild muss identisch sein.
 
-**Stand:** gebaut (Release x64), im Spiel noch NICHT gemessen.
+**Gemessen (02.10. 15:16, Screech's Sprint, 870 Frames):** Filter im Mittel **4,48 ms statt 12,35 ms**, Frames über
+12 ms: **1 statt 492** von 650. Der eine ist Frame 10 beim Levelstart, als der Cache noch leer war (12,35 ms,
+2.438 Fehltreffer), danach fällt es binnen ~15 Frames auf ~4 ms. `rcHit` ~85.000 je Frame, `rcMiss` meist
+0–50 (Sprites unter wechselnden OBJ-Zeilen). User: „deutlich besser“.
+Rest: Ab etwa Frame 290 liegt der Kontext bei 6,5–7 ms **ohne Fehltreffer** und mit fast gleichen Zählern wie
+die 3,6-ms-Frames davor. Das Umfärben ist es also nicht, die Ursache ist offen und liegt unter dem Budget von
+16,7 ms. Das Diagnose-Log deckt nur die ersten 600 Frames je Kontext ab, spätere Ruckler stehen nicht darin
+(dafür `SNES_HD_PERF=1`).
 
 ---
 
