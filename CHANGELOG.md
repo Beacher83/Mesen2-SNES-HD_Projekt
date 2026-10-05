@@ -21,6 +21,33 @@ Für die Architektur der Compositing Engine siehe `ARCHITECTURE.md`.
 
 ---
 
+## [2026-10-05] — S58: an einer inneren Naht kein Hintergrund als Untergrund (Linie am Level-Ende)
+
+**Symptom (User, Spiel 02.10.):** Am Level-Ende zieht sich eine feine Linie aus Hintergrund-Pixeln durch
+Diddys Sonnenbrille und Dixies Gitarre. **A/B (User, 05.10.): „Sprite-Kanten glätten“ aus → die Linie bei Diddy
+ist weg.** Die Kunst ist es also nicht, sondern die Glättung.
+
+**Ursache:** Seit dem 02.10. (Viewer) werden Composites in Teilen hochgerechnet, und jedes Teil läuft an seinem
+eigenen Rand weich aus. Hat der Gewinner-Texel Alpha < 255, sucht S22 ein Sprite darunter (Slot 3), sonst nimmt
+S21 die BG-Kachel. Dort, wo zwei Teile aneinanderstoßen, liegt nativ nichts **unter** dem Gewinner: Slot 3 ist
+leer, also wurde gegen den Hintergrund geblendet. Mit Glättung aus wird gegen die eigene SD-Farbe geblendet,
+deshalb war es dann dicht.
+
+**Lösung:** Der BG-Rückfall greift nur noch an der Außenkante. Hat an allen vier Nachbarn ein Sprite den
+Main-Screen gewonnen (`IsInsideSpriteArea`), bleibt `hdTileBot` leer, und der Texel wird gegen die eigene Farbe
+geblendet wie bei Glättung aus. Slot 3 hat weiter Vorrang, die Außensilhouette bleibt geglättet.
+
+**Messen:** neu `sprSeam=` in der FRAME-Zeile (Pixel, an denen der BG-Untergrund abgelehnt wurde). A/B
+`ab_no_seam_guard.bat` (`SNES_HD_NO_SEAM_GUARD=1`) stellt S57 her, in dem Fall muss `sprSeam=0` sein.
+**Bildtest:** Level-Ende Diddy (Sonnenbrille) und Dixie (Gitarre), Glättung an. Gegenprobe an einer
+Außenkante (Dixies Haar vor dem Himmel): Die muss weich bleiben.
+
+**Im Spiel bestätigt (User, 05.10.):** Die Sonnenbrille ist sauber, die Linie größtenteils weg. **Geparkt:** Zwischen
+Boombox und Diddy scheinen kurz noch 1–2 Pixel durch, vermutlich Nahtpixel mit einem Nachbarn ohne Sprite, an denen die
+Vier-Nachbarn-Prüfung nicht greift. Idee für später: dort den HD-Texel des Nachbar-Sprites als Untergrund nehmen.
+
+---
+
 ## [2026-10-02] — S57: Kachel-Cache für das Umfärben (Ruckler in Screech's Sprint)
 
 **Symptom:** Einbrüche in Screech's Sprint. Log 02.10. 14:21, Kontext `gfx=39`: Filter 12,4 ms im Mittel,

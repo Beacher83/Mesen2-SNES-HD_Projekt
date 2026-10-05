@@ -25,7 +25,7 @@
 #endif
 
 // Build version — logged in diagnostics so test PC can verify correct code is running.
-#define SNES_HD_BUILD_VERSION "S57"
+#define SNES_HD_BUILD_VERSION "S58"
 
 // ---------------------------------------------------------------------------
 // DiagLog — writes to both Mesen's log window AND a persistent text file.
@@ -268,6 +268,7 @@ static void WriteSessionBanner(FILE* f, const char* what)
 		"SNES_HD_NO_RECOLOR_GRID",   // S54
 		"SNES_HD_OLD_CM_CLAMP",      // S55
 		"SNES_HD_NO_RECOLOR_CACHE",  // S57
+		"SNES_HD_NO_SEAM_GUARD",     // S58
 		"SNES_HD_PAINT_LAYERS",      // S47
 		"SNES_HD_DUMP_FRAMES",       // S48
 	};
@@ -730,6 +731,21 @@ struct TileLookupEntry
 	SnesHdPackTileInfo* tile = nullptr;
 };
 
+// S58: true when a sprite won the main screen at all four neighbours of (x, y), i.e. the
+// pixel lies inside the sprite area and not on its outer silhouette. The screen border
+// counts as outside. Reads the PPU's finished frame, which no render thread writes.
+static inline bool IsInsideSpriteArea(const SnesHdScreenInfo* screen, uint32_t x, uint32_t y)
+{
+	if(x == 0 || y == 0 || x + 1 >= (uint32_t)SnesHdScreenInfo::ScreenWidth
+		|| y + 1 >= (uint32_t)SnesHdScreenInfo::ScreenHeight) {
+		return false;
+	}
+	const SnesHdPpuPixelInfo* p = screen->ScreenTiles + y * SnesHdScreenInfo::ScreenWidth + x;
+	constexpr int w = SnesHdScreenInfo::ScreenWidth;
+	return (p[-1].MainScreenFlags & 0x40) && (p[1].MainScreenFlags & 0x40)
+		&& (p[-w].MainScreenFlags & 0x40) && (p[w].MainScreenFlags & 0x40);
+}
+
 static inline SnesHdPackTileInfo* CachedGetMatchingTile(SnesHdPackData* hdData, const uint16_t* vram,
 	TileLookupEntry* cache, const SnesHdTileKey& key)
 {
@@ -995,6 +1011,9 @@ static const bool s_paintLayers = getenv("SNES_HD_PAINT_LAYERS") != nullptr;
 // back in the same session without a rebuild -- the pattern S42/S44 used.
 static const bool s_noOamTiebreak = getenv("SNES_HD_NO_OAM_TIEBREAK") != nullptr;
 
+// S58 A/B: give an inner seam the BG ground again, i.e. the behaviour up to S57.
+static const bool s_noSeamGuard = getenv("SNES_HD_NO_SEAM_GUARD") != nullptr;
+
 // S50 A/B, zwei Schalter fuer EINEN Befund: Glimmer's Galleon wird mit HD-Pack
 // als Negativ dargestellt, ohne Pack ist es korrekt (vom User belegt, 23.09.).
 //
@@ -1242,6 +1261,7 @@ struct HdFilterFrameStats
 	uint32_t SprEdge = 0;       // S21: pixels outside the native silhouette that carry sprite fringe art
 	uint32_t SprEdgeBlend = 0;  // S21: of those, sub-pixels where the fringe was actually drawn
 	uint32_t SprEdgeUnder = 0;  // S22: pixels blended against the sprite behind, not the BG
+	uint32_t SprSeam = 0;       // S58: soft sprite texel inside the sprite area -- BG ground refused
 	uint32_t SprEdgeTie = 0;     // S23: fringe present over a sprite, priority rejects it
 	uint32_t SprEdgeTieWon = 0;  // S49: that tie resolved by OAM order -- fringe drawn after all
 	uint32_t SubSprBot = 0;     // S26: sub-screen sprite given a BG ground to blend against
@@ -1285,6 +1305,7 @@ static void AddFilterStats(HdFilterFrameStats& dst, const HdFilterFrameStats& sr
 	dst.SprEdge += src.SprEdge;
 	dst.SprEdgeBlend += src.SprEdgeBlend;
 	dst.SprEdgeUnder += src.SprEdgeUnder;
+	dst.SprSeam += src.SprSeam;
 	dst.SprEdgeTie += src.SprEdgeTie;
 	dst.SprEdgeTieWon += src.SprEdgeTieWon;
 	dst.SubSprBot += src.SubSprBot;
@@ -2172,6 +2193,17 @@ static void RenderHdRows(const HdFilterFrameCtx& ctx, uint32_t yStart, uint32_t 
 								hdTileInfoBot = &pixelInfo.Sprites[3];
 								st.SprEdgeUnder++;
 							}
+						} else if(!s_noSeamGuard && IsInsideSpriteArea(hdScreen, x, y)) {
+							// S58: an inner seam. Composite parts are upscaled one by one, so each
+							// part's art fades out along its own border -- and where two parts butt
+							// against each other, nothing lies UNDER the winner natively: slot 3 is
+							// empty and the loop below took the BG. That drew a thin line of
+							// background through the character (Diddy's sunglasses, Dixie's guitar
+							// at the level end); with smoothing off it was gone. Inside the sprite
+							// area the BG is not what shows behind the texel, so blend against the
+							// sprite's own colour, as with smoothing off. The outer silhouette keeps
+							// its BG ground.
+							st.SprSeam++;
 						} else {
 							for(int layer = 0; layer < 4 && !hdTileBot; layer++) {
 								if(!(pixelInfo.BgLayerMask & (1 << layer))) continue;
@@ -3270,7 +3302,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			"[SNES HD diag] FRAME %d/%d [%s] build=" SNES_HD_BUILD_VERSION
 			": total=%u bg=%u match=%u miss=%u hdCm=%u mNat=%u sHd=%u sFix=%u lRetry=%u multi=%u"
 			" sprWon=%u sprHd=%u sprSub=%u sprSubHd=%u sprHdSub=%u sprRecol=%u sprNoRef=%u"
-			" sprEdge=%u/%u sprUnder=%u sprFrTie=%u sprFrTieWon=%u subBot=%u subSprUnder=%u subNoBot=%u sprHoleHd=%u subNoRef=%u subOpaque=%u nbEmpty=%u nbNoHd=%u subBotRetry=%u"
+			" sprEdge=%u/%u sprUnder=%u sprSeam=%u sprFrTie=%u sprFrTieWon=%u subBot=%u subSprUnder=%u subNoBot=%u sprHoleHd=%u subNoRef=%u subOpaque=%u nbEmpty=%u nbNoHd=%u subBotRetry=%u"
 			" bgBot=%u bgBotRetry=%u bgNoBot=%u bgOpaque=%u"
 			" mask0=%u hdmaSplit=%u ms=%.2f/%.2f rcHit=%u rcMiss=%u"
 			" BG1=%u BG2=%u BG3=%u BG4=%u"
@@ -3284,7 +3316,7 @@ void SnesHdVideoFilter::ApplyFilter(uint16_t* ppuOutputBuffer)
 			frameHdMiss, frameHdCm, frameMainNatHd, frameSubOpHd, frameSubOpFixed, frameLayerRetry, frameMultiLayer,
 			frameSpriteWon, frameSprHd, frameSprSub, frameSprSubMainHd, frameSprSubHd,
 			frameSprRecolor, frameSprRecolorNoRef,
-			frameSprEdge, frameSprEdgeBlend, frameSprEdgeUnder,
+			frameSprEdge, frameSprEdgeBlend, frameSprEdgeUnder, total.SprSeam,
 			frameSprEdgeTie, frameSprEdgeTieWon, frameSubSprBot,
 			frameSubSprUnder, frameSubSprNoBot, frameSprHoleHd, frameSubGateNoRef, frameSubGateOpaque, frameSubNoBotEmpty, frameSubNoBotNoHd, frameSubBotRetry,
 			frameSubBgBot, frameSubBgBotRetry, frameSubBgNoBot, frameSubBgOpaque,
